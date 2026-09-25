@@ -1,11 +1,20 @@
 <!doctype html>
-<html lang="tr">
+<html lang="tr" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="Upload a PNG, get a 3D model — right in your browser." />
+    <meta name="description" content="Upload a PNG, get a 3D model — right in your browser. / Bir PNG yükleyin, 3D modeliniz tarayıcınızda hazır." />
+    <meta name="theme-color" content="#0a0c10" />
     <title>3D Marker — Image to 3D</title>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <script>
+      // Apply the saved theme / language before first paint (avoids a flash of the wrong theme).
+      try {
+        var s = JSON.parse(localStorage.getItem('3dmarker:settings') || '{}');
+        if (s.theme === 'light' || s.theme === 'dark') document.documentElement.dataset.theme = s.theme;
+        if (s.lang === 'tr' || s.lang === 'en') document.documentElement.lang = s.lang;
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

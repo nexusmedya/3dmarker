@@ -1,0 +1,94 @@
+/** Generate / cancel, the progress bar and the error alert. */
+import type { I18nText, Progress } from '../core/types';
+import type { JobStatus } from '../app/store';
+import { useI18n } from './i18n';
+import { IconAlert, IconSparkles, IconX } from './icons';
+
+interface Props {
+  status: JobStatus;
+  progress: Progress | null;
+  error: I18nText | null;
+  errorTitle: string;
+  canGenerate: boolean;
+  blockedReason: string | null;
+  hasResult: boolean;
+  onGenerate: () => void;
+  onCancel: () => void;
+  onDismiss: () => void;
+}
+
+export function GeneratePanel({ status, progress, error, errorTitle, canGenerate, blockedReason, hasResult, onGenerate, onCancel, onDismiss }: Props) {
+  const { t, tx } = useI18n();
+  const running = status === 'running';
+  return (
+    <div className="generate-panel">
+      {running ? (
+        <div className="generate-row">
+          <button type="button" className="btn btn-primary btn-lg grow" disabled aria-busy="true">
+            <span className="spinner" aria-hidden="true" /> {t('generating')}
+          </button>
+          <button type="button" className="btn btn-secondary btn-lg" onClick={onCancel} data-testid="cancel">
+            <IconX size={16} /> {t('cancel')}
+          </button>
+        </div>
+      ) : (
+        <button
+          type="button"
+          className="btn btn-primary btn-lg btn-block"
+          onClick={onGenerate}
+          disabled={!canGenerate}
+          data-testid="generate"
+          title={blockedReason ?? t('shortcutHint')}
+        >
+          <IconSparkles size={18} /> {hasResult ? t('regenerate') : t('generate')}
+        </button>
+      )}
+      {running && <ProgressBar progress={progress} />}
+      {!running && blockedReason && <p className="muted small center">{blockedReason}</p>}
+      {!running && !blockedReason && <p className="muted small center kbd-hint">{t('shortcutHint')}</p>}
+      {status === 'cancelled' && !error && (
+        <p className="muted small center" role="status">
+          {t('cancelled')}
+        </p>
+      )}
+      {error && (
+        <div className="alert alert-danger" role="alert" data-testid="error">
+          <IconAlert size={18} />
+          <div className="alert-body">
+            <strong>{errorTitle}</strong>
+            <p>{tx(error)}</p>
+          </div>
+          <button type="button" className="icon-btn" onClick={onDismiss} aria-label={t('dismiss')} title={t('dismiss')}>
+            <IconX size={16} />
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function ProgressBar({ progress, testId = 'progress', compact }: { progress: Progress | null; testId?: string; compact?: boolean }) {
+  const { t, tx } = useI18n();
+  const ratio = progress?.ratio;
+  const known = typeof ratio === 'number' && Number.isFinite(ratio);
+  const pct = known ? Math.round(Math.min(1, Math.max(0, ratio)) * 100) : null;
+  const label = progress ? tx(progress.label) : t('starting');
+  return (
+    <div className={`progress${compact ? ' progress-compact' : ''}`} data-testid={testId}>
+      <div className="progress-text" aria-live="polite">
+        <span className="truncate">{label}</span>
+        {pct !== null && <span className="tabular">{pct}%</span>}
+      </div>
+      <div
+        className={`progress-track${known ? '' : ' is-indeterminate'}`}
+        role="progressbar"
+        aria-label={label}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={pct ?? undefined}
+      >
+        <div className="progress-fill" style={known ? { width: `${pct}%` } : undefined} />
+      </div>
+    </div>
+  );
+}

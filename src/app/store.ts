@@ -1,0 +1,263 @@
+/**
+ * App state: a plain reducer (no library) plus loading / saving the
+ * persisted parts. Heavy three.js objects live outside the state (see
+ * useStudio); this module stays pure and Node-testable.
+ */
+import type { Driver, I18nText, Lang, Mask, ParamValue, ParamValues, Progress, RGBAImage } from '../core/types';
+import { defaultParams } from '../core/types';
+import type { MeshStats } from '../core/mesh/stats';
+import { MESH_PARAMS } from '../core/mesh/options';
+import { detectLang, type UIKey } from './i18n';
+import { suggestedMeshMode } from './driverMeta';
+import { isBackgroundMode, type BackgroundMode, type MaskNote, type SourceImage } from './pipeline';
+import { loadJSON, persistableParams, sanitizeParams, saveJSON, type KeyValueStore } from './persist';
+
+export type Theme = 'dark' | 'light';
+export type JobStatus = 'idle' | 'running' | 'done' | 'error' | 'cancelled';
+
+export interface ViewSettings {
+  texture: boolean;
+  wireframe: boolean;
+  clay: boolean;
+  autoRotate: boolean;
+  darkBackground: boolean;
+  showDepth: boolean;
+}
+
+export interface ResultInfo {
+  driverId: string;
+  kind: 'depth' | 'geometry' | 'model';
+  stats: MeshStats;
+  /** Grayscale preview of the depth map (depth results only). */
+  depthPreview: RGBAImage | null;
+  elapsedMs: number;
+  sourceName: string;
+}
+
+export interface AppState {
+  lang: Lang;
+  theme: Theme;
+  source: SourceImage | null;
+  loadingImage: boolean;
+  bgMode: BackgroundMode;
+  /** Mask for the preview overlay (and for generation in the non-AI modes). */
+  mask: Mask | null;
+  maskNote: MaskNote;
+  /** Cached AI background-removal mask for the current source. */
+  aiMask: { source: SourceImage; mask: Mask | null } | null;
+  showMask: boolean;
+  driverId: string;
+  params: Record<string, ParamValues>;
+  meshParams: ParamValues;
+  /** Shown once after the mesh mode was auto-set for the selected driver. */
+  meshNotice: I18nText | null;
+  status: JobStatus;
+  progress: Progress | null;
+  error: I18nText | null;
+  /** Heading for the error alert (image loading vs generation). */
+  errorTitle: UIKey;
+  result: ResultInfo | null;
+  view: ViewSettings;
+  stlSizeMm: number;
+}
+
+export type Action =
+  | { type: 'setLang'; lang: Lang }
+  | { type: 'setTheme'; theme: Theme }
+  | { type: 'imageLoading' }
+  | { type: 'imageLoaded'; source: SourceImage; mask: Mask | null; maskNote: MaskNote }
+  | { type: 'imageFailed'; error: I18nText }
+  | { type: 'clearImage' }
+  | { type: 'setBgMode'; mode: BackgroundMode; mask: Mask | null; maskNote: MaskNote }
+  | { type: 'setShowMask'; show: boolean }
+  | { type: 'selectDriver'; driver: Driver }
+  | { type: 'setParam'; driverId: string; key: string; value: ParamValue }
+  | { type: 'resetParams'; driver: Driver }
+  | { type: 'setMeshParam'; key: string; value: ParamValue }
+  | { type: 'resetMeshParams' }
+  | { type: 'jobStart' }
+  | { type: 'jobProgress'; progress: Progress }
+  | { type: 'jobDone'; result: ResultInfo; source: SourceImage; bgMode: BackgroundMode; inputMask: Mask | null }
+  | { type: 'jobFailed'; error: I18nText }
+  | { type: 'jobCancelled' }
+  | { type: 'statsUpdated'; stats: MeshStats }
+  | { type: 'setView'; view: Partial<ViewSettings> }
+  | { type: 'dismissError' }
+  | { type: 'setStlSize'; mm: number };
+
+export const DEFAULT_VIEW: ViewSettings = {
+  texture: true,
+  wireframe: false,
+  clay: false,
+  autoRotate: false,
+  darkBackground: true,
+  showDepth: true,
+};
+
+export const DEFAULT_STL_SIZE_MM = 100;
+
+export function reducer(state: AppState, action: Action): AppState {
+  switch (action.type) {
+    case 'setLang':
+      return { ...state, lang: action.lang };
+    case 'setTheme':
+      // The viewer background follows the theme (the viewer toolbar can still override it).
+      return { ...state, theme: action.theme, view: { ...state.view, darkBackground: action.theme === 'dark' } };
+    case 'imageLoading':
+      return { ...state, loadingImage: true, error: null };
+    case 'imageLoaded':
+      return {
+        ...state,
+        loadingImage: false,
+        source: action.source,
+        mask: action.mask,
+        maskNote: action.maskNote,
+        aiMask: null,
+        error: null,
+        status: state.status === 'running' ? 'running' : 'idle',
+      };
+    case 'imageFailed':
+      return { ...state, loadingImage: false, error: action.error, errorTitle: 'imageErrorTitle' };
+    case 'clearImage':
+      return { ...state, source: null, mask: null, maskNote: null, aiMask: null };
+    case 'setBgMode': {
+      // The cached AI mask survives mode switches so going back to 'ai' is instant.
+      const cached = action.mode === 'ai' && state.aiMask && state.aiMask.source === state.source ? state.aiMask : null;
+      return {
+        ...state,
+        bgMode: action.mode,
+        mask: cached ? cached.mask : action.mask,
+        maskNote: cached ? null : action.maskNote,
+      };
+    }
+    case 'setShowMask':
+      return { ...state, showMask: action.show };
+    case 'selectDriver': {
+      const { driver } = action;
+      const params = state.params[driver.id] ? state.params : { ...state.params, [driver.id]: defaultParams(driver.params) };
+      const mode = suggestedMeshMode(driver);
+      let meshParams = state.meshParams;
+      let meshNotice: I18nText | null = null;
+      if (driver.id !== state.driverId && mode && meshParams.mode !== mode) {
+        meshParams = { ...meshParams, mode };
+        const option = MESH_PARAMS.find((p) => p.key === 'mode');
+        const label = option?.kind === 'select' ? option.options.find((o) => o.value === mode)?.label : undefined;
+        if (label) meshNotice = label;
+      }
+      return { ...state, driverId: driver.id, params, meshParams, meshNotice };
+    }
+    case 'setParam': {
+      const current = state.params[action.driverId] ?? {};
+      return { ...state, params: { ...state.params, [action.driverId]: { ...current, [action.key]: action.value } } };
+    }
+    case 'resetParams':
+      return { ...state, params: { ...state.params, [action.driver.id]: defaultParams(action.driver.params) } };
+    case 'setMeshParam':
+      return { ...state, meshParams: { ...state.meshParams, [action.key]: action.value }, meshNotice: null };
+    case 'resetMeshParams':
+      return { ...state, meshParams: defaultParams(MESH_PARAMS), meshNotice: null };
+    case 'jobStart':
+      return { ...state, status: 'running', progress: null, error: null };
+    case 'jobProgress':
+      return state.status === 'running' ? { ...state, progress: action.progress } : state;
+    case 'jobDone': {
+      const next: AppState = { ...state, status: 'done', progress: null, result: action.result };
+      if (action.bgMode === 'ai') {
+        next.aiMask = { source: action.source, mask: action.inputMask };
+        if (state.source === action.source && state.bgMode === 'ai') {
+          next.mask = action.inputMask;
+          next.maskNote = null;
+        }
+      }
+      return next;
+    }
+    case 'jobFailed':
+      return { ...state, status: 'error', progress: null, error: action.error, errorTitle: 'errorTitle' };
+    case 'jobCancelled':
+      return { ...state, status: 'cancelled', progress: null };
+    case 'statsUpdated':
+      return state.result ? { ...state, result: { ...state.result, stats: action.stats } } : state;
+    case 'setView':
+      return { ...state, view: { ...state.view, ...action.view } };
+    case 'dismissError':
+      return { ...state, error: null, status: state.status === 'error' ? 'idle' : state.status };
+    case 'setStlSize':
+      return Number.isFinite(action.mm) && action.mm > 0 ? { ...state, stlSizeMm: action.mm } : state;
+  }
+}
+
+interface StoredSettings {
+  lang?: unknown;
+  theme?: unknown;
+  driverId?: unknown;
+  bgMode?: unknown;
+  view?: unknown;
+  stlSizeMm?: unknown;
+  showMask?: unknown;
+}
+
+export interface InitEnv {
+  store: KeyValueStore | null;
+  languages: readonly string[] | string | undefined;
+  drivers: Driver[];
+  defaultDriverId: string;
+  prefersLight?: boolean;
+}
+
+export function createInitialState(env: InitEnv): AppState {
+  const settings = (loadJSON(env.store, 'settings') ?? {}) as StoredSettings;
+  const lang: Lang = settings.lang === 'tr' || settings.lang === 'en' ? settings.lang : detectLang(env.languages);
+  const theme: Theme = settings.theme === 'light' || settings.theme === 'dark' ? settings.theme : env.prefersLight ? 'light' : 'dark';
+  const known = (id: unknown) => typeof id === 'string' && env.drivers.some((d) => d.id === id);
+  const driverId = known(settings.driverId)
+    ? (settings.driverId as string)
+    : known(env.defaultDriverId)
+      ? env.defaultDriverId
+      : (env.drivers[0]?.id ?? env.defaultDriverId);
+  const params: Record<string, ParamValues> = {};
+  for (const d of env.drivers) params[d.id] = sanitizeParams(d.params, loadJSON(env.store, `params:${d.id}`));
+  const storedView = settings.view && typeof settings.view === 'object' ? (settings.view as Record<string, unknown>) : {};
+  const view: ViewSettings = { ...DEFAULT_VIEW, darkBackground: theme === 'dark' };
+  for (const k of Object.keys(DEFAULT_VIEW) as (keyof ViewSettings)[]) if (typeof storedView[k] === 'boolean') view[k] = storedView[k] as boolean;
+  const stl = typeof settings.stlSizeMm === 'number' && settings.stlSizeMm > 0 && settings.stlSizeMm <= 10_000 ? settings.stlSizeMm : DEFAULT_STL_SIZE_MM;
+  return {
+    lang,
+    theme,
+    source: null,
+    loadingImage: false,
+    bgMode: isBackgroundMode(settings.bgMode) ? settings.bgMode : 'auto',
+    mask: null,
+    maskNote: null,
+    aiMask: null,
+    showMask: typeof settings.showMask === 'boolean' ? settings.showMask : false,
+    driverId,
+    params,
+    meshParams: sanitizeParams(MESH_PARAMS, loadJSON(env.store, 'mesh')),
+    meshNotice: null,
+    status: 'idle',
+    progress: null,
+    error: null,
+    errorTitle: 'errorTitle',
+    result: null,
+    view,
+    stlSizeMm: stl,
+  };
+}
+
+/** Persist settings, mesh params and every driver's non-secret params. */
+export function saveState(store: KeyValueStore | null, state: AppState, drivers: Driver[]): void {
+  saveJSON(store, 'settings', {
+    lang: state.lang,
+    theme: state.theme,
+    driverId: state.driverId,
+    bgMode: state.bgMode,
+    view: state.view,
+    stlSizeMm: state.stlSizeMm,
+    showMask: state.showMask,
+  });
+  saveJSON(store, 'mesh', state.meshParams);
+  for (const d of drivers) {
+    const values = state.params[d.id];
+    if (values) saveJSON(store, `params:${d.id}`, persistableParams(d.params, values));
+  }
+}

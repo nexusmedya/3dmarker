@@ -25,7 +25,10 @@ export interface MeshOptions {
   discontinuity: number;
   /** Flip near/far. */
   invert: boolean;
-  /** Extra thickness under the surface in solid mode, fraction of longest side. */
+  /**
+   * Fraction of the longest side. solid: flat base under the surface;
+   * double: rim band between front and mirrored back. Unused in relief mode.
+   */
   baseThickness: number;
   /** Gamma applied to depth (d^gamma) to exaggerate / flatten relief. */
   gamma: number;
@@ -100,7 +103,10 @@ export const MESH_PARAMS: ParamSpec[] = [
     kind: 'number',
     key: 'baseThickness',
     label: { tr: 'Taban kalınlığı', en: 'Base thickness' },
-    hint: { tr: 'Yalnızca katı modda', en: 'Solid mode only' },
+    hint: {
+      tr: 'Katı modda taban, çift yüz modunda kenar kalınlığı',
+      en: 'Solid: base under the surface; double-sided: rim thickness',
+    },
     min: 0, max: 0.2, step: 0.005, default: DEFAULT_MESH_OPTIONS.baseThickness,
   },
   {
