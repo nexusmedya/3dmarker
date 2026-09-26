@@ -19,7 +19,7 @@ const opts = (o: Partial<InflateOptions> = {}): InflateOptions => ({ profile: 'r
 
 function input(image: RGBAImage, mask: Mask | null, params = {}, signal = new AbortController().signal): DriverInput {
   return {
-    image, mask, file: new Blob(), signal, onProgress: () => {},
+    image, mask, file: new Blob(), views: {}, signal, onProgress: () => {},
     params: { ...defaultParams(inflateDriver.params), ...params },
   };
 }

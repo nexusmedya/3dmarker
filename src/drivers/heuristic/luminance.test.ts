@@ -112,7 +112,7 @@ describe('autoLevels', () => {
 describe('luminanceDriver', () => {
   const run = (image: RGBAImage, mask: Mask | null, signal = new AbortController().signal) =>
     luminanceDriver.run({
-      image, mask, file: new Blob(), signal, onProgress: () => {}, params: defaultParams(luminanceDriver.params),
+      image, mask, file: new Blob(), views: {}, signal, onProgress: () => {}, params: defaultParams(luminanceDriver.params),
     } satisfies DriverInput);
 
   it('declares its contract', () => {
@@ -147,7 +147,7 @@ describe('luminanceDriver', () => {
       let settled = false;
       const job = luminanceDriver
         .run({
-          image: ramp, mask: null, file: new Blob(), signal: new AbortController().signal,
+          image: ramp, mask: null, file: new Blob(), views: {}, signal: new AbortController().signal,
           onProgress: (p) => labels.push(p.label.en), params: defaultParams(luminanceDriver.params),
         })
         .finally(() => (settled = true));

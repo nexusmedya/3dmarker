@@ -22,8 +22,8 @@ import {
   UnsignedByteType,
   Vector3,
 } from 'three';
-import type { BufferGeometry, Object3D, Side, Texture } from 'three';
-import type { DepthMap, Driver, DriverResult, Mask, ParamValues, Progress, RGBAImage } from '../core/types';
+import type { AnimationClip, BufferGeometry, Object3D, Side, Texture } from 'three';
+import type { DepthMap, Driver, DriverResult, Mask, ParamValues, Progress, RGBAImage, ViewSet } from '../core/types';
 import { AbortError, throwIfAborted } from '../core/types';
 import { fitRGBA, hasTransparency, maskArea, maskFromAlpha } from '../core/image/ops';
 import { autoMaskFromBorder } from '../core/image/autoMask';
@@ -185,6 +185,8 @@ export interface BuiltModel {
   meshKey: string | null;
   /** Depth results only: rebuild the surface in place for new mesh params (disposes the old geometry). */
   remesh: ((meshParams: ParamValues) => MeshStats) | null;
+  /** Animation clips carried by the model (rigged models; exported with GLB). */
+  animations?: AnimationClip[];
 }
 
 /**
@@ -338,6 +340,8 @@ export interface PipelineRequest {
   onProgress: (p: Progress) => void;
   /** Mask already computed for this source + mode; `undefined` computes it (AI removal for 'ai'). */
   mask?: Mask | null;
+  /** Extra views (back / sides / top / bottom); the front view is added from `source`. */
+  views?: ViewSet;
   removeBg?: typeof removeBackground;
 }
 
@@ -359,6 +363,7 @@ export async function runPipeline(req: PipelineRequest): Promise<PipelineResult>
     mask: inputMask,
     file: source.file,
     params: req.params,
+    views: req.views ?? {},
     signal,
     onProgress,
   });

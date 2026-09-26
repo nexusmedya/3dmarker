@@ -59,6 +59,7 @@ function input(params: ParamValues = {}, file: Blob = new File([new Uint8Array([
     image: { width: 1, height: 1, data: new Uint8ClampedArray(4) },
     mask: null,
     file,
+    views: {},
     params: { ...defaultParams(tripoDriver.params), ...params },
     signal: ctl.signal,
     onProgress: (p) => progress.push(p),

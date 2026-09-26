@@ -5,17 +5,19 @@
 import type { Driver, DriverBadge, DriverCategory, I18nText } from '../core/types';
 import type { MeshMode } from '../core/mesh/options';
 
-export const CATEGORY_ORDER: DriverCategory[] = ['ml', 'heuristic', 'cloud'];
+export const CATEGORY_ORDER: DriverCategory[] = ['ml', 'heuristic', 'multiview', 'cloud'];
 
 export const CATEGORY_LABELS: Record<DriverCategory, I18nText> = {
   ml: { tr: 'Yapay zekâ derinlik (tarayıcıda)', en: 'ML depth (in-browser)' },
   heuristic: { tr: 'Sezgisel (anında, çevrimdışı)', en: 'Heuristic (instant, offline)' },
+  multiview: { tr: 'Çok görünümlü (tam 3D, tarayıcıda)', en: 'Multi-view (full 3D, in-browser)' },
   cloud: { tr: 'Bulut (tam 3D)', en: 'Cloud (full 3D)' },
 };
 
 export const CATEGORY_SHORT: Record<DriverCategory, I18nText> = {
   ml: { tr: 'Yapay zekâ', en: 'ML depth' },
   heuristic: { tr: 'Sezgisel', en: 'Heuristic' },
+  multiview: { tr: 'Çok görünüm', en: 'Multi-view' },
   cloud: { tr: 'Bulut', en: 'Cloud' },
 };
 
@@ -26,6 +28,8 @@ export const BADGE_LABELS: Record<DriverBadge, I18nText> = {
   'api-key': { tr: 'API anahtarı', en: 'API key' },
   'closed-mesh': { tr: 'Kapalı mesh', en: 'Closed mesh' },
   'full-3d': { tr: 'Tam 3D', en: 'Full 3D' },
+  'multi-view': { tr: 'Çok görünüm', en: 'Multi-view' },
+  'human-detail': { tr: 'İnsan detayı', en: 'Human detail' },
 };
 
 export const BADGE_HINTS: Record<DriverBadge, I18nText> = {
@@ -35,6 +39,8 @@ export const BADGE_HINTS: Record<DriverBadge, I18nText> = {
   'api-key': { tr: 'Sunucu tarafında ya da sizin API anahtarınızı ister', en: 'Needs a server-side or your own API key' },
   'closed-mesh': { tr: 'Kapalı (watertight) mesh üretebilir', en: 'Can produce a closed (watertight) mesh' },
   'full-3d': { tr: 'Görünmeyen arka yüzü de oluşturur', en: 'Reconstructs the unseen back side' },
+  'multi-view': { tr: 'Arka / yan / üst / alt görünümleri kullanır', en: 'Uses the back / side / top / bottom views' },
+  'human-detail': { tr: 'Yüz ve elleri işaret noktalarıyla ayrıntılandırır', en: 'Refines faces and hands with landmark detection' },
 };
 
 const BEST_FOR: Record<string, I18nText> = {
@@ -50,6 +56,7 @@ const BEST_FOR: Record<string, I18nText> = {
 const BEST_FOR_FALLBACK: Record<DriverCategory, I18nText> = {
   ml: { tr: 'Fotoğraflar ve sahneler', en: 'Photos and scenes' },
   heuristic: { tr: 'Basit grafikler', en: 'Simple graphics' },
+  multiview: { tr: 'Birden çok görünümü olan karakter ve nesneler', en: 'Characters and objects with several views' },
   cloud: { tr: 'Tam 3D nesneler', en: 'Full 3D objects' },
 };
 

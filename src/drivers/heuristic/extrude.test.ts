@@ -27,7 +27,7 @@ const opts = (o: Partial<ExtrudeOptions> = {}): ExtrudeOptions => ({ ...DEFAULT_
 
 function input(image: RGBAImage, mask: Mask | null, params = {}, signal = new AbortController().signal): DriverInput {
   return {
-    image, mask, file: new Blob(), signal, onProgress: () => {},
+    image, mask, file: new Blob(), views: {}, signal, onProgress: () => {},
     params: { ...defaultParams(extrudeDriver.params), ...params },
   };
 }

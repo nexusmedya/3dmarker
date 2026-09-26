@@ -29,6 +29,7 @@ function input(over: Partial<DriverInput> = {}): DriverInput & { progress: Progr
     image: { width, height, data: new Uint8ClampedArray(width * height * 4).fill(200) },
     mask: null,
     file: new Blob(),
+    views: {},
     params: {},
     signal: new AbortController().signal,
     onProgress: (p) => progress.push(p),

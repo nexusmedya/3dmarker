@@ -8,6 +8,13 @@
  * everything, including the renderer. Display modes (texture off,
  * wireframe, clay) swap in display materials and never mutate the originals,
  * so `getExportObject` can hand the exporters the pristine materials.
+ *
+ * Extension points for tools that live on top of the viewer (sculpting,
+ * rigging / animation): `addFrameListener` (per-frame callback; return true
+ * while something animates so frames keep rendering), `invalidate`,
+ * `getObject`, `canvas`, `setOrbitEnabled` and `addOverlay` /
+ * `removeOverlay` for helpers (brush cursor, skeleton) that the viewer shows
+ * but does not own (the caller disposes them).
  */
 import {
   ACESFilmicToneMapping,
@@ -123,6 +130,9 @@ export class ViewerCore {
   private display: ViewerDisplay;
   private dirty = true;
   private visible = true;
+  private readonly frameListeners = new Set<(dt: number) => boolean | void>();
+  private readonly overlays = new Group();
+  private lastTick = 0;
   private disposed = false;
   private readonly resizeObserver: ResizeObserver | null = null;
   private readonly intersectionObserver: IntersectionObserver | null = null;
@@ -167,7 +177,8 @@ export class ViewerCore {
     this.ground.rotation.x = -Math.PI / 2;
     this.ground.receiveShadow = true;
     this.ground.position.y = -1;
-    this.scene.add(this.ground, this.root);
+    this.overlays.name = 'overlays';
+    this.scene.add(this.ground, this.root, this.overlays);
 
     this.controls = new OrbitControls(this.camera, renderer.domElement);
     this.controls.enableDamping = true;
@@ -193,10 +204,15 @@ export class ViewerCore {
     renderer.setAnimationLoop(this.tick);
   }
 
-  private readonly tick = () => {
+  private readonly tick = (time?: number) => {
     if (!this.visible || this.disposed) return;
+    const now = typeof time === 'number' ? time : performance.now();
+    const dt = this.lastTick ? Math.min(0.1, (now - this.lastTick) / 1000) : 0;
+    this.lastTick = now;
+    let animating = false;
+    for (const fn of this.frameListeners) if (fn(dt) === true) animating = true;
     const moved = this.controls.update();
-    if (moved || this.dirty) {
+    if (moved || this.dirty || animating) {
       this.dirty = false;
       this.renderer.render(this.scene, this.camera);
     }
@@ -208,6 +224,50 @@ export class ViewerCore {
     this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    this.dirty = true;
+  }
+
+  /** The canvas the viewer renders into (pointer events for tools). */
+  get canvas(): HTMLCanvasElement {
+    return this.renderer.domElement;
+  }
+
+  /** The object on screen (the one passed to setObject), or null. */
+  getObject(): Object3D | null {
+    return this.object;
+  }
+
+  /** Request a render on the next frame (after editing geometry / transforms in place). */
+  invalidate(): void {
+    this.dirty = true;
+  }
+
+  /**
+   * Call `fn(dt)` every frame (dt in seconds, clamped to 0.1). Return true
+   * while it animates to keep frames rendering. Returns the unsubscribe.
+   */
+  addFrameListener(fn: (dt: number) => boolean | void): () => void {
+    this.frameListeners.add(fn);
+    this.dirty = true;
+    return () => {
+      this.frameListeners.delete(fn);
+      this.dirty = true;
+    };
+  }
+
+  /** Enable / disable orbiting (e.g. while a sculpt stroke or joint drag is in progress). */
+  setOrbitEnabled(enabled: boolean): void {
+    this.controls.enabled = enabled;
+  }
+
+  /** Show a helper (not owned: never disposed by the viewer; call removeOverlay then dispose it yourself). */
+  addOverlay(obj: Object3D): void {
+    this.overlays.add(obj);
+    this.dirty = true;
+  }
+
+  removeOverlay(obj: Object3D): void {
+    this.overlays.remove(obj);
     this.dirty = true;
   }
 
@@ -275,6 +335,8 @@ export class ViewerCore {
     if (this.disposed) return;
     this.disposed = true;
     this.renderer.setAnimationLoop(null);
+    this.frameListeners.clear();
+    this.scene.remove(this.overlays);
     this.resizeObserver?.disconnect();
     this.intersectionObserver?.disconnect();
     this.clearObject();
