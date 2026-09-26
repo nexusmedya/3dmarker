@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_MODEL_HOSTS,
+  DEFAULT_MULTIVIEW_ORDER,
   TripoClient,
   TripoError,
   isTrustedModelUrl,
   openModelDownload,
   parseHostList,
+  parseMultiviewOrder,
   redactSecrets,
   resolveModelUrl,
 } from './tripo';
@@ -64,6 +66,38 @@ describe('TripoClient', () => {
     });
     expect(await c.createImageToModelTask('tok', { fileType: 'png', faceLimit: 0, texture: true })).toBe('t-1');
     expect(body).toEqual({ type: 'image_to_model', file: { type: 'png', file_token: 'tok' }, texture: true });
+  });
+
+  it('sends the multi-view task body: four files in order, {} for missing views', async () => {
+    let body: unknown;
+    const { c } = client((_url, init) => {
+      body = JSON.parse(init.body as string);
+      return json({ code: 0, data: { task_id: 'mv-1' } });
+    });
+    const files = { front: { fileType: 'png' as const, fileToken: 'f' }, back: { fileType: 'jpg' as const, fileToken: 'b' } };
+    expect(await c.createMultiviewToModelTask(files, { modelVersion: 'v2.5-20250123', pbr: false, faceLimit: 10000 })).toBe('mv-1');
+    expect(body).toEqual({
+      type: 'multiview_to_model',
+      files: [{ type: 'png', file_token: 'f' }, {}, { type: 'jpg', file_token: 'b' }, {}],
+      model_version: 'v2.5-20250123',
+      pbr: false,
+      face_limit: 10000,
+    });
+    await c.createMultiviewToModelTask(files, {}, undefined, ['front', 'right', 'back', 'left']);
+    expect((body as { files: unknown[] }).files).toEqual([{ type: 'png', file_token: 'f' }, {}, { type: 'jpg', file_token: 'b' }, {}]);
+    await c.createMultiviewToModelTask({ ...files, left: { fileType: 'webp', fileToken: 'l' } }, {}, undefined, ['front', 'right', 'back', 'left']);
+    expect((body as { files: unknown[] }).files[3]).toEqual({ type: 'webp', file_token: 'l' });
+    const e = await rejection(c.createMultiviewToModelTask({ back: files.back }, {}));
+    expect(e.message).toMatch(/front/);
+  });
+
+  it('parseMultiviewOrder accepts only permutations of the four views', () => {
+    expect(DEFAULT_MULTIVIEW_ORDER).toEqual(['front', 'left', 'back', 'right']);
+    expect(parseMultiviewOrder(' Front, right ,back,left')).toEqual(['front', 'right', 'back', 'left']);
+    expect(parseMultiviewOrder(undefined)).toBeNull();
+    expect(parseMultiviewOrder('front,left,back')).toBeNull();
+    expect(parseMultiviewOrder('front,left,back,back')).toBeNull();
+    expect(parseMultiviewOrder('front,left,back,top')).toBeNull();
   });
 
   it('normalises task responses', async () => {

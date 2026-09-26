@@ -79,7 +79,7 @@ describe('useStudio generation guards', () => {
 
     const decode = deferred<SourceImage>();
     mocks.prepareSource.mockImplementationOnce(() => decode.promise);
-    let pending!: Promise<void>;
+    let pending!: Promise<unknown>;
     await act(async () => {
       pending = studio.actions.loadFile(new Blob(), 'new.png');
       // Same task as the paste: before React re-renders with loadingImage.
@@ -126,7 +126,7 @@ describe('useStudio generation guards', () => {
     await loadNow('a.png');
     const decode = deferred<SourceImage>();
     mocks.prepareSource.mockImplementationOnce(() => decode.promise);
-    let pending!: Promise<void>;
+    let pending!: Promise<unknown>;
     await act(async () => {
       pending = studio.actions.loadFile(new Blob(), 'big.png');
     });

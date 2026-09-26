@@ -6,6 +6,10 @@
 import type { I18nText } from '../core/types';
 
 type Ctx = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
+type Draw = (ctx: Ctx, w: number, h: number) => void;
+
+/** Extra views a sample comes with (same size as the front; conventions of src/core/types.ts). */
+export type SampleViewId = 'back' | 'left' | 'right' | 'top' | 'bottom';
 
 export interface SampleSpec {
   id: string;
@@ -15,7 +19,9 @@ export interface SampleSpec {
   height: number;
   /** Driver that shows this sample off best. */
   driverId: string;
-  draw: (ctx: Ctx, w: number, h: number) => void;
+  draw: Draw;
+  /** Procedural extra views loaded with the sample (multi-view drivers work offline with them). */
+  views?: Partial<Record<SampleViewId, Draw>>;
 }
 
 /** Deterministic PRNG (mulberry32) so samples look the same every time. */
@@ -251,6 +257,212 @@ function drawLandscape(ctx: Ctx, w: number, h: number): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// T-pose mannequin: front / back / left / right, one silhouette frame
+// (head top at 5.8 %, feet at 94.5 % of the height, arm span 90 % of the width)
+// so the views line up for multi-view fusion and the rig's T-pose detection.
+
+const MANNEQUIN = {
+  skin: '#e9b48f',
+  skinShade: '#d39a74',
+  hair: '#3f2a1d',
+  shirt: '#2563eb',
+  shirtShade: '#1d4ed8',
+  pants: '#1f2f4d',
+  shoes: '#111827',
+};
+
+/** Rounded capsule between two points (thickness `r` at a, `r2` at b). */
+function limb(ctx: Ctx, ax: number, ay: number, bx: number, by: number, r: number, r2 = r): void {
+  const a = Math.atan2(by - ay, bx - ax);
+  const nx = -Math.sin(a), ny = Math.cos(a);
+  ctx.beginPath();
+  ctx.moveTo(ax + nx * r, ay + ny * r);
+  ctx.lineTo(bx + nx * r2, by + ny * r2);
+  ctx.arc(bx, by, r2, a + Math.PI / 2, a - Math.PI / 2, true);
+  ctx.lineTo(ax - nx * r, ay - ny * r);
+  ctx.arc(ax, ay, r, a - Math.PI / 2, a + Math.PI / 2, true);
+  ctx.closePath();
+  ctx.fill();
+}
+
+/** Front or back of the mannequin (the silhouette is symmetric, so both share it). */
+function drawMannequinFrontBack(ctx: Ctx, w: number, h: number, back: boolean): void {
+  const s = Math.min(w, h);
+  const cx = w / 2;
+  const C = MANNEQUIN;
+  ctx.clearRect(0, 0, w, h);
+  // Legs and shoes.
+  for (const side of [-1, 1]) {
+    ctx.fillStyle = C.pants;
+    limb(ctx, cx + side * s * 0.058, h * 0.53, cx + side * s * 0.06, h * 0.89, s * 0.045, s * 0.03);
+    ctx.fillStyle = C.shoes;
+    ctx.beginPath();
+    ctx.ellipse(cx + side * s * 0.065, h * 0.915, s * 0.04, s * 0.03, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // Arms straight out (T-pose) with hands.
+  for (const side of [-1, 1]) {
+    ctx.fillStyle = C.skin;
+    limb(ctx, cx + side * s * 0.1, h * 0.275, cx + side * s * 0.41, h * 0.275, s * 0.03, s * 0.022);
+    ctx.fillStyle = C.shirt;
+    limb(ctx, cx + side * s * 0.1, h * 0.275, cx + side * s * 0.2, h * 0.275, s * 0.036, s * 0.033);
+    ctx.fillStyle = C.skinShade;
+    ctx.beginPath();
+    ctx.ellipse(cx + side * s * 0.435, h * 0.276, s * 0.032, s * 0.026, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // Neck and head.
+  ctx.fillStyle = C.skin;
+  ctx.fillRect(cx - s * 0.025, h * 0.18, s * 0.05, h * 0.06);
+  ctx.beginPath();
+  ctx.ellipse(cx, h * 0.13, s * 0.06, s * 0.072, 0, 0, Math.PI * 2);
+  ctx.fill();
+  for (const side of [-1, 1]) {
+    ctx.beginPath();
+    ctx.ellipse(cx + side * s * 0.06, h * 0.135, s * 0.012, s * 0.02, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.fillStyle = C.hair;
+  ctx.beginPath();
+  if (back) ctx.ellipse(cx, h * 0.125, s * 0.062, s * 0.07, 0, 0, Math.PI * 2);
+  else ctx.ellipse(cx, h * 0.095, s * 0.062, s * 0.04, 0, Math.PI, Math.PI * 2);
+  ctx.fill();
+  // Torso: shoulders → waist → hips.
+  const shirt = ctx.createLinearGradient(cx - s * 0.12, 0, cx + s * 0.12, 0);
+  shirt.addColorStop(0, C.shirtShade);
+  shirt.addColorStop(0.5, C.shirt);
+  shirt.addColorStop(1, C.shirtShade);
+  ctx.fillStyle = shirt;
+  ctx.beginPath();
+  ctx.moveTo(cx - s * 0.1, h * 0.24);
+  ctx.quadraticCurveTo(cx - s * 0.125, h * 0.25, cx - s * 0.12, h * 0.3);
+  ctx.quadraticCurveTo(cx - s * 0.1, h * 0.42, cx - s * 0.1, h * 0.46);
+  ctx.lineTo(cx + s * 0.1, h * 0.46);
+  ctx.quadraticCurveTo(cx + s * 0.1, h * 0.42, cx + s * 0.12, h * 0.3);
+  ctx.quadraticCurveTo(cx + s * 0.125, h * 0.25, cx + s * 0.1, h * 0.24);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = C.pants;
+  ctx.beginPath();
+  ctx.moveTo(cx - s * 0.1, h * 0.455);
+  ctx.lineTo(cx + s * 0.1, h * 0.455);
+  ctx.quadraticCurveTo(cx + s * 0.11, h * 0.5, cx + s * 0.1, h * 0.55);
+  ctx.lineTo(cx - s * 0.1, h * 0.55);
+  ctx.quadraticCurveTo(cx - s * 0.11, h * 0.5, cx - s * 0.1, h * 0.455);
+  ctx.closePath();
+  ctx.fill();
+  if (back) return;
+  // Face.
+  ctx.fillStyle = '#1e293b';
+  for (const side of [-1, 1]) {
+    ctx.beginPath();
+    ctx.arc(cx + side * s * 0.022, h * 0.128, s * 0.007, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.fillStyle = C.skinShade;
+  ctx.beginPath();
+  ctx.ellipse(cx, h * 0.142, s * 0.008, s * 0.012, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#9f3a3a';
+  ctx.lineWidth = s * 0.006;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.arc(cx, h * 0.152, s * 0.014, 0.2 * Math.PI, 0.8 * Math.PI);
+  ctx.stroke();
+}
+
+/** Profile facing the image's left (the mannequin's left side: `left` view). */
+function drawMannequinProfile(ctx: Ctx, w: number, h: number): void {
+  const s = Math.min(w, h);
+  const cx = w / 2;
+  const C = MANNEQUIN;
+  // Legs (both behind each other) and a shoe pointing forward (left).
+  ctx.fillStyle = C.pants;
+  limb(ctx, cx, h * 0.53, cx, h * 0.89, s * 0.05, s * 0.034);
+  ctx.fillStyle = C.shoes;
+  ctx.beginPath();
+  ctx.ellipse(cx - s * 0.025, h * 0.915, s * 0.06, s * 0.03, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // Torso (front to the left: chest a bit forward), hips.
+  ctx.fillStyle = C.shirt;
+  ctx.beginPath();
+  ctx.moveTo(cx - s * 0.04, h * 0.24);
+  ctx.quadraticCurveTo(cx - s * 0.075, h * 0.3, cx - s * 0.065, h * 0.38);
+  ctx.quadraticCurveTo(cx - s * 0.055, h * 0.43, cx - s * 0.058, h * 0.46);
+  ctx.lineTo(cx + s * 0.058, h * 0.46);
+  ctx.quadraticCurveTo(cx + s * 0.06, h * 0.35, cx + s * 0.05, h * 0.26);
+  ctx.quadraticCurveTo(cx + s * 0.045, h * 0.24, cx + s * 0.03, h * 0.24);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = C.pants;
+  ctx.beginPath();
+  ctx.moveTo(cx - s * 0.06, h * 0.455);
+  ctx.lineTo(cx + s * 0.06, h * 0.455);
+  ctx.quadraticCurveTo(cx + s * 0.07, h * 0.5, cx + s * 0.055, h * 0.55);
+  ctx.lineTo(cx - s * 0.055, h * 0.55);
+  ctx.quadraticCurveTo(cx - s * 0.065, h * 0.5, cx - s * 0.06, h * 0.455);
+  ctx.closePath();
+  ctx.fill();
+  // The near arm points at the camera: the hand seen head-on (it hides the arm behind it).
+  ctx.fillStyle = C.skin;
+  ctx.beginPath();
+  ctx.arc(cx, h * 0.275, s * 0.036, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = C.skinShade;
+  ctx.beginPath();
+  ctx.ellipse(cx, h * 0.276, s * 0.022, s * 0.026, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // Neck, head with nose (left), ear and hair at the back (right).
+  ctx.fillStyle = C.skin;
+  ctx.fillRect(cx - s * 0.022, h * 0.18, s * 0.044, h * 0.06);
+  ctx.beginPath();
+  ctx.ellipse(cx, h * 0.13, s * 0.065, s * 0.072, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(cx - s * 0.06, h * 0.125);
+  ctx.lineTo(cx - s * 0.08, h * 0.145);
+  ctx.lineTo(cx - s * 0.058, h * 0.15);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = C.hair;
+  ctx.beginPath();
+  ctx.ellipse(cx + s * 0.012, h * 0.115, s * 0.058, s * 0.055, 0, Math.PI * 0.85, Math.PI * 2.25);
+  ctx.fill();
+  ctx.fillStyle = C.skinShade;
+  ctx.beginPath();
+  ctx.ellipse(cx + s * 0.008, h * 0.135, s * 0.012, s * 0.02, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#1e293b';
+  ctx.beginPath();
+  ctx.arc(cx - s * 0.04, h * 0.125, s * 0.006, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+const drawMannequin: Draw = (ctx, w, h) => drawMannequinFrontBack(ctx, w, h, false);
+
+/** Mirror a drawing left ↔ right. */
+function mirrored(draw: Draw): Draw {
+  return (ctx, w, h) => {
+    ctx.clearRect(0, 0, w, h);
+    ctx.save();
+    ctx.translate(w, 0);
+    ctx.scale(-1, 1);
+    draw(ctx, w, h);
+    ctx.restore();
+  };
+}
+
+const MANNEQUIN_VIEWS: Partial<Record<SampleViewId, Draw>> = {
+  back: (ctx, w, h) => drawMannequinFrontBack(ctx, w, h, true),
+  left: (ctx, w, h) => {
+    ctx.clearRect(0, 0, w, h);
+    drawMannequinProfile(ctx, w, h);
+  },
+  // The right side faces the image's right.
+  right: mirrored(drawMannequinProfile),
+};
+
 export const SAMPLES: SampleSpec[] = [
   {
     id: 'logo',
@@ -279,11 +491,22 @@ export const SAMPLES: SampleSpec[] = [
     driverId: 'depth-anything-v2-small',
     draw: drawLandscape,
   },
+  {
+    id: 'tpose',
+    name: { tr: 'T-poz manken', en: 'T-pose mannequin' },
+    fileName: 'sample-tpose.png',
+    width: 768,
+    height: 768,
+    driverId: 'multiview-fusion',
+    draw: drawMannequin,
+    views: MANNEQUIN_VIEWS,
+  },
 ];
 
-/** Render a sample to a PNG blob (browser only). */
-export async function renderSample(spec: SampleSpec): Promise<Blob> {
+/** Render a sample (or one of its views, drawn by `draw`) to a PNG blob (browser only). */
+export async function renderSample(spec: SampleSpec, draw: Draw = spec.draw): Promise<Blob> {
   const { width: w, height: h } = spec;
+  spec = { ...spec, draw };
   if (typeof OffscreenCanvas !== 'undefined') {
     const canvas = new OffscreenCanvas(w, h);
     const ctx = canvas.getContext('2d', { willReadFrequently: true });

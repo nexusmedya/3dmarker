@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import {
-  BoxGeometry, BufferAttribute, BufferGeometry, DataTexture, Group, InterleavedBuffer, InterleavedBufferAttribute, Mesh,
-  MeshStandardMaterial, RGBAFormat,
+  AnimationClip, Bone, BoxGeometry, BufferAttribute, BufferGeometry, DataTexture, Group, InterleavedBuffer, InterleavedBufferAttribute, Mesh,
+  MeshStandardMaterial, QuaternionKeyframeTrack, RGBAFormat, Skeleton, SkinnedMesh, Uint16BufferAttribute, Vector3,
 } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OBJExporter } from 'three/examples/jsm/exporters/OBJExporter.js';
@@ -208,5 +208,87 @@ describe('DataTexture handling for GLB', () => {
     expect(out.map!.flipY).toBe(false);
     expect(mat.map).toBe(t);
     expect(m.material).toBe(mat);
+  });
+});
+
+describe('skinned meshes and animations', () => {
+  /** A 1×2×1 box skinned to two bones (lower / upper half), bones under the root, rest transforms stored. */
+  function skinnedBox() {
+    const geometry = new BoxGeometry(1, 2, 1, 1, 4, 1);
+    const pos = geometry.getAttribute('position');
+    const idx = new Uint16Array(pos.count * 4), w = new Float32Array(pos.count * 4);
+    for (let i = 0; i < pos.count; i++) {
+      idx[i * 4] = pos.getY(i) > 0 ? 1 : 0;
+      w[i * 4] = 1;
+    }
+    geometry.setAttribute('skinIndex', new Uint16BufferAttribute(idx, 4));
+    geometry.setAttribute('skinWeight', new BufferAttribute(w, 4));
+    const root = new Group();
+    root.name = 'model';
+    const lower = new Bone(), upper = new Bone();
+    lower.name = 'Lower';
+    upper.name = 'Upper';
+    lower.position.set(0, -1, 0);
+    upper.position.set(0, 1, 0);
+    lower.add(upper);
+    for (const b of [lower, upper]) b.userData.rest = { position: b.position.toArray(), quaternion: [0, 0, 0, 1] };
+    const mesh = new SkinnedMesh(geometry, new MeshStandardMaterial());
+    mesh.name = 'skinned';
+    root.add(lower, mesh);
+    root.updateMatrixWorld(true);
+    mesh.bind(new Skeleton([lower, upper]));
+    const clip = new AnimationClip('bend', 1, [
+      new QuaternionKeyframeTrack('Upper.quaternion', [0, 1], [0, 0, 0, 1, 0, 0, Math.SQRT1_2, Math.SQRT1_2]),
+    ]);
+    return { root, mesh, upper, clip };
+  }
+
+  async function glbJson(blob: Blob) {
+    const buf = await blob.arrayBuffer();
+    const len = new DataView(buf).getUint32(12, true);
+    return { buf, json: JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 20, len))) };
+  }
+
+  it('GLB: skin + animations, bones reset to their bind pose, also from a clone(true) of the model', async () => {
+    const { root, upper, clip } = skinnedBox();
+    upper.rotation.z = 1; // posed on screen
+    root.updateMatrixWorld(true);
+    for (const obj of [root, root.clone(true)]) {
+      const { buf, json } = await glbJson(await exportObject(obj, 'glb', { animations: [clip, new AnimationClip('nothing', 1, [new QuaternionKeyframeTrack('Missing.quaternion', [0], [0, 0, 0, 1])])] }));
+      expect(json.skins).toHaveLength(1);
+      expect(json.skins[0].joints.map((j: number) => json.nodes[j].name)).toEqual(['Lower', 'Upper']);
+      expect(json.animations).toHaveLength(1); // the clip that targets nothing is skipped
+      expect(json.animations[0].name).toBe('bend');
+      expect(json.nodes[json.animations[0].channels[0].target.node].name).toBe('Upper');
+      const upperNode = json.nodes.find((n: { name?: string }) => n.name === 'Upper');
+      expect(upperNode.rotation).toBeUndefined(); // bind pose, not the on-screen pose
+      const gltf = await new GLTFLoader().parseAsync(buf, '');
+      let skinned: SkinnedMesh | undefined;
+      gltf.scene.traverse((o) => { if ((o as SkinnedMesh).isSkinnedMesh) skinned = o as SkinnedMesh; });
+      expect(skinned!.skeleton.bones).toHaveLength(2);
+      expect(gltf.animations[0].tracks[0].name).toBe('Upper.quaternion');
+    }
+    expect(upper.rotation.z).toBeCloseTo(1, 9); // the original is untouched
+  });
+
+  it('STL / OBJ / PLY: the posed mesh by default, the bind pose on request', async () => {
+    const { root, upper } = skinnedBox();
+    upper.rotation.z = Math.PI / 2;
+    root.updateMatrixWorld(true);
+    const box = async (format: 'stl' | 'ply', pose?: 'rest' | 'current') => {
+      const buf = await (await exportObject(root, format, { pose })).arrayBuffer();
+      const g = format === 'stl' ? new STLLoader().parse(buf) : new PLYLoader().parse(buf);
+      g.computeBoundingBox();
+      return g.boundingBox!.getSize(new Vector3());
+    };
+    const rest = await box('stl', 'rest');
+    expect(rest.y).toBeCloseTo(2, 4);
+    const posed = await box('stl');
+    expect(posed.y).toBeLessThan(1.9);
+    expect(posed.x).toBeGreaterThan(1.1);
+    expect((await box('ply')).x).toBeCloseTo(posed.x, 4);
+    const obj = await (await exportObject(root, 'obj')).text();
+    const xs = obj.split('\n').filter((l) => l.startsWith('v ')).map((l) => Number(l.split(' ')[1]));
+    expect(Math.max(...xs) - Math.min(...xs)).toBeCloseTo(posed.x, 3);
   });
 });

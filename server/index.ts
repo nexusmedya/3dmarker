@@ -3,11 +3,12 @@
  * proxies /api here; `--production` or NODE_ENV=production: all interfaces,
  * and also serves the built SPA from ./dist, or STATIC_DIR).
  * Env: PORT (8787), HOST (default 127.0.0.1 in dev, all interfaces in
- * production), plus the API settings documented in ./app.ts.
+ * production), plus the API settings documented in ./app.ts and ./ai/providers.ts.
  */
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { serve } from '@hono/node-server';
+import { byokEnabled, managedProviders } from './ai/providers';
 import { createApp } from './app';
 import { mountStatic, serverOptions, withHostGuard } from './runtime';
 
@@ -31,6 +32,8 @@ const server = serve({ fetch: guardHost ? withHostGuard(app.fetch) : app.fetch, 
   const host = hostname && hostname !== '0.0.0.0' && hostname !== '::' ? hostname : 'localhost';
   console.log(`3D Marker ${production ? 'server' : 'API'} listening on http://${host}:${info.port}`);
   console.log(`Tripo3D server key: ${process.env.TRIPO_API_KEY?.trim() ? 'configured' : 'not set (users must supply their own key)'}`);
+  const managed = managedProviders(process.env).map((p) => p.kind);
+  console.log(`AI providers with server keys: ${managed.length ? managed.join(', ') : 'none'}${byokEnabled(process.env) ? ' (users may add their own keys)' : ' (user keys disabled)'}`);
 });
 
 const shutdown = () => {

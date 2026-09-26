@@ -2,14 +2,14 @@
 import type { I18nText } from '../core/types';
 
 export const HERO = {
-  eyebrow: { tr: 'Tarayıcıda görselden 3D’ye', en: 'Image to 3D in your browser' },
+  eyebrow: { tr: 'Tarayıcıda görselden tam 3D’ye', en: 'Image to full 3D in your browser' },
   title: {
-    tr: 'Bir PNG yükleyin, saniyeler içinde 3D modeliniz hazır.',
-    en: 'Upload a PNG. Get a 3D model in seconds.',
+    tr: 'Bir görsel yükleyin: stil verin, her yönünü tamamlayın, heykelleyin ve canlandırın.',
+    en: 'Upload an image. Style it, complete every side, sculpt it and bring it to life.',
   },
   body: {
-    tr: 'Yapay zekâ derinlik tahmini, siluet şişirme ve ekstrüzyon gibi farklı sürücüleri aynı görsel üzerinde deneyin; sonucu GLB, OBJ, STL ya da PLY olarak indirin. Tarayıcı içi sürücüler görselinizi hiçbir sunucuya yüklemez.',
-    en: 'Try different drivers — AI depth estimation, silhouette inflation, extrusion and more — on the same image, then download GLB, OBJ, STL or PLY. In-browser drivers never upload your image to any server.',
+    tr: 'Tek görselden 2.5D kabartma, ön / arka / yan / üst / alt görünümlerden tam 3D model üretin. Yapay zekâ ile onlarca stil, T-poz ve eksik gövdeyi tamamlama; yüz ve ellerde ayrıntılı derinlik; Blender tarzı heykel ve derinlik düzenleme; otomatik iskelet ve 45 hazır animasyon. Sonucu GLB (animasyonlarıyla), OBJ, STL ya da PLY olarak indirin. Tarayıcı içi sürücüler görselinizi hiçbir yere yüklemez; AI sağlayıcıları için kendi anahtarınızı kullanırsınız.',
+    en: 'Turn one image into a 2.5D relief, or front / back / side / top / bottom views into a full 3D model. AI restyling with dozens of styles, T-pose and body completion; detailed depth on faces and hands; Blender-style sculpting and depth editing; auto-rigging with 45 ready-made animations. Download GLB (with animations), OBJ, STL or PLY. In-browser drivers never upload your image; AI providers use your own keys.',
   },
   cta: { tr: 'Stüdyoyu aç', en: 'Open the studio' },
   secondary: { tr: 'Sürücüleri karşılaştır', en: 'Compare drivers' },
@@ -18,15 +18,45 @@ export const HERO = {
 export const HIGHLIGHTS: { title: I18nText; body: I18nText }[] = [
   {
     title: { tr: 'Gizlilik önce', en: 'Private by default' },
-    body: { tr: 'Model ağırlıkları bir kez indirilir, çıkarım cihazınızda çalışır.', en: 'Weights download once; inference runs on your device.' },
+    body: {
+      tr: 'Derinlik, sezgisel ve çok görünümlü sürücüler cihazınızda çalışır; AI anahtarları yalnızca bu tarayıcıda kalır.',
+      en: 'Depth, heuristic and multi-view drivers run on your device; AI keys stay in this browser.',
+    },
   },
   {
-    title: { tr: 'WebGPU hızında', en: 'WebGPU fast' },
-    body: { tr: 'WebGPU varsa GPU’da, yoksa WASM ile CPU’da çalışır.', en: 'Runs on the GPU with WebGPU, falls back to WASM on the CPU.' },
+    title: { tr: 'Her yönden tam 3D', en: 'Full 3D from every side' },
+    body: {
+      tr: 'Arka, yan, üst ve alt görünümleri yükleyin ya da yapay zekâya ürettirin; siluetler ve derinlik kapalı, renkli bir modelde birleşir.',
+      en: 'Upload the back, side, top and bottom views or let AI generate them; silhouettes and depth fuse into a closed, coloured model.',
+    },
   },
   {
-    title: { tr: 'Baskıya hazır', en: 'Print-ready' },
-    body: { tr: 'Katı mod ve ekstrüzyon kapalı (watertight) mesh üretir.', en: 'Solid mode and extrusion produce watertight meshes.' },
+    title: { tr: 'Yapay zekâ hazırlığı', en: 'AI preparation' },
+    body: {
+      tr: '60 stil, T-poz, yalnızca baştan tam gövde ve saydam arka plan — OpenAI, Gemini, fal.ai ve diğerleriyle.',
+      en: '60 styles, T-pose, a full body from just a head and transparent backgrounds — with OpenAI, Gemini, fal.ai and more.',
+    },
+  },
+  {
+    title: { tr: 'Yüz ve el detayı', en: 'Face & hand detail' },
+    body: {
+      tr: 'Yüz, el ve vücut noktaları algılanır; burun, dudak, göz çukuru, kulak ve parmaklar düz kalmaz.',
+      en: 'Face, hand and body landmarks are detected, so noses, lips, eye sockets, ears and fingers no longer come out flat.',
+    },
+  },
+  {
+    title: { tr: 'Heykel ve derinlik editörü', en: 'Sculpt & depth editor' },
+    body: {
+      tr: 'Blender tarzı sekiz fırça, simetri ve geri alma; derinlik haritasını da fırçayla boyayın.',
+      en: 'Eight Blender-style brushes with symmetry and undo; paint the depth map with brushes too.',
+    },
+  },
+  {
+    title: { tr: 'İskelet ve animasyon', en: 'Rig & animate' },
+    body: {
+      tr: 'Otomatik insansı iskelet, 45 hazır animasyon, BVH / FBX / GLB içe aktarma ve animasyonlu GLB.',
+      en: 'Automatic humanoid skeleton, 45 built-in animations, BVH / FBX / GLB import and animated GLB export.',
+    },
   },
 ];
 
@@ -34,22 +64,43 @@ export const STEPS: { title: I18nText; body: I18nText }[] = [
   {
     title: { tr: 'Görseli yükleyin', en: 'Upload an image' },
     body: {
-      tr: 'PNG’yi sürükleyip bırakın, yapıştırın ya da bir örnek seçin. Saydam arka plan varsa otomatik olarak maske olarak kullanılır.',
-      en: 'Drag & drop a PNG, paste it or pick a sample. A transparent background is used as the mask automatically.',
+      tr: 'PNG’yi sürükleyip bırakın, yapıştırın ya da bir örnek seçin. Saydam arka plan maske olur; düz ya da karmaşık arka planı otomatik veya yapay zekâ ile ayırın.',
+      en: 'Drag & drop a PNG, paste it or pick a sample. A transparent background becomes the mask; plain or busy backgrounds are removed automatically or with AI.',
     },
   },
   {
-    title: { tr: 'Sürücüyü seçin', en: 'Pick a driver' },
+    title: { tr: 'Yapay zekâ ile hazırlayın', en: 'Prepare with AI' },
     body: {
-      tr: 'Fotoğraflar için yapay zekâ derinliği, logolar için ekstrüzyon, karakterler için şişirme… Parametreleri ayarlayın.',
-      en: 'AI depth for photos, extrusion for logos, inflation for characters… then tune the parameters.',
+      tr: 'İsteğe bağlı: kendi sağlayıcınızı ekleyin, onlarca stilden birini seçin, kişiyi T-pozuna getirin ya da eksik gövdeyi tamamlatın; sonucu onaylayın veya orijinale dönün.',
+      en: 'Optional: add your own provider, pick one of dozens of styles, re-pose a person into a T-pose or complete the missing body; accept the result or revert to the original.',
     },
   },
   {
-    title: { tr: 'Görüntüleyin ve indirin', en: 'Inspect and export' },
+    title: { tr: 'Görünümleri ekleyin', en: 'Add the views' },
     body: {
-      tr: 'Modeli döndürün, kil ya da tel kafes görünümüyle inceleyin, mesh ayarlarını canlı değiştirin ve GLB/OBJ/STL/PLY indirin.',
-      en: 'Orbit the model, check it in clay or wireframe, tweak the mesh live and download GLB/OBJ/STL/PLY.',
+      tr: 'Tam 3D için arka, sol, sağ, üst ve alt görünümleri yükleyin ya da eksikleri yapay zekâya ön görünümden ürettirin.',
+      en: 'For full 3D, upload the back, left, right, top and bottom views, or have AI generate the missing ones from the front.',
+    },
+  },
+  {
+    title: { tr: '3D’yi oluşturun', en: 'Generate the 3D' },
+    body: {
+      tr: 'Fotoğraflar için yapay zekâ derinliği (yüz ve el detayıyla), logolar için ekstrüzyon, karakterler için şişirme, tam 3D için çok görünümlü birleştirme ya da bulut modelleri. Mesh ayarları canlı değişir.',
+      en: 'AI depth for photos (with face & hand detail), extrusion for logos, inflation for characters, multi-view fusion or cloud models for full 3D. Mesh settings update live.',
+    },
+  },
+  {
+    title: { tr: 'Düzenleyin', en: 'Edit' },
+    body: {
+      tr: 'Modeli Blender tarzı fırçalarla heykelleyin ya da derinlik haritasını boyayıp yeniden örün.',
+      en: 'Sculpt the model with Blender-style brushes, or paint the depth map and rebuild.',
+    },
+  },
+  {
+    title: { tr: 'Canlandırın ve indirin', en: 'Animate and export' },
+    body: {
+      tr: 'İskelet ekleyin, hazır ya da içe aktarılan animasyonları oynatın; GLB’yi animasyonlarıyla, ya da OBJ / STL / PLY indirin.',
+      en: 'Add a skeleton, play built-in or imported animations; download GLB with its animations, or OBJ / STL / PLY.',
     },
   },
 ];
@@ -58,15 +109,43 @@ export const FAQ: { q: I18nText; a: I18nText }[] = [
   {
     q: { tr: 'Görselim bir sunucuya yükleniyor mu?', en: 'Is my image uploaded anywhere?' },
     a: {
-      tr: 'Yapay zekâ ve sezgisel sürücüler tamamen tarayıcınızda çalışır; görsel cihazınızdan çıkmaz. Yalnızca bulut sürücüsü (Tripo3D) görseli sunucumuz üzerinden Tripo3D API’sine gönderir.',
-      en: 'The ML and heuristic drivers run entirely in your browser; the image never leaves your device. Only the cloud driver (Tripo3D) sends it to the Tripo3D API through our server.',
+      tr: 'Yapay zekâ derinliği, sezgisel ve çok görünümlü sürücüler, heykel ve animasyon tamamen tarayıcınızda çalışır; görsel cihazınızdan çıkmaz. Yalnızca sizin başlattığınız yapay zekâ işleri (hazırlık, görünüm üretme, bulut 3D) görseli seçtiğiniz sağlayıcıya — doğrudan ya da sunucumuzun vekili üzerinden — gönderir.',
+      en: 'The ML depth, heuristic and multi-view drivers, sculpting and animation run entirely in your browser; the image never leaves your device. Only AI jobs you start (preparation, view generation, cloud 3D) send it to the provider you chose — directly or through our server’s proxy.',
+    },
+  },
+  {
+    q: { tr: 'Yapay zekâ özellikleri için ne gerekir?', en: 'What do the AI features need?' },
+    a: {
+      tr: 'Üst çubuktaki “AI sağlayıcılar” penceresinden bir anahtar ekleyin: OpenAI, Google Gemini, Stability AI, Replicate, fal.ai, OpenAI uyumlu bir uç nokta ya da özel bir HTTP servisi; istediğiniz kadar sağlayıcı ve model tanımlanabilir. Anahtarlar yalnızca bu tarayıcıda kalır (“hatırla” açık değilse sekme kapanınca silinir). Tarayıcıdan doğrudan çağrılamayan servisler (Stability, Replicate, Tripo3D) sunucu vekili gerektirir; statik demoda OpenAI, Gemini ve fal.ai doğrudan çalışır.',
+      en: 'Add a key in the “AI providers” dialog in the top bar: OpenAI, Google Gemini, Stability AI, Replicate, fal.ai, an OpenAI-compatible endpoint or a custom HTTP service; add as many providers and models as you like. Keys stay in this browser (gone when the tab closes unless you choose to remember them). Services that browsers cannot call directly (Stability, Replicate, Tripo3D) need the server proxy; on the static demo OpenAI, Gemini and fal.ai work directly.',
     },
   },
   {
     q: { tr: '2.5D derinlik ile tam 3D arasındaki fark nedir?', en: 'What is the difference between 2.5D depth and full 3D?' },
     a: {
-      tr: 'Derinlik sürücüleri her pikselin kameraya uzaklığını tahmin eder ve görünen yüzeyi kabartma olarak üretir; arka taraf tahmin edilmez (düz taban veya aynalı arka eklenebilir). Bulut sürücüsü ise görünmeyen yüzleri de tamamlanmış tam bir model döndürür.',
-      en: 'Depth drivers estimate how far each pixel is from the camera and build the visible surface as a relief; the back is not predicted (a flat base or mirrored back can be added). The cloud driver returns a complete model with the unseen sides reconstructed.',
+      tr: 'Derinlik sürücüleri tek görselde her pikselin kameraya uzaklığını tahmin eder ve görünen yüzeyi kabartma olarak üretir; arka taraf tahmin edilmez (düz taban veya aynalı arka eklenebilir). Tam 3D için ön görünüme arka, yan, üst ve alt görünümleri ekleyin: çok görünümlü sürücü bunları tarayıcıda kapalı, renkli bir modelde birleştirir; bulut sürücüleri de görünmeyen yüzleri tamamlar.',
+      en: 'Depth drivers estimate how far each pixel of one image is from the camera and build the visible surface as a relief; the back is not predicted (a flat base or mirrored back can be added). For full 3D, add back, side, top and bottom views to the front: the multi-view driver fuses them into a closed, coloured model in your browser, and cloud drivers also reconstruct the unseen sides.',
+    },
+  },
+  {
+    q: { tr: 'Tam 3D için hangi görünümler gerekir?', en: 'Which views does full 3D need?' },
+    a: {
+      tr: 'Ön görünüm ve en az bir ek görünüm; en iyisi arka, sol ve sağ (üst ve alt da yardımcı olur). Görünümler dik, ortalanmış ve aynı ölçekte olmalı. Elinizde yoksa yapay zekâ bunları ön görünümden üretebilir.',
+      en: 'The front and at least one more view; back, left and right work best (top and bottom help too). Views should be upright, centred and at the same scale. If you have none, AI can generate them from the front.',
+    },
+  },
+  {
+    q: { tr: 'Yüzler neden artık düz çıkmıyor?', en: 'Why do faces no longer come out flat?' },
+    a: {
+      tr: 'Yapay zekâ derinlik sürücüleri görselde yüz, el ve vücut noktalarını (MediaPipe) algılar ve burun, dudak, göz çukuru, kulak ve parmaklara gerçek oranlarda kabartma ekler; istenirse yüz ve eller yakın planda yeniden işlenir. Kalan kısımları heykel fırçalarıyla elle belirginleştirebilirsiniz.',
+      en: 'The ML depth drivers detect face, hand and body landmarks (MediaPipe) and add relief with true proportions to the nose, lips, eye sockets, ears and fingers; optionally faces and hands are re-processed in close-up. Bring out the rest by hand with the sculpt brushes.',
+    },
+  },
+  {
+    q: { tr: 'Modeli canlandırabilir miyim?', en: 'Can I animate the model?' },
+    a: {
+      tr: 'Evet. “Rig & Animasyon” adımı modele insansı bir iskelet (Mixamo kemik adları) ekler, eklemleri otomatik yerleştirir (kişi algılanırsa vücut noktalarıyla), deri ağırlıklarını hesaplar; 45 hazır animasyonu oynatır ve BVH / FBX / GLB animasyonlarını içe aktarır. Seçtiğiniz animasyonlar GLB’ye eklenir. En iyi sonuç T-pozundaki tam boy modellerle alınır — yapay zekâ hazırlığı T-pozu üretebilir.',
+      en: 'Yes. The “Rig & animation” step adds a humanoid skeleton (Mixamo bone names), places the joints automatically (from body landmarks when a person is detected), computes skin weights, plays 45 built-in animations and imports BVH / FBX / GLB animations. The clips you pick are included in the GLB. Full-body models in a T-pose work best — the AI preparation can produce one.',
     },
   },
   {
@@ -79,15 +158,15 @@ export const FAQ: { q: I18nText; a: I18nText }[] = [
   {
     q: { tr: 'İlk çalıştırma neden daha uzun sürüyor?', en: 'Why is the first run slower?' },
     a: {
-      tr: 'Yapay zekâ sürücüleri ilk kullanımda model ağırlıklarını (25–500 MB) indirir; tarayıcı bunları önbelleğe alır, sonraki çalıştırmalar hızlıdır.',
-      en: 'ML drivers download their weights (25–500 MB) on first use; the browser caches them so later runs are fast.',
+      tr: 'Yapay zekâ sürücüleri ilk kullanımda model ağırlıklarını (25–500 MB), insan algılama ise ~20 MB’lık modelleri indirir; tarayıcı bunları önbelleğe alır, sonraki çalıştırmalar hızlıdır.',
+      en: 'ML drivers download their weights (25–500 MB) and human detection its ~20 MB of models on first use; the browser caches them so later runs are fast.',
     },
   },
   {
     q: { tr: 'Sonucu 3D yazıcıda basabilir miyim?', en: 'Can I 3D print the result?' },
     a: {
-      tr: 'Evet: mesh tipini “Katı” ya da “Çift yüz” yapın veya ekstrüzyon sürücüsünü kullanın. “Watertight” rozeti kapalı bir mesh olduğunu gösterir; STL boyutunu mm olarak ayarlayıp indirin.',
-      en: 'Yes: set the mesh type to “Solid” or “Double-sided”, or use the extrusion driver. The “Watertight” badge confirms a closed mesh; set the STL size in mm and download.',
+      tr: 'Evet: mesh tipini “Katı” ya da “Çift yüz” yapın, ekstrüzyon ya da çok görünümlü sürücüyü kullanın. “Watertight” rozeti kapalı bir mesh olduğunu gösterir; STL boyutunu mm olarak ayarlayıp indirin.',
+      en: 'Yes: set the mesh type to “Solid” or “Double-sided”, or use the extrusion or multi-view driver. The “Watertight” badge confirms a closed mesh; set the STL size in mm and download.',
     },
   },
   {
@@ -119,10 +198,11 @@ export const PLANS: Plan[] = [
     period: { tr: 'her zaman', en: 'forever' },
     blurb: { tr: 'Tarayıcıda çalışan her şey, sınırsız.', en: 'Everything that runs in your browser, unlimited.' },
     features: [
-      { tr: 'Tüm tarayıcı içi sürücüler (yapay zekâ + sezgisel)', en: 'All in-browser drivers (ML + heuristic)' },
+      { tr: 'Tüm tarayıcı içi sürücüler (yapay zekâ derinliği, sezgisel, çok görünümlü)', en: 'All in-browser drivers (ML depth, heuristic, multi-view)' },
+      { tr: 'Heykel, derinlik editörü, iskelet ve 45 animasyon', en: 'Sculpting, depth editor, rigging and 45 animations' },
+      { tr: 'Kendi AI anahtarınızla stil, T-poz ve gövde tamamlama', en: 'Styles, T-pose and body completion with your own AI key' },
       { tr: 'Sınırsız oluşturma, kayıt gerekmez', en: 'Unlimited generations, no sign-up' },
-      { tr: 'GLB, OBJ, STL, PLY dışa aktarma', en: 'GLB, OBJ, STL, PLY export' },
-      { tr: 'Görseller cihazınızdan çıkmaz', en: 'Images never leave your device' },
+      { tr: 'GLB (animasyonlu), OBJ, STL, PLY dışa aktarma', en: 'GLB (animated), OBJ, STL, PLY export' },
     ],
     cta: { tr: 'Hemen başla', en: 'Start now' },
     highlighted: true,
@@ -132,8 +212,9 @@ export const PLANS: Plan[] = [
     name: { tr: 'Pro', en: 'Pro' },
     price: { tr: 'Yakında', en: 'Soon' },
     period: { tr: 'kredi paketleri', en: 'credit packs' },
-    blurb: { tr: 'Bulutta tam 3D model üretimi.', en: 'Full 3D generation in the cloud.' },
+    blurb: { tr: 'Anahtarsız yapay zekâ ve bulutta tam 3D.', en: 'AI without your own keys, full 3D in the cloud.' },
     features: [
+      { tr: 'Yönetilen AI sağlayıcıları (anahtar gerekmez)', en: 'Managed AI providers (no keys needed)' },
       { tr: 'Tam 3D bulut kredileri (Tripo3D)', en: 'Full-3D cloud credits (Tripo3D)' },
       { tr: 'Dokulu, PBR malzemeli GLB', en: 'Textured GLB with PBR materials' },
       { tr: 'Öncelikli kuyruk', en: 'Priority queue' },
@@ -146,7 +227,7 @@ export const PLANS: Plan[] = [
 
 export const SECTION_TITLES = {
   how: { tr: 'Nasıl çalışır', en: 'How it works' },
-  howSub: { tr: 'Üç adımda görselden modele.', en: 'From image to model in three steps.' },
+  howSub: { tr: 'Altı adımda görselden animasyonlu modele.', en: 'From an image to an animated model in six steps.' },
   drivers: { tr: 'Sürücü karşılaştırması', en: 'Compare drivers' },
   driversSub: {
     tr: 'Her sürücü farklı bir yaklaşım kullanır; aynı görselle deneyip en iyisini seçin.',

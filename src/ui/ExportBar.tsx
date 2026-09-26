@@ -1,7 +1,7 @@
-/** Mesh statistics and export buttons under the viewer. */
+/** Mesh statistics and export buttons under the viewer. GLB carries the rig's animation clips. */
 import { useState } from 'react';
 import { Box3, Vector3 } from 'three';
-import type { Object3D } from 'three';
+import type { AnimationClip, Object3D } from 'three';
 import type { I18nText } from '../core/types';
 import { EXPORT_FORMATS, downloadBlob, exportObject, type ExportFormat } from '../core/export/exporters';
 import type { ResultInfo } from '../app/store';
@@ -9,7 +9,7 @@ import { modelFileName, errorToText, formatSeconds } from '../app/format';
 import { yieldToPaint } from '../app/throttle';
 import { getDriver } from '../drivers';
 import { useI18n } from './i18n';
-import { IconAlert, IconCheck, IconDownload, IconInfo } from './icons';
+import { IconAlert, IconBone, IconCheck, IconDownload, IconInfo } from './icons';
 
 interface Props {
   result: ResultInfo | null;
@@ -17,6 +17,10 @@ interface Props {
   stlSizeMm: number;
   onStlSize: (mm: number) => void;
   disabled: boolean;
+  /** Clips exported with GLB (rigged models). */
+  animations?: AnimationClip[];
+  /** Download names get "-rigged". */
+  rigged?: boolean;
 }
 
 export function MeshStatsLine({ result }: { result: ResultInfo }) {
@@ -47,8 +51,9 @@ export function MeshStatsLine({ result }: { result: ResultInfo }) {
   );
 }
 
-export function ExportBar({ result, getObject, stlSizeMm, onStlSize, disabled }: Props) {
+export function ExportBar({ result, getObject, stlSizeMm, onStlSize, disabled, animations, rigged }: Props) {
   const { t, tx } = useI18n();
+  const clips = animations?.length ? animations : null;
   const [busy, setBusy] = useState<ExportFormat | null>(null);
   // Kept bilingual and localised at render, so a language switch updates it.
   const [error, setError] = useState<I18nText | null>(null);
@@ -67,8 +72,8 @@ export function ExportBar({ result, getObject, stlSizeMm, onStlSize, disabled }:
         const longest = Math.max(size.x, size.y, size.z);
         if (longest > 0) scale = stlSizeMm / longest;
       }
-      const blob = await exportObject(obj, format, { scale });
-      downloadBlob(blob, modelFileName(result.sourceName, result.driverId, format));
+      const blob = await exportObject(obj, format, format === 'glb' && clips ? { scale, animations: clips } : { scale });
+      downloadBlob(blob, modelFileName(result.sourceName, result.driverId, format, rigged ? 'rigged' : undefined));
     } catch (e) {
       console.error(e);
       setError(errorToText(e));
@@ -118,6 +123,11 @@ export function ExportBar({ result, getObject, stlSizeMm, onStlSize, disabled }:
           />
         </label>
       </div>
+      {clips && (
+        <p className="muted small export-anim" data-testid="export-animations">
+          <IconBone size={14} /> {t('exportAnimations', { n: clips.length })}
+        </p>
+      )}
       {error && (
         <p className="note note-danger small" role="alert">
           <IconAlert size={14} /> {t('exportFailed', { msg: tx(error) })}

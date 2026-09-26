@@ -160,6 +160,122 @@ export const UI = {
   colBestFor: { tr: 'En uygun', en: 'Best for' },
   colDownload: { tr: 'İndirme', en: 'Download' },
   none: { tr: 'Yok', en: 'None' },
+
+  // Step navigator
+  stepsLabel: { tr: 'Stüdyo adımları', en: 'Studio steps' },
+  stepImage: { tr: 'Görsel', en: 'Image' },
+  stepPrep: { tr: 'AI hazırlık', en: 'AI prep' },
+  stepViews: { tr: 'Görünümler', en: 'Views' },
+  step3d: { tr: '3D', en: '3D' },
+  stepEdit: { tr: 'Düzenle', en: 'Edit' },
+  stepRig: { tr: 'Rig & Anim', en: 'Rig & anim' },
+  stepImageTitle: { tr: 'Görsel ve arka plan', en: 'Image & background' },
+  stepPrepTitle: { tr: 'Yapay zekâ hazırlığı', en: 'AI preparation' },
+  stepViewsTitle: { tr: 'Görünümler (tam 3D)', en: 'Views (full 3D)' },
+  step3dTitle: { tr: '3D oluşturma', en: '3D generation' },
+  stepEditTitle: { tr: 'Düzenle: heykel ve derinlik', en: 'Edit: sculpt & depth' },
+  stepRigTitle: { tr: 'Rig ve animasyon', en: 'Rig & animation' },
+  stepNumber: { tr: '{n}. adım', en: 'Step {n}' },
+  stepNext: { tr: 'Sonraki: {step}', en: 'Next: {step}' },
+  stepBack: { tr: 'Geri: {step}', en: 'Back: {step}' },
+  hintTodo: { tr: 'Bekliyor', en: 'To do' },
+  hintLoading: { tr: 'Okunuyor…', en: 'Reading…' },
+  hintLoaded: { tr: 'Yüklendi', en: 'Loaded' },
+  hintWorking: { tr: 'Çalışıyor…', en: 'Working…' },
+  hintReview: { tr: 'Onaylayın', en: 'To review' },
+  hintPrepared: { tr: 'Hazırlandı', en: 'Prepared' },
+  hintOptional: { tr: 'Opsiyonel', en: 'Optional' },
+  hintViews: { tr: '{n}/5 görünüm', en: '{n}/5 views' },
+  hintModel: { tr: 'Model hazır', en: 'Model ready' },
+  hintSculpted: { tr: 'Düzenlendi', en: 'Sculpted' },
+  hintRigged: { tr: 'Kemikli', en: 'Rigged' },
+  hintNeedsModel: { tr: 'Model yok', en: 'No model' },
+
+  // AI providers / jobs
+  aiProviders: { tr: 'AI sağlayıcılar', en: 'AI providers' },
+  aiProvidersCount: { tr: '{n} etkin AI sağlayıcısı', en: '{n} enabled AI providers' },
+  aiNoProviders: {
+    tr: 'Henüz bir AI sağlayıcısı eklenmedi (OpenAI, Gemini, fal.ai…).',
+    en: 'No AI provider has been added yet (OpenAI, Gemini, fal.ai…).',
+  },
+  aiNoEditProvider: {
+    tr: 'Görsel düzenleyebilen, kullanılabilir bir AI sağlayıcısı yok.',
+    en: 'No usable AI provider that can edit images.',
+  },
+  aiNothingToDo: {
+    tr: 'Bir stil, T-poz ya da tamamlama seçin veya talimat yazın.',
+    en: 'Pick a style, T-pose or completion, or write instructions.',
+  },
+  detectingPeople: { tr: 'İnsan algılanıyor…', en: 'Detecting people…' },
+  removingViewBg: { tr: 'Görünümün arka planı kaldırılıyor…', en: 'Removing the view’s background…' },
+  preparedInUse: { tr: 'Yapay zekâ ile hazırlanan görsel kullanılıyor.', en: 'Using the AI-prepared image.' },
+  revertOriginal: { tr: 'Orijinale dön', en: 'Revert to original' },
+
+  // Generate guards
+  blockedAiBusy: { tr: 'Yapay zekâ işi bitince oluşturabilirsiniz.', en: 'Wait for the AI job to finish.' },
+  needAnyView: {
+    tr: 'Bu sürücü en az bir ek görünüm ister (arka, sol, sağ, üst ya da alt).',
+    en: 'This driver needs at least one more view (back, left, right, top or bottom).',
+  },
+  needViews: { tr: 'Bu sürücü şu görünümleri de ister: {views}.', en: 'This driver also needs these views: {views}.' },
+  goToViews: { tr: 'Görünümlere git', en: 'Go to Views' },
+  generateWith: { tr: 'Sürücü: {driver}', en: 'Driver: {driver}' },
+  changeDriver: { tr: 'Değiştir', en: 'Change' },
+
+  // Human detail (step 3D)
+  humanTitle: { tr: 'İnsan detayı', en: 'Human detail' },
+  humanAnalyzing: { tr: 'İnsan algılanıyor…', en: 'Detecting people…' },
+  humanDetected: { tr: 'İnsan algılandı', en: 'Person detected' },
+  humanDetectedBody: {
+    tr: 'Yüz, burun, dudak, kulak, el ve parmaklara ayrıntılı kabartma eklenir.',
+    en: 'Detailed relief is added to the face, nose, lips, ears, hands and fingers.',
+  },
+  humanCounts: { tr: '{f} yüz · {h} el · {p} gövde', en: '{f} face(s) · {h} hand(s) · {p} body(ies)' },
+  humanNone: { tr: 'İnsan algılanmadı', en: 'No person detected' },
+  humanNoneBody: { tr: 'Derinlik olduğu gibi kullanılır.', en: 'The depth is used as is.' },
+  humanUnavailable: { tr: 'Algılama kullanılamıyor', en: 'Detection unavailable' },
+  humanPending: {
+    tr: 'Yüz, el ve vücut noktaları oluştururken algılanır (MediaPipe, ilk seferde ~20 MB).',
+    en: 'Face, hand and body landmarks are detected when you generate (MediaPipe, ~20 MB the first time).',
+  },
+  humanDetectNow: { tr: 'Şimdi algıla', en: 'Detect now' },
+  humanOff: { tr: 'İnsan detayı kapalı (parametrelerden açılır).', en: 'Human detail is off (turn it on in the parameters).' },
+
+  // Mesh / sculpt / rig interplay
+  remeshPausedSculpt: {
+    tr: 'Model heykelle düzenlendi; mesh ayarları canlı uygulanmıyor.',
+    en: 'The model was sculpted; mesh settings are not applied live.',
+  },
+  remeshPausedActive: {
+    tr: 'Heykel modu açıkken mesh ayarları uygulanmaz.',
+    en: 'Mesh settings wait while sculpt mode is on.',
+  },
+  remeshPausedRig: {
+    tr: 'Model kemikli; mesh ayarları canlı uygulanmıyor (önce kemikleri kaldırın).',
+    en: 'The model is rigged; mesh settings are not applied live (remove the rig first).',
+  },
+  discardEdits: { tr: 'Düzenlemeleri at', en: 'Discard edits' },
+  discardEditsHint: {
+    tr: 'Heykel düzenlemelerini atar ve yüzeyi önbellekteki derinlikten yeniden örer.',
+    en: 'Throws the sculpt edits away and rebuilds the surface from the cached depth.',
+  },
+  sculptBlockedRig: { tr: 'Kemikli modelde heykel kapalı; önce kemikleri kaldırın.', en: 'Sculpting is off for a rigged model; remove the rig first.' },
+  rigBlockedSculpt: { tr: 'Heykel modu açıkken kemik eklenemez.', en: 'Rigging waits while sculpt mode is on.' },
+  depthEditTitle: { tr: 'Derinlik haritası', en: 'Depth map' },
+  depthEditBody: {
+    tr: 'Derinliği Blender tarzı fırçalarla boyayın; model yeni derinlikten yeniden örülür ve mesh ayarları canlı kalır.',
+    en: 'Paint the depth with Blender-style brushes; the model is rebuilt from the new depth and the mesh settings stay live.',
+  },
+  depthEditOpen: { tr: 'Derinlik haritasını düzenle', en: 'Edit depth map' },
+  depthEditNeedsDepth: {
+    tr: 'Yalnızca derinlik üreten sürücülerin sonuçlarında (yapay zekâ derinliği, şişirme, parlaklık).',
+    en: 'Only for results of depth drivers (ML depth, inflate, luminance).',
+  },
+  depthEditRigged: { tr: 'Kemikli modelin derinliği düzenlenemez; önce kemikleri kaldırın.', en: 'Remove the rig before editing the depth.' },
+  depthEditSculpted: { tr: 'Uygulamak heykel düzenlemelerini atar.', en: 'Applying discards the sculpt edits.' },
+
+  // Export
+  exportAnimations: { tr: 'GLB {n} animasyon içerir', en: 'GLB includes {n} animations' },
 } satisfies Record<string, I18nText>;
 
 export type UIKey = keyof typeof UI;

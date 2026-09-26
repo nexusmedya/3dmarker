@@ -16,6 +16,8 @@ describe('format', () => {
     expect(modelFileName('cat.photo.png', 'depth-anything-v2-small', 'glb')).toBe('cat.photo-depth-anything-v2-small.glb');
     expect(modelFileName('a/b:c.PNG', 'x', 'stl')).toBe('a_b_c-x.stl');
     expect(modelFileName('', 'x', 'obj')).toBe('3dmarker-x.obj');
+    // Rigged models get a suffix.
+    expect(modelFileName('cat.png', 'silhouette-inflate', 'glb', 'rigged')).toBe('cat-silhouette-inflate-rigged.glb');
     expect(baseName('  spaced .png')).toBe('spaced');
   });
 
@@ -146,12 +148,17 @@ describe('driverMeta', () => {
 
   it('groups drivers by category in select order and describes each', () => {
     const groups = groupDrivers(DRIVERS);
-    expect(groups.map((g) => g.category)).toEqual(['ml', 'heuristic', 'cloud']);
+    expect(groups.map((g) => g.category)).toEqual(['ml', 'heuristic', 'multiview', 'cloud']);
     expect(groups.flatMap((g) => g.drivers)).toHaveLength(DRIVERS.length);
     for (const d of DRIVERS) {
       expect(bestFor(d).en).not.toBe('');
       expect(outputKind(d).tr).not.toBe('');
     }
+    const byId = (id: string) => DRIVERS.find((d) => d.id === id)!;
+    expect(outputKind(byId('multiview-fusion')).en).toMatch(/vertex colours/);
+    expect(outputKind(byId('tripo3d-multiview')).en).toMatch(/GLB/);
+    // Every built-in driver has its own "best for" line (not the category fallback).
+    for (const id of ['multiview-fusion', 'tripo3d-multiview', 'ai-provider-3d']) expect(bestFor(byId(id)).en).not.toMatch(/^(Full 3D objects|Characters and objects with several views)$/);
   });
 });
 
@@ -192,6 +199,17 @@ describe('samples', () => {
       });
       s.draw(ctx as unknown as CanvasRenderingContext2D, 96, 64);
       expect(calls.length, s.id).toBeGreaterThan(10);
+      for (const [view, draw] of Object.entries(s.views ?? {})) {
+        calls.length = 0;
+        draw(ctx as unknown as CanvasRenderingContext2D, 96, 64);
+        expect(calls.length, `${s.id}/${view}`).toBeGreaterThan(10);
+      }
     }
+  });
+
+  it('the T-pose mannequin comes with back / left / right views for multi-view fusion', () => {
+    const tpose = SAMPLES.find((s) => s.id === 'tpose')!;
+    expect(tpose.driverId).toBe('multiview-fusion');
+    expect(Object.keys(tpose.views ?? {}).sort()).toEqual(['back', 'left', 'right']);
   });
 });

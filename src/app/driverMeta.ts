@@ -51,6 +51,15 @@ const BEST_FOR: Record<string, I18nText> = {
   'silhouette-extrude': { tr: 'Logolar, ikonlar, yazılar, 3D baskı', en: 'Logos, icons, lettering, 3D printing' },
   'luminance-heightmap': { tr: 'Kabartmalar, litofan, desenler, dokular', en: 'Embossing, lithophanes, patterns, textures' },
   'tripo3d-cloud': { tr: 'Gerçekçi, her yönden tam 3D nesneler', en: 'Realistic objects, complete from every side' },
+  'multiview-fusion': {
+    tr: 'Ön + arka / yan görünümleri olan karakterler ve nesneler — tarayıcıda, kapalı ve renkli',
+    en: 'Characters and objects with front + back / side views — in-browser, closed and coloured',
+  },
+  'tripo3d-multiview': { tr: 'Ön + yan + arka görünümlerden gerçekçi tam 3D (bulut)', en: 'Realistic full 3D from front + side + back views (cloud)' },
+  'ai-provider-3d': {
+    tr: 'Kendi eklediğiniz yapay zekâ sağlayıcısıyla (fal, Replicate, Tripo…) tam 3D',
+    en: 'Full 3D with an AI provider you added (fal, Replicate, Tripo…)',
+  },
 };
 
 const BEST_FOR_FALLBACK: Record<DriverCategory, I18nText> = {
@@ -66,7 +75,12 @@ export function bestFor(driver: Driver): I18nText {
 
 /** What kind of 3D the driver produces, derived from its badges / result kind. */
 export function outputKind(driver: Driver): I18nText {
-  if (driver.badges.includes('full-3d')) return { tr: 'Tam 3D model (GLB)', en: 'Full 3D model (GLB)' };
+  if (driver.badges.includes('full-3d')) {
+    // In-browser multi-view fusion builds a vertex-coloured mesh; cloud models return a GLB.
+    return driver.category === 'multiview'
+      ? { tr: 'Tam 3D mesh (köşe renkli)', en: 'Full 3D mesh (vertex colours)' }
+      : { tr: 'Tam 3D model (GLB)', en: 'Full 3D model (GLB)' };
+  }
   if (!driver.producesDepth) return { tr: 'Kapalı katı gövde', en: 'Closed solid' };
   if (driver.badges.includes('closed-mesh')) return { tr: '2.5D gövde (kapatılabilir)', en: '2.5D body (closable)' };
   return { tr: '2.5D rölyef', en: '2.5D relief' };

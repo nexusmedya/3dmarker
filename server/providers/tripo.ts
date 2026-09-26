@@ -9,8 +9,29 @@
  * The key is only ever sent to `baseUrl` — never to model download hosts —
  * and upstream error messages are scrubbed of it before they leave this module.
  */
+import { timedRelay } from '../relay';
 
 export const TRIPO_API_BASE = 'https://api.tripo3d.ai/v2/openapi';
+
+/** The four views a multi-view task takes. */
+export type MultiviewSlot = 'front' | 'left' | 'back' | 'right';
+
+/**
+ * ASSUMPTION: `multiview_to_model` takes `files` as exactly four entries in
+ * this order, a missing view (all but the front may be missing) as `{}`, and
+ * "left" meaning the subject's left side (as src/core/types.ts ViewId). Both
+ * the order (TRIPO_MULTIVIEW_ORDER) and a left/right swap (driver param) are
+ * configurable in case the live API disagrees.
+ */
+export const DEFAULT_MULTIVIEW_ORDER: readonly MultiviewSlot[] = ['front', 'left', 'back', 'right'];
+
+/** Parse TRIPO_MULTIVIEW_ORDER ('front,left,back,right'): a permutation of the four slots, else null. */
+export function parseMultiviewOrder(value: string | undefined): MultiviewSlot[] | null {
+  if (value === undefined || !value.trim()) return null;
+  const slots = value.split(',').map((s) => s.trim().toLowerCase());
+  const valid = slots.length === 4 && DEFAULT_MULTIVIEW_ORDER.every((s) => slots.includes(s));
+  return valid ? (slots as MultiviewSlot[]) : null;
+}
 
 /**
  * ASSUMPTION: direct multipart upload is `POST /upload` in the original v2
@@ -50,13 +71,23 @@ export interface TripoTask {
   output: Record<string, unknown>;
 }
 
-export interface ImageToModelOptions {
-  fileType: TripoFileType;
+/** Generation options shared by single- and multi-view tasks. */
+export interface ModelTaskOptions {
   modelVersion?: string;
   texture?: boolean;
   pbr?: boolean;
   /** Omitted when undefined or ≤ 0 (Tripo picks adaptively). */
   faceLimit?: number;
+}
+
+export interface ImageToModelOptions extends ModelTaskOptions {
+  fileType: TripoFileType;
+}
+
+/** An uploaded view of a multi-view task. */
+export interface MultiviewFile {
+  fileType: TripoFileType;
+  fileToken: string;
 }
 
 export type TripoErrorKind = 'http' | 'api' | 'timeout' | 'network' | 'aborted' | 'invalid-response' | 'untrusted-host';
@@ -167,10 +198,29 @@ export class TripoClient {
 
   /** Start an image → model task; returns its id. */
   async createImageToModelTask(fileToken: string, opts: ImageToModelOptions, signal?: AbortSignal): Promise<string> {
-    const body: Record<string, unknown> = {
-      type: 'image_to_model',
-      file: { type: opts.fileType, file_token: fileToken },
-    };
+    return this.createTask({ type: 'image_to_model', file: { type: opts.fileType, file_token: fileToken } }, opts, signal);
+  }
+
+  /**
+   * Start a multi-view → model task (front required); returns its id.
+   * ASSUMPTION: wire format, see DEFAULT_MULTIVIEW_ORDER.
+   */
+  async createMultiviewToModelTask(
+    files: Partial<Record<MultiviewSlot, MultiviewFile>>,
+    opts: ModelTaskOptions,
+    signal?: AbortSignal,
+    order: readonly MultiviewSlot[] = DEFAULT_MULTIVIEW_ORDER,
+  ): Promise<string> {
+    if (!files.front) throw new TripoError('A multi-view task needs the front view', 'invalid-response');
+    const list = order.map((slot) => {
+      const f = files[slot];
+      return f ? { type: f.fileType, file_token: f.fileToken } : {};
+    });
+    return this.createTask({ type: 'multiview_to_model', files: list }, opts, signal);
+  }
+
+  private async createTask(base: Record<string, unknown>, opts: ModelTaskOptions, signal?: AbortSignal): Promise<string> {
+    const body: Record<string, unknown> = { ...base };
     if (opts.modelVersion) body.model_version = opts.modelVersion;
     if (opts.texture !== undefined) body.texture = opts.texture;
     if (opts.pbr !== undefined) body.pbr = opts.pbr;
@@ -286,126 +336,45 @@ export interface ModelDownloadOptions {
 export async function openModelDownload(modelUrl: string, opts: ModelDownloadOptions): Promise<Response> {
   const f = opts.fetch ?? fetch;
   const maxRedirects = opts.maxRedirects ?? 3;
-  let settled = false;
-  const settle = () => {
-    if (settled) return;
-    settled = true;
-    opts.onSettled?.();
-  };
   let url: URL;
   try {
     url = new URL(modelUrl);
   } catch {
-    settle();
+    opts.onSettled?.();
     throw new TripoError('Tripo returned an invalid model URL', 'invalid-response');
   }
-
-  const ctrl = new AbortController();
-  const signal = opts.signal ? AbortSignal.any([ctrl.signal, opts.signal]) : ctrl.signal;
-  let timeoutError: TripoError | null = null;
-  const expire = (message: string) => () => {
-    timeoutError ??= new TripoError(message, 'timeout');
-    ctrl.abort(timeoutError);
-  };
-  const total = setTimeout(expire('Model download took too long'), opts.totalTimeoutMs ?? DEFAULT_TIMEOUTS.downloadTotalMs);
-  const headersTimer = setTimeout(expire('Model download timed out'), opts.timeoutMs ?? DEFAULT_TIMEOUTS.downloadMs);
-  let idle: ReturnType<typeof setTimeout> | undefined;
-  const clearTimers = () => {
-    clearTimeout(total);
-    clearTimeout(headersTimer);
-    clearTimeout(idle);
-  };
-
-  let res: Response;
-  try {
-    for (let hop = 0; ; hop++) {
-      if (!isTrustedModelUrl(url, opts.allowedHosts)) throw new TripoError(url.hostname || url.protocol, 'untrusted-host');
-      try {
-        res = await f(url.toString(), { method: 'GET', redirect: 'manual', credentials: 'omit', signal });
-      } catch (e) {
-        throw transportError(e, timeoutError !== null, opts.signal);
-      }
-      if (res.status >= 300 && res.status < 400) {
-        const location = res.headers.get('location');
-        await res.body?.cancel().catch(() => {});
-        if (!location || hop >= maxRedirects) throw new TripoError('Too many redirects downloading the model', 'http', res.status);
-        url = new URL(location, url);
-        continue;
-      }
-      if (!res.ok) {
-        await res.body?.cancel().catch(() => {});
-        throw new TripoError(`Model download failed (HTTP ${res.status})`, 'http', res.status);
-      }
-      break;
-    }
-  } catch (e) {
-    clearTimers();
-    settle();
-    throw e;
-  }
-  clearTimeout(headersTimer);
-  if (!res.body) {
-    clearTimers();
-    settle();
-    return res;
-  }
-
-  // Relay the body, re-arming the idle timer on every chunk.
-  const reader = res.body.getReader();
-  const idleMs = opts.idleTimeoutMs ?? DEFAULT_TIMEOUTS.downloadIdleMs;
-  let finished = false;
-  let out!: ReadableStreamDefaultController<Uint8Array>;
-  const finish = () => {
-    finished = true;
-    clearTimers();
-    signal.removeEventListener('abort', onAbort);
-    settle();
-  };
-  const onAbort = () => {
-    if (finished) return;
-    finish();
-    const reason = timeoutError ?? new TripoError('Request aborted', 'aborted');
-    out.error(reason);
-    reader.cancel(reason).catch(() => {});
-  };
-  const arm = () => {
-    clearTimeout(idle);
-    idle = setTimeout(expire('Model download stalled'), idleMs);
-  };
-  const body = new ReadableStream<Uint8Array>(
-    {
-      start(c) {
-        out = c;
-        signal.addEventListener('abort', onAbort, { once: true });
-        if (signal.aborted) onAbort();
-        else arm();
-      },
-      async pull(c) {
-        let chunk: ReadableStreamReadResult<Uint8Array>;
+  return timedRelay(
+    async (signal, timedOut) => {
+      for (let hop = 0; ; hop++) {
+        if (!isTrustedModelUrl(url, opts.allowedHosts)) throw new TripoError(url.hostname || url.protocol, 'untrusted-host');
+        let res: Response;
         try {
-          chunk = await reader.read();
+          res = await f(url.toString(), { method: 'GET', redirect: 'manual', credentials: 'omit', signal });
         } catch (e) {
-          if (!finished) {
-            finish();
-            c.error(timeoutError ?? e);
-          }
-          return;
+          throw transportError(e, timedOut(), opts.signal);
         }
-        if (finished) return;
-        if (chunk.done) {
-          finish();
-          c.close();
-        } else {
-          arm();
-          c.enqueue(chunk.value);
+        if (res.status >= 300 && res.status < 400) {
+          const location = res.headers.get('location');
+          await res.body?.cancel().catch(() => {});
+          if (!location || hop >= maxRedirects) throw new TripoError('Too many redirects downloading the model', 'http', res.status);
+          url = new URL(location, url);
+          continue;
         }
-      },
-      cancel(reason) {
-        finish();
-        return reader.cancel(reason);
-      },
+        if (!res.ok) {
+          await res.body?.cancel().catch(() => {});
+          throw new TripoError(`Model download failed (HTTP ${res.status})`, 'http', res.status);
+        }
+        return res;
+      }
     },
-    { highWaterMark: 0 },
+    {
+      signal: opts.signal,
+      timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUTS.downloadMs,
+      idleTimeoutMs: opts.idleTimeoutMs ?? DEFAULT_TIMEOUTS.downloadIdleMs,
+      totalTimeoutMs: opts.totalTimeoutMs ?? DEFAULT_TIMEOUTS.downloadTotalMs,
+      onSettled: opts.onSettled,
+      makeError: (kind, message) =>
+        kind === 'aborted' ? new TripoError('Request aborted', 'aborted') : new TripoError(`Model download: ${message}`, kind === 'timeout' ? 'timeout' : 'http'),
+    },
   );
-  return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
 }

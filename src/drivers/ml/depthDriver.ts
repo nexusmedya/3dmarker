@@ -1,8 +1,27 @@
 /**
  * Shared factory for the in-browser monocular depth drivers
  * (transformers.js 'depth-estimation' pipeline in a worker).
+ *
+ * Human detail (default on): while the depth model runs, MediaPipe finds
+ * faces / hands / bodies (src/core/human); the depth is then refined with a
+ * high-res pass of the same model on each face / hand crop and with
+ * landmark-based relief (nose, lips, eye sockets, ears, fingers).
  */
-import { throwIfAborted, type Availability, type Driver, type I18nText, type ParamSpec, type ParamValues } from '../../core/types';
+import { analyzeHuman } from '../../core/human/analyze';
+import { enhanceHumanDepth } from '../../core/human/enhance';
+import type { HumanAnalysis } from '../../core/human/types';
+import {
+  AbortError,
+  throwIfAborted,
+  type Availability,
+  type DepthMap,
+  type Driver,
+  type I18nText,
+  type ParamSpec,
+  type ParamValues,
+  type Progress,
+  type RGBAImage,
+} from '../../core/types';
 import { yieldToPaint } from '../../core/yield';
 import { mlProgressToProgress, processDepth, type DepthConvention } from './postprocess';
 import { prepareInferenceImage } from './prepare';
@@ -101,6 +120,84 @@ const COMMON_PARAMS: ParamSpec[] = [
   },
 ];
 
+/** Landmark-guided face / hand refinement (src/core/human). */
+export const HUMAN_PARAMS: ParamSpec[] = [
+  {
+    kind: 'boolean',
+    key: 'humanDetail',
+    label: { tr: 'İnsan detayı (yüz ve eller)', en: 'Human detail (face & hands)' },
+    hint: {
+      tr: 'Yüz, el ve vücut noktalarını algılar (MediaPipe, ilk kullanımda ~20 MB indirilir) ve burun, dudak, göz çukuru, kulak ve parmaklara kabartma ekler. İnsan yoksa derinlik değişmez',
+      en: 'Detects face, hand and body landmarks (MediaPipe, ~20 MB downloaded on first use) and adds relief to the nose, lips, eye sockets, ears and fingers. Without people the depth is unchanged',
+    },
+    default: true,
+  },
+  {
+    kind: 'number',
+    key: 'faceStrength',
+    label: { tr: 'Yüz kabartması', en: 'Face relief' },
+    hint: {
+      tr: '0 = kapalı, 1 ≈ gerçek yüz oranları (varsayılan derinlikte); yalnızca modelde eksik kalan kısım eklenir',
+      en: '0 = off, 1 ≈ true facial proportions (at the default depth); only what the model is missing is added',
+    },
+    min: 0,
+    max: 1.5,
+    step: 0.05,
+    default: 0.8,
+  },
+  {
+    kind: 'number',
+    key: 'handStrength',
+    label: { tr: 'El ve parmak kabartması', en: 'Hand & finger relief' },
+    min: 0,
+    max: 1.5,
+    step: 0.05,
+    default: 0.7,
+  },
+  {
+    kind: 'boolean',
+    key: 'hiResCrops',
+    label: { tr: 'Yüz/el için yüksek çözünürlüklü geçiş', en: 'High-res pass on faces & hands' },
+    hint: {
+      tr: 'Modeli her yüz ve elin yakın plan kırpıntısında yeniden çalıştırır: daha ince detay, kırpıntı başına bir çıkarım daha',
+      en: 'Re-runs the model on a close-up crop of each face and hand: finer detail, one extra inference per crop',
+    },
+    default: true,
+  },
+];
+
+const isAbort = (e: unknown) => e instanceof AbortError || (typeof e === 'object' && e !== null && (e as { name?: unknown }).name === 'AbortError');
+
+/**
+ * Human analysis started alongside the depth inference (MediaPipe runs on the
+ * main thread while the worker infers). Its progress is held back until the
+ * depth is done (`relay`), so the two label streams do not interleave.
+ */
+function startHumanAnalysis(image: RGBAImage, signal: AbortSignal) {
+  const ac = new AbortController();
+  const onAbort = () => ac.abort();
+  signal.addEventListener('abort', onAbort, { once: true });
+  const state: { last: Progress | null; relay: ((p: Progress) => void) | null; settled: boolean } = { last: null, relay: null, settled: false };
+  const promise: Promise<HumanAnalysis | null> = analyzeHuman(image, {
+    signal: ac.signal,
+    onProgress: (p) => {
+      state.last = p;
+      state.relay?.(p);
+    },
+  })
+    .catch((e: unknown) => {
+      if (isAbort(e)) throw e;
+      console.warn('[ml] human analysis failed', e);
+      return null;
+    })
+    .finally(() => {
+      state.settled = true;
+      signal.removeEventListener('abort', onAbort);
+    });
+  promise.catch(() => undefined); // awaited later, or dropped when the depth fails
+  return { promise, state, cancel: () => ac.abort() };
+}
+
 /** Inference side for the given params (validated against the spec). */
 export function resolveSide(spec: DepthModelSpec, params: ParamValues): number {
   const v = Number(params.detail);
@@ -125,9 +222,9 @@ export function createDepthDriver(spec: DepthModelSpec): Driver {
     name: spec.name,
     description: spec.description,
     category: 'ml',
-    badges: ['download', 'webgpu'],
+    badges: ['download', 'webgpu', 'human-detail'],
     downloadSizeMB: spec.downloadSizeMB,
-    params: detail ? [detail, ...COMMON_PARAMS] : COMMON_PARAMS,
+    params: [...(detail ? [detail] : []), ...COMMON_PARAMS, ...HUMAN_PARAMS],
     producesDepth: true,
     isAvailable: mlAvailability,
     async run({ image, mask, params, signal, onProgress }) {
@@ -136,21 +233,30 @@ export function createDepthDriver(spec: DepthModelSpec): Driver {
       const side = resolveSide(spec, params);
       const multiple = spec.patchMultiple ?? 1;
       const prepared = prepareInferenceImage(image, { side, multiple });
+      const job = {
+        model: spec.model,
+        exactSize: !!spec.patchMultiple,
+        device: params.device === 'wasm' ? ('wasm' as const) : ('auto' as const),
+        precision: params.precision === 'fp32' ? ('fp32' as const) : ('auto' as const),
+      };
+      const human = params.humanDetail !== false ? startHumanAnalysis(image, signal) : null;
 
-      const raw = await requestDepth(
-        {
-          model: spec.model,
-          image: prepared,
-          exactSize: !!spec.patchMultiple,
-          device: params.device === 'wasm' ? 'wasm' : 'auto',
-          precision: params.precision === 'fp32' ? 'fp32' : 'auto',
-        },
-        { signal, onProgress: (p) => onProgress(mlProgressToProgress(p, ACTION)) },
-      );
+      let raw;
+      try {
+        raw = await requestDepth(
+          { ...job, image: prepared },
+          { signal, onProgress: (p) => onProgress(mlProgressToProgress(p, ACTION)) },
+        );
+      } catch (e) {
+        human?.cancel();
+        throw e;
+      }
+      if (signal.aborted) human?.cancel();
       throwIfAborted(signal);
 
       onProgress({ label: { tr: 'Son işlem…', en: 'Post-processing…' } });
       await yieldToPaint(); // show the label during the synchronous post-processing
+      if (signal.aborted) human?.cancel();
       throwIfAborted(signal);
       const depth = processDepth(raw, {
         width: image.width,
@@ -159,7 +265,43 @@ export function createDepthDriver(spec: DepthModelSpec): Driver {
         mask,
         refine: params.edgeRefine === true ? { image } : null,
       });
-      return { kind: 'depth', depth, mask };
+      if (!human) return { kind: 'depth', depth, mask };
+
+      // Human detail: wait for the analysis (showing its progress from now on).
+      if (!human.state.settled) {
+        if (human.state.last) onProgress(human.state.last);
+        human.state.relay = onProgress;
+      }
+      const analysis = await human.promise;
+      throwIfAborted(signal);
+      if (!analysis || (analysis.faces.length === 0 && analysis.hands.length === 0 && analysis.poses.length === 0)) {
+        return { kind: 'depth', depth, mask };
+      }
+      // High-res crop pass: the same model at its native input size on each face / hand crop.
+      const refineCrop = async (crop: RGBAImage, sig: AbortSignal): Promise<DepthMap> => {
+        const r = await requestDepth({ ...job, image: prepareInferenceImage(crop, { side: spec.nativeSide, multiple }) }, { signal: sig });
+        return processDepth(r, { width: crop.width, height: crop.height, convention: spec.convention, mask: null });
+      };
+      try {
+        const refined = await enhanceHumanDepth(depth, mask, image, analysis, {
+          faceStrength: numberParam(params.faceStrength, 0.8),
+          handStrength: numberParam(params.handStrength, 0.7),
+          refineCrop: params.hiResCrops !== false ? refineCrop : undefined,
+          signal,
+          onProgress,
+        });
+        return { kind: 'depth', depth: refined, mask };
+      } catch (e) {
+        if (isAbort(e) || signal.aborted) throw e;
+        // Detail is a bonus: never lose the base depth over it.
+        console.warn('[ml] human detail refinement failed; keeping the plain depth', e);
+        return { kind: 'depth', depth, mask };
+      }
     },
   };
+}
+
+function numberParam(v: unknown, fallback: number): number {
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) ? Math.min(1.5, Math.max(0, n)) : fallback;
 }

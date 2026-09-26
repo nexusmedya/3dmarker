@@ -1,4 +1,10 @@
-/** Generate / cancel, the progress bar and the error alert. */
+/**
+ * Generate / cancel, the progress bar and the error alert. Pinned at the
+ * bottom of the studio panel: it generates from step 4's settings whatever
+ * step is open (`summary` names the driver, `blockedAction` links to the
+ * step that unblocks it).
+ */
+import type { ReactNode } from 'react';
 import type { I18nText, Progress } from '../core/types';
 import type { JobStatus } from '../app/store';
 import { useI18n } from './i18n';
@@ -15,13 +21,31 @@ interface Props {
   onGenerate: () => void;
   onCancel: () => void;
   onDismiss: () => void;
+  /** One line above the button (e.g. the selected driver). */
+  summary?: ReactNode;
+  /** A button next to the blocked reason (e.g. "Go to Views"). */
+  blockedAction?: { label: string; onClick: () => void } | null;
 }
 
-export function GeneratePanel({ status, progress, error, errorTitle, canGenerate, blockedReason, hasResult, onGenerate, onCancel, onDismiss }: Props) {
+export function GeneratePanel({
+  status,
+  progress,
+  error,
+  errorTitle,
+  canGenerate,
+  blockedReason,
+  hasResult,
+  onGenerate,
+  onCancel,
+  onDismiss,
+  summary,
+  blockedAction,
+}: Props) {
   const { t, tx } = useI18n();
   const running = status === 'running';
   return (
     <div className="generate-panel">
+      {summary}
       {running ? (
         <div className="generate-row">
           <button type="button" className="btn btn-primary btn-lg grow" disabled aria-busy="true">
@@ -44,7 +68,19 @@ export function GeneratePanel({ status, progress, error, errorTitle, canGenerate
         </button>
       )}
       {running && <ProgressBar progress={progress} />}
-      {!running && blockedReason && <p className="muted small center">{blockedReason}</p>}
+      {!running && blockedReason && (
+        <p className="muted small center generate-blocked" data-testid="generate-blocked">
+          {blockedReason}
+          {blockedAction && (
+            <>
+              {' '}
+              <button type="button" className="link-btn" onClick={blockedAction.onClick} data-testid="generate-blocked-action">
+                {blockedAction.label}
+              </button>
+            </>
+          )}
+        </p>
+      )}
       {!running && !blockedReason && <p className="muted small center kbd-hint">{t('shortcutHint')}</p>}
       {status === 'cancelled' && !error && (
         <p className="muted small center" role="status">

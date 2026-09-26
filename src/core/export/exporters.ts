@@ -18,9 +18,22 @@
  * top-row-first RGBAImage data) would come out upside down; exportObject
  * hands the exporter a row-flipped copy instead. Float DataTextures are not
  * supported by GLTFExporter.
+ *
+ * Rigged models (src/rig): skinned meshes are re-bound to the cloned bones
+ * (a plain clone() keeps pointing at the original skeleton — also true of
+ * ViewerCore.getExportObject's clone — so bones are matched by identity,
+ * then by name), rig placeholder meshes are dropped. GLB keeps the skin
+ * (JOINTS_0 / WEIGHTS_0 + inverse bind matrices) with the bones put back
+ * into their bind pose (`userData.rest`) and writes `options.animations`
+ * (node TRS, LINEAR samplers; clips that target no exported node are
+ * skipped). OBJ / STL / PLY have no skins: they get the mesh as currently
+ * posed (`pose: 'current'`, the default — what the viewer shows, e.g. a
+ * paused animation frame) or in the bind pose (`pose: 'rest'`).
  */
-import { BufferAttribute, BufferGeometry, Matrix3, Matrix4, TextureSource, Vector3 } from 'three';
-import type { DataTexture, InterleavedBufferAttribute, Line, Material, Mesh, Object3D, Points, Texture } from 'three';
+import { BufferAttribute, BufferGeometry, Group, Matrix3, Matrix4, Mesh as MeshClass, PropertyBinding, Skeleton, TextureSource, Vector3, Vector4 } from 'three';
+import type {
+  AnimationClip, Bone, DataTexture, InterleavedBufferAttribute, Line, Material, Mesh, Object3D, Points, SkinnedMesh, Texture,
+} from 'three';
 import type { I18nText } from '../types';
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
 import { OBJExporter } from 'three/examples/jsm/exporters/OBJExporter.js';
@@ -65,16 +78,33 @@ export interface ExportOptions {
   scale?: number;
   /** GLB: textures larger than this are downscaled (default 4096). */
   maxTextureSize?: number;
+  /** GLB only: animation clips to embed (tracks bind by node name, e.g. `Hips.quaternion`). */
+  animations?: AnimationClip[];
+  /** OBJ / STL / PLY of skinned meshes: bake the current pose (default) or the bind pose. */
+  pose?: 'current' | 'rest';
 }
 
 /** Export `object` (and its children) as a file blob; the object itself is not modified. GLB/STL/PLY are binary. */
 export async function exportObject(object: Object3D, format: ExportFormat, opts: ExportOptions = {}): Promise<Blob> {
-  const root = bakeWorldTransform(object, opts.scale ?? 1);
+  let root = bakeWorldTransform(object, opts.scale ?? 1);
   const type = exportFormatInfo(format).mime;
+  const rigged = hasSkinOrRig(root);
+  if (rigged) {
+    rebindSkinnedClones(object, root);
+    root = dropRigPlaceholders(root);
+    if (format === 'glb') {
+      resetBonesToRest(root);
+      root.updateMatrixWorld(true);
+    } else {
+      root.updateMatrixWorld(true);
+      bakeSkinnedMeshes(root, opts.pose ?? 'current');
+    }
+  }
   switch (format) {
     case 'glb': {
       makeTexturesExportable(root);
-      const out = await new GLTFExporter().parseAsync(root, { binary: true, maxTextureSize: opts.maxTextureSize ?? 4096 });
+      const animations = (opts.animations ?? []).filter((clip) => clipTargetsNodes(clip, root));
+      const out = await new GLTFExporter().parseAsync(root, { binary: true, maxTextureSize: opts.maxTextureSize ?? 4096, animations });
       if (typeof (out as ArrayBuffer).byteLength !== 'number') throw new Error('GLTFExporter returned JSON instead of GLB');
       return new Blob([out as ArrayBuffer], { type });
     }
@@ -272,4 +302,159 @@ export function flipDataTexture(tex: DataTexture): DataTexture {
   out.flipY = false;
   out.needsUpdate = true;
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Rigged models
+
+/** Set by src/rig on a mesh whose geometry moved to a skinned child (it renders nothing). */
+const RIG_PLACEHOLDER = 'rigPlaceholder';
+
+function hasSkinOrRig(root: Object3D): boolean {
+  let found = false;
+  root.traverse((o) => {
+    if ((o as SkinnedMesh).isSkinnedMesh || (o as Bone).isBone || (o.userData as Record<string, unknown>)[RIG_PLACEHOLDER]) found = true;
+  });
+  return found;
+}
+
+function parallelTraverse(a: Object3D, b: Object3D, fn: (a: Object3D, b: Object3D) => void): void {
+  fn(a, b);
+  for (let i = 0; i < a.children.length && i < b.children.length; i++) parallelTraverse(a.children[i], b.children[i], fn);
+}
+
+/**
+ * Point every skinned mesh of `clone` (a clone of `source`) at the cloned
+ * bones: by identity through the parallel hierarchy, else by bone name
+ * (when `source` itself was a clone whose skeleton still references another
+ * tree's bones). Meshes whose bones cannot all be found are left as they are.
+ */
+export function rebindSkinnedClones(source: Object3D, clone: Object3D): void {
+  const map = new Map<Object3D, Object3D>();
+  parallelTraverse(source, clone, (a, b) => map.set(a, b));
+  const byName = new Map<string, Bone>();
+  clone.traverse((o) => {
+    if ((o as Bone).isBone && !byName.has(o.name)) byName.set(o.name, o as Bone);
+  });
+  const inTree = new Set<Object3D>();
+  clone.traverse((o) => inTree.add(o));
+  clone.traverse((o) => {
+    const mesh = o as SkinnedMesh;
+    if (!mesh.isSkinnedMesh || !mesh.skeleton) return;
+    const bones = mesh.skeleton.bones.map((b) => {
+      const mapped = map.get(b) as Bone | undefined;
+      if (mapped && (mapped as Bone).isBone) return mapped;
+      return inTree.has(b) ? b : byName.get(b.name);
+    });
+    if (bones.some((b) => !b)) return;
+    const skeleton = new Skeleton(bones as Bone[], mesh.skeleton.boneInverses.map((m) => m.clone()));
+    mesh.bind(skeleton, mesh.bindMatrix.clone());
+  });
+}
+
+/** Remove rig placeholder meshes (a root placeholder becomes a Group keeping its transform and children). */
+function dropRigPlaceholders(root: Object3D): Object3D {
+  const swap = (mesh: Object3D): Object3D => {
+    const g = new Group();
+    g.name = mesh.name;
+    g.position.copy(mesh.position);
+    g.quaternion.copy(mesh.quaternion);
+    g.scale.copy(mesh.scale);
+    g.userData = { ...mesh.userData };
+    delete (g.userData as Record<string, unknown>)[RIG_PLACEHOLDER];
+    for (const c of [...mesh.children]) g.add(c);
+    const parent = mesh.parent;
+    if (parent) {
+      const i = parent.children.indexOf(mesh);
+      parent.children[i] = g;
+      g.parent = parent;
+      mesh.parent = null;
+    }
+    return g;
+  };
+  const found: Object3D[] = [];
+  root.traverse((o) => {
+    if ((o as Mesh).isMesh && (o.userData as Record<string, unknown>)[RIG_PLACEHOLDER]) found.push(o);
+  });
+  let out = root;
+  for (const m of found) {
+    const g = swap(m);
+    if (m === root) out = g;
+  }
+  out.updateMatrixWorld(true);
+  return out;
+}
+
+interface RestTransform {
+  position: [number, number, number];
+  quaternion: [number, number, number, number];
+}
+
+function resetBonesToRest(root: Object3D): void {
+  root.traverse((o) => {
+    const rest = (o.userData as { rest?: RestTransform }).rest;
+    if (!(o as Bone).isBone || !rest) return;
+    o.position.fromArray(rest.position);
+    o.quaternion.fromArray(rest.quaternion);
+    o.scale.set(1, 1, 1);
+  });
+}
+
+/** Replace each skinned mesh by a plain mesh in the given pose (skin attributes dropped). */
+function bakeSkinnedMeshes(root: Object3D, pose: 'current' | 'rest'): void {
+  const list: SkinnedMesh[] = [];
+  root.traverse((o) => {
+    if ((o as SkinnedMesh).isSkinnedMesh) list.push(o as SkinnedMesh);
+  });
+  if (pose === 'rest') {
+    resetBonesToRest(root);
+    root.updateMatrixWorld(true);
+  }
+  for (const sm of list) {
+    const src = sm.geometry;
+    const g = new BufferGeometry();
+    g.setIndex(src.getIndex());
+    for (const [name, attr] of Object.entries(src.attributes)) if (name !== 'skinIndex' && name !== 'skinWeight') g.setAttribute(name, attr);
+    for (const grp of src.groups) g.addGroup(grp.start, grp.count, grp.materialIndex);
+    const posAttr = src.getAttribute('position');
+    const nrmAttr = src.getAttribute('normal');
+    if (pose === 'current' && sm.skeleton && src.getAttribute('skinIndex') && posAttr) {
+      const v = new Vector3(), n = new Vector4();
+      const out = new Float32Array(posAttr.count * 3);
+      for (let i = 0; i < posAttr.count; i++) sm.applyBoneTransform(i, v.fromBufferAttribute(posAttr, i)).toArray(out, i * 3);
+      g.setAttribute('position', new BufferAttribute(out, 3));
+      if (nrmAttr) {
+        const outN = new Float32Array(nrmAttr.count * 3);
+        for (let i = 0; i < nrmAttr.count; i++) {
+          n.set(nrmAttr.getX(i), nrmAttr.getY(i), nrmAttr.getZ(i), 0);
+          sm.applyBoneTransform(i, n);
+          v.set(n.x, n.y, n.z).normalize().toArray(outN, i * 3);
+        }
+        g.setAttribute('normal', new BufferAttribute(outN, 3));
+      }
+    }
+    const mesh = new MeshClass(g, sm.material);
+    mesh.name = sm.name;
+    mesh.position.copy(sm.position);
+    mesh.quaternion.copy(sm.quaternion);
+    mesh.scale.copy(sm.scale);
+    mesh.visible = sm.visible;
+    mesh.userData = { ...sm.userData };
+    for (const c of [...sm.children]) mesh.add(c);
+    const parent = sm.parent;
+    if (parent) {
+      parent.children[parent.children.indexOf(sm)] = mesh;
+      mesh.parent = parent;
+      sm.parent = null;
+    }
+  }
+  root.updateMatrixWorld(true);
+}
+
+/** True when at least one of the clip's tracks resolves to a node under `root`. */
+function clipTargetsNodes(clip: AnimationClip, root: Object3D): boolean {
+  return clip.tracks.some((t) => {
+    const binding = PropertyBinding.parseTrackName(t.name);
+    return !!PropertyBinding.findNode(root, binding.nodeName);
+  });
 }

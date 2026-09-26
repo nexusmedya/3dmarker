@@ -10,10 +10,14 @@ export function baseName(name: string): string {
     .trim();
 }
 
-/** "<upload name>-<driver id>.<ext>", e.g. "cat-depth-anything-v2-small.glb". */
-export function modelFileName(sourceName: string, driverId: string, format: ExportFormat): string {
+/**
+ * "<upload name>-<driver id>[-<suffix>].<ext>", e.g. "cat-depth-anything-v2-small.glb"
+ * or "cat-depth-anything-v2-small-rigged.glb".
+ */
+export function modelFileName(sourceName: string, driverId: string, format: ExportFormat, suffix?: string): string {
   const base = baseName(sourceName) || '3dmarker';
-  return `${base}-${driverId}.${exportFormatInfo(format).ext}`;
+  const tail = suffix ? `-${baseName(suffix)}` : '';
+  return `${base}-${driverId}${tail}.${exportFormatInfo(format).ext}`;
 }
 
 /**

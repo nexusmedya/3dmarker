@@ -39,9 +39,10 @@ import {
   Vector3,
   WebGLRenderer,
 } from 'three';
-import type { Material, Object3D, Texture, WebGLRenderTarget } from 'three';
+import type { Material, Object3D, SkinnedMesh, Texture, WebGLRenderTarget } from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { rebindSkinnedClones } from '../core/export/exporters';
 import { disposeObject, materialsOf } from './dispose';
 
 export interface ViewerDisplay {
@@ -304,6 +305,34 @@ export class ViewerCore {
     this.dirty = true;
   }
 
+  /**
+   * Call after meshes were added to / removed from the object in place (e.g.
+   * the rig swapping meshes for skinned copies): meshes that left the tree get
+   * their original material back and are forgotten, new ones are registered
+   * with their current material as the original; then like refresh().
+   */
+  rescanObject(): void {
+    const obj = this.object;
+    if (!obj) return;
+    const current = new Set(meshesOf(obj));
+    for (const [mesh, mat] of this.originals) {
+      if (current.has(mesh)) continue;
+      mesh.material = mat;
+      this.originals.delete(mesh);
+    }
+    const aniso = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
+    for (const mesh of current) {
+      if (this.originals.has(mesh)) continue;
+      this.originals.set(mesh, mesh.material);
+      mesh.castShadow = true;
+      for (const m of materialsOf(mesh)) {
+        const map = (m as Material & { map?: Texture | null }).map;
+        if (map) map.anisotropy = aniso;
+      }
+    }
+    this.refresh();
+  }
+
   setDisplay(patch: Partial<ViewerDisplay>): void {
     const prev = this.display;
     this.display = { ...prev, ...patch };
@@ -321,6 +350,8 @@ export class ViewerCore {
   /**
    * Clone of the current object (sharing geometries / textures) carrying the
    * original materials, whatever the display mode — for the exporters.
+   * Skinned meshes are re-bound to the cloned bones (a plain clone() keeps
+   * pointing at the on-screen skeleton).
    */
   getExportObject(): Object3D | null {
     const obj = this.object;
@@ -328,6 +359,7 @@ export class ViewerCore {
     const clone = obj.clone(true);
     const src = meshesOf(obj), dst = meshesOf(clone);
     for (let i = 0; i < src.length && i < dst.length; i++) dst[i].material = this.originals.get(src[i]) ?? src[i].material;
+    if (src.some((m) => (m as SkinnedMesh).isSkinnedMesh)) rebindSkinnedClones(obj, clone);
     return clone;
   }
 

@@ -3,7 +3,7 @@ import type { Availability, Driver } from '../core/types';
 import { DRIVERS } from '../drivers';
 import { BADGE_HINTS, BADGE_LABELS, CATEGORY_LABELS, groupDrivers } from '../app/driverMeta';
 import { useI18n } from './i18n';
-import { IconAlert, IconCheck, IconCloud, IconCpu, IconInfo, IconWand } from './icons';
+import { IconAlert, IconCheck, IconCloud, IconCpu, IconInfo, IconViews, IconWand } from './icons';
 
 interface Props {
   driver: Driver;
@@ -15,6 +15,7 @@ interface Props {
 export function CategoryIcon({ category, size = 16 }: { category: Driver['category']; size?: number }) {
   if (category === 'ml') return <IconCpu size={size} />;
   if (category === 'cloud') return <IconCloud size={size} />;
+  if (category === 'multiview') return <IconViews size={size} />;
   return <IconWand size={size} />;
 }
 

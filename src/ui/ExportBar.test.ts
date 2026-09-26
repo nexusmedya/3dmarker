@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, createElement } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Group } from 'three';
+import { AnimationClip, Group, NumberKeyframeTrack } from 'three';
 import { describe, expect, it, vi } from 'vitest';
 import type { Lang } from '../core/types';
 import type { ResultInfo } from '../app/store';
@@ -85,6 +85,39 @@ describe('ExportBar', () => {
     });
     expect(downloadBlob).toHaveBeenCalledTimes(1);
     expect(stl.getAttribute('aria-busy')).toBe('false');
+    await act(async () => root.unmount());
+  });
+
+  it('exports the rig’s animation clips with GLB only, names rigged models “-rigged” and says how many clips go along', async () => {
+    const clip = new AnimationClip('wave', 1, [new NumberKeyframeTrack('.morphTargetInfluences[0]', [0, 1], [0, 1])]);
+    vi.mocked(exportObject).mockImplementation(async () => new Blob(['x']));
+    vi.mocked(downloadBlob).mockClear();
+    const host = document.createElement('div');
+    document.body.append(host);
+    const root = createRoot(host);
+    const obj = new Group();
+    await act(async () =>
+      root.render(
+        createElement(
+          LangProvider,
+          { value: 'en' as Lang },
+          createElement(ExportBar, { result, getObject: () => obj, stlSizeMm: 100, onStlSize: () => {}, disabled: false, animations: [clip], rigged: true }),
+        ),
+      ),
+    );
+    expect(host.querySelector('[data-testid="export-animations"]')?.textContent).toContain('GLB includes 1 animations');
+    const calls = vi.mocked(exportObject).mock.calls.length;
+    for (const f of ['glb', 'obj']) {
+      await act(async () => {
+        (host.querySelector(`[data-testid="export-${f}"]`) as HTMLButtonElement).click();
+        await vi.waitFor(() => expect(vi.mocked(downloadBlob).mock.calls.length).toBe(f === 'glb' ? 1 : 2));
+      });
+    }
+    const [glbCall, objCall] = vi.mocked(exportObject).mock.calls.slice(calls);
+    expect(glbCall[1]).toBe('glb');
+    expect(glbCall[2]).toEqual({ scale: 1, animations: [clip] });
+    expect(objCall[2]).toEqual({ scale: 1 });
+    expect(vi.mocked(downloadBlob).mock.calls.map((c) => c[1])).toEqual(['a-silhouette-inflate-rigged.glb', 'a-silhouette-inflate-rigged.obj']);
     await act(async () => root.unmount());
   });
 });

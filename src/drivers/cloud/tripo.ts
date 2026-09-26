@@ -2,6 +2,10 @@
  * Cloud driver: true image → full 3D via Tripo3D, proxied through our own
  * server (/api/tripo/*, see server/app.ts) so the API key stays server-side.
  * Uploads the original file, polls the task, then downloads the GLB.
+ *
+ * The task machinery (create → poll → download with retries, error mapping)
+ * is shared with the multi-view driver (./tripoMultiview.ts) through
+ * createTripoTaskRunner.
  */
 import type { Availability, Driver, DriverInput, DriverResult, I18nText, ParamSpec, ParamValues } from '../../core/types';
 import { AbortError, throwIfAborted } from '../../core/types';
@@ -46,13 +50,13 @@ export interface TripoParams {
 
 export const DEFAULT_TRIPO_PARAMS: TripoParams = { apiKey: '', modelVersion: 'default', texture: true, pbr: true, faceLimit: 0 };
 
-const ACCEPTED_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
+export const ACCEPTED_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
 
 // Progress bands: upload → 0.05, generation 0.05..0.9, download 0.9..1.
 const GEN_START = 0.05;
 const GEN_END = 0.9;
 
-const T = {
+export const TRIPO_TEXT = {
   upload: { tr: 'Görsel Tripo3D’ye yükleniyor', en: 'Uploading image to Tripo3D' },
   queued: { tr: 'Tripo3D kuyruğunda bekleniyor', en: 'Waiting in the Tripo3D queue' },
   generating: (p: number): I18nText => ({ tr: `3B model oluşturuluyor… %${p}`, en: `Generating 3D model… ${p}%` }),
@@ -134,20 +138,20 @@ const isTransient = (e: HttpError) => e.status === 0 || e.status === 429 || e.st
 function localize(e: HttpError, userKey: boolean): LocalizedError {
   switch (e.status) {
     case 0:
-      return new LocalizedError(e instanceof DownloadInterruptedError ? T.downloadInterrupted : T.serverUnreachable);
+      return new LocalizedError(e instanceof DownloadInterruptedError ? TRIPO_TEXT.downloadInterrupted : TRIPO_TEXT.serverUnreachable);
     case 401:
-      return new LocalizedError(userKey ? T.keyRejected : T.needsKey);
+      return new LocalizedError(userKey ? TRIPO_TEXT.keyRejected : TRIPO_TEXT.needsKey);
     case 402:
     case 403:
-      return new LocalizedError(T.refused(e.message));
+      return new LocalizedError(TRIPO_TEXT.refused(e.message));
     case 413:
-      return new LocalizedError(T.tooLarge);
+      return new LocalizedError(TRIPO_TEXT.tooLarge);
     case 415:
-      return new LocalizedError(T.unsupported);
+      return new LocalizedError(TRIPO_TEXT.unsupported);
     case 429:
-      return new LocalizedError(T.rateLimited(e.retryAfterSec ? Math.ceil(e.retryAfterSec / 60) : null));
+      return new LocalizedError(TRIPO_TEXT.rateLimited(e.retryAfterSec ? Math.ceil(e.retryAfterSec / 60) : null));
     default:
-      return new LocalizedError(T.generic(e.message));
+      return new LocalizedError(TRIPO_TEXT.generic(e.message));
   }
 }
 
@@ -200,7 +204,8 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-const PARAMS: ParamSpec[] = [
+/** Parameters shared by the Tripo drivers. */
+export const TRIPO_PARAMS: ParamSpec[] = [
   {
     kind: 'text',
     key: 'apiKey',
@@ -255,7 +260,34 @@ const PARAMS: ParamSpec[] = [
   },
 ];
 
-export function createTripoDriver(options: TripoDriverOptions = {}): Driver {
+/** Why Tripo would refuse this file (size / type), or null. An empty type is left to the server's sniffing. */
+export function checkTripoFile(file: Blob): I18nText | null {
+  if (file.size > MAX_IMAGE_BYTES) return TRIPO_TEXT.tooLarge;
+  if (file.type && !ACCEPTED_TYPES.includes(file.type)) return TRIPO_TEXT.unsupported;
+  return null;
+}
+
+/** A task-creation request: our server's route and its multipart body. */
+export interface TripoTaskSpec {
+  path: string;
+  form: FormData;
+  /** Progress label while uploading (default TRIPO_TEXT.upload). */
+  uploadLabel?: I18nText;
+}
+
+export interface TripoTaskRunner {
+  /**
+   * Create the task (checking the user key's format first), poll it with
+   * progress, download the GLB with retries; server / Tripo errors become
+   * bilingual LocalizedErrors, aborts AbortError.
+   */
+  run(input: DriverInput, params: TripoParams, task: TripoTaskSpec): Promise<DriverResult>;
+  /** Server reachable (ok), with a reason when it has no key of its own. */
+  isAvailable(): Promise<Availability>;
+}
+
+/** The create → poll → download machinery shared by the Tripo drivers. */
+export function createTripoTaskRunner(options: TripoDriverOptions = {}): TripoTaskRunner {
   const pollIntervalMs = options.pollIntervalMs ?? 2000;
   const maxWaitMs = options.maxWaitMs ?? 15 * 60_000;
   const maxPollErrors = options.maxPollErrors ?? 5;
@@ -344,7 +376,7 @@ export function createTripoDriver(options: TripoDriverOptions = {}): Driver {
     let shown = 0; // never move the bar backwards when a retry starts over
     const progress = (share: number) => {
       shown = Math.max(shown, share);
-      onProgress({ label: T.downloading, ratio: GEN_END + (1 - GEN_END) * shown });
+      onProgress({ label: TRIPO_TEXT.downloading, ratio: GEN_END + (1 - GEN_END) * shown });
     };
     for (let attempt = 1; ; attempt++) {
       try {
@@ -357,35 +389,29 @@ export function createTripoDriver(options: TripoDriverOptions = {}): Driver {
     }
   }
 
-  async function run(input: DriverInput): Promise<DriverResult> {
-    const { file, signal, onProgress } = input;
-    const params = tripoParamsFrom(input.params);
+  async function run(input: DriverInput, params: TripoParams, task: TripoTaskSpec): Promise<DriverResult> {
+    const { signal, onProgress } = input;
     const userKey = params.apiKey !== '';
     throwIfAborted(signal);
-    if (file.size > MAX_IMAGE_BYTES) throw new LocalizedError(T.tooLarge);
-    if (file.type && !ACCEPTED_TYPES.includes(file.type)) throw new LocalizedError(T.unsupported);
     // Checked here: fetch itself throws on non-Latin-1 header values, which would read as "server unreachable".
-    if (userKey && !API_KEY_PATTERN.test(params.apiKey)) throw new LocalizedError(T.keyFormat);
+    if (userKey && !API_KEY_PATTERN.test(params.apiKey)) throw new LocalizedError(TRIPO_TEXT.keyFormat);
     const headers: Record<string, string> = {
       [CLIENT_HEADER]: CLIENT_HEADER_VALUE,
       ...(userKey ? { [TRIPO_KEY_HEADER]: params.apiKey } : {}),
     };
 
     try {
-      onProgress({ label: T.upload, ratio: 0.01 });
-      const created = await readJson<CreateTaskResponse>(
-        await request(TRIPO_TASKS_PATH, { method: 'POST', headers, body: buildTaskForm(file, params) }, signal),
-        signal,
-      );
+      onProgress({ label: task.uploadLabel ?? TRIPO_TEXT.upload, ratio: 0.01 });
+      const created = await readJson<CreateTaskResponse>(await request(task.path, { method: 'POST', headers, body: task.form }, signal), signal);
       if (typeof created.taskId !== 'string' || !created.taskId) throw new HttpError(502, 'no task id');
       const taskId = created.taskId;
-      onProgress({ label: T.queued, ratio: GEN_START });
+      onProgress({ label: TRIPO_TEXT.queued, ratio: GEN_START });
 
       const deadline = Date.now() + maxWaitMs;
       let errors = 0;
       for (;;) {
         await sleep(pollIntervalMs, signal);
-        if (Date.now() > deadline) throw new LocalizedError(T.timeout(Math.round(maxWaitMs / 60_000)));
+        if (Date.now() > deadline) throw new LocalizedError(TRIPO_TEXT.timeout(Math.round(maxWaitMs / 60_000)));
         let state: TaskStateResponse;
         try {
           state = await readJson<TaskStateResponse>(await request(taskPath(taskId), { headers }, signal), signal);
@@ -397,22 +423,22 @@ export function createTripoDriver(options: TripoDriverOptions = {}): Driver {
         const pct = Math.max(0, Math.min(100, Math.round(Number(state.progress) || 0)));
         if (state.status === 'success') break;
         if (state.status === 'failed') {
-          if (state.reason === 'banned') throw new LocalizedError(T.banned);
-          if (state.reason === 'expired') throw new LocalizedError(T.expired);
+          if (state.reason === 'banned') throw new LocalizedError(TRIPO_TEXT.banned);
+          if (state.reason === 'expired') throw new LocalizedError(TRIPO_TEXT.expired);
           // Servers without `reason` only send an English detail.
-          throw new LocalizedError(T.failed(state.reason === 'failed' ? '' : state.error ?? ''));
+          throw new LocalizedError(TRIPO_TEXT.failed(state.reason === 'failed' ? '' : state.error ?? ''));
         }
-        if (state.status === 'cancelled') throw new LocalizedError(T.cancelled);
+        if (state.status === 'cancelled') throw new LocalizedError(TRIPO_TEXT.cancelled);
         if (state.status === 'running' || pct > 0) {
-          onProgress({ label: T.generating(pct), ratio: GEN_START + (GEN_END - GEN_START) * (pct / 100) });
+          onProgress({ label: TRIPO_TEXT.generating(pct), ratio: GEN_START + (GEN_END - GEN_START) * (pct / 100) });
         } else {
-          onProgress({ label: T.queued, ratio: GEN_START });
+          onProgress({ label: TRIPO_TEXT.queued, ratio: GEN_START });
         }
       }
 
       const glb = await downloadWithRetry(taskId, headers, input);
-      if (!isGlb(glb)) throw new LocalizedError(T.badModel);
-      onProgress({ label: T.done, ratio: 1 });
+      if (!isGlb(glb)) throw new LocalizedError(TRIPO_TEXT.badModel);
+      onProgress({ label: TRIPO_TEXT.done, ratio: 1 });
       return { kind: 'model', glb };
     } catch (e) {
       if (signal.aborted || e instanceof AbortError) throw new AbortError();
@@ -429,8 +455,22 @@ export function createTripoDriver(options: TripoDriverOptions = {}): Driver {
     } catch {
       body = null;
     }
-    if (!body || typeof body.configured !== 'boolean') return { ok: false, reason: T.serverUnreachable };
-    return body.configured ? { ok: true } : { ok: true, reason: T.needsKey };
+    if (!body || typeof body.configured !== 'boolean') return { ok: false, reason: TRIPO_TEXT.serverUnreachable };
+    return body.configured ? { ok: true } : { ok: true, reason: TRIPO_TEXT.needsKey };
+  }
+
+  return { run, isAvailable };
+}
+
+export function createTripoDriver(options: TripoDriverOptions = {}): Driver {
+  const runner = createTripoTaskRunner(options);
+
+  async function run(input: DriverInput): Promise<DriverResult> {
+    const params = tripoParamsFrom(input.params);
+    throwIfAborted(input.signal);
+    const problem = checkTripoFile(input.file);
+    if (problem) throw new LocalizedError(problem);
+    return runner.run(input, params, { path: TRIPO_TASKS_PATH, form: buildTaskForm(input.file, params) });
   }
 
   return {
@@ -442,9 +482,9 @@ export function createTripoDriver(options: TripoDriverOptions = {}): Driver {
     },
     category: 'cloud',
     badges: ['api-key', 'full-3d', 'closed-mesh'],
-    params: PARAMS,
+    params: TRIPO_PARAMS,
     producesDepth: false,
-    isAvailable,
+    isAvailable: runner.isAvailable,
     run,
   };
 }

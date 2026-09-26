@@ -23,7 +23,7 @@ import {
   Vector3,
 } from 'three';
 import type { AnimationClip, BufferGeometry, Object3D, Side, Texture } from 'three';
-import type { DepthMap, Driver, DriverResult, Mask, ParamValues, Progress, RGBAImage, ViewSet } from '../core/types';
+import type { DepthMap, Driver, DriverResult, Mask, ParamValues, Progress, RGBAImage, ViewImage, ViewSet } from '../core/types';
 import { AbortError, throwIfAborted } from '../core/types';
 import { fitRGBA, hasTransparency, maskArea, maskFromAlpha } from '../core/image/ops';
 import { autoMaskFromBorder } from '../core/image/autoMask';
@@ -249,10 +249,28 @@ export function buildDepthModel(depth: DepthMap, mask: Mask | null, texture: Tex
   return model;
 }
 
+/** True when the geometry carries per-vertex colours (e.g. multi-view fusion). */
+export function hasVertexColors(geometry: BufferGeometry): boolean {
+  const color = geometry.getAttribute('color');
+  return !!color && color.count > 0;
+}
+
+/**
+ * Geometry results: vertex-coloured geometries (a `color` attribute) are shown
+ * with their colours and no texture (`texture`, if given, is disposed);
+ * others map the source image through their UVs.
+ */
 export function buildGeometryModel(geometry: BufferGeometry, texture: Texture | null): BuiltModel {
   if (!geometry.getAttribute('normal')) geometry.computeVertexNormals();
   const stats = computeMeshStats(geometry);
-  const mesh = new Mesh(geometry, createSurfaceMaterial(texture, stats.watertight ? FrontSide : DoubleSide));
+  const side = stats.watertight ? FrontSide : DoubleSide;
+  let material: MeshStandardMaterial;
+  if (hasVertexColors(geometry)) {
+    texture?.dispose();
+    material = createSurfaceMaterial(null, side);
+    material.vertexColors = true;
+  } else material = createSurfaceMaterial(texture, side);
+  const mesh = new Mesh(geometry, material);
   mesh.name = 'surface';
   return { kind: 'geometry', object: mesh, stats, depth: null, mask: null, meshKey: null, remesh: null };
 }
@@ -277,12 +295,13 @@ export function normalizeToFrame(obj: Object3D): Group {
   return group;
 }
 
-/** Summed stats over every mesh; watertight only if every mesh is. */
+/** Summed stats over every non-empty mesh; watertight only if every one is. */
 export function statsForObject(obj: Object3D): MeshStats {
   let vertices = 0, triangles = 0, watertight = true, any = false;
   obj.traverse((o) => {
     const mesh = o as Mesh;
-    if (!mesh.isMesh) return;
+    // Empty geometries (e.g. a rig's placeholder for a swapped-out mesh) add nothing.
+    if (!mesh.isMesh || (mesh.geometry?.getAttribute('position')?.count ?? 0) === 0) return;
     const s = computeMeshStats(mesh.geometry);
     vertices += s.vertices;
     triangles += s.triangles;
@@ -305,7 +324,9 @@ export async function buildGltfModel(glb: ArrayBuffer): Promise<BuiltModel> {
   try {
     const gltf = await loader.parseAsync(glb, '');
     const object = normalizeToFrame(gltf.scene);
-    return { kind: 'model', object, stats: statsForObject(object), depth: null, mask: null, meshKey: null, remesh: null };
+    // Embedded clips (skinned GLBs) bind by node name, so they still resolve under the normalising group.
+    const animations = gltf.animations?.length ? gltf.animations : undefined;
+    return { kind: 'model', object, stats: statsForObject(object), depth: null, mask: null, meshKey: null, remesh: null, animations };
   } finally {
     draco.dispose();
   }
@@ -324,7 +345,7 @@ export async function buildModel(
       return buildDepthModel(result.depth, result.mask ?? inputMask, texture, meshParams);
     }
     case 'geometry':
-      return buildGeometryModel(result.geometry, createImageTexture(opaqueTextureImage(image)));
+      return buildGeometryModel(result.geometry, hasVertexColors(result.geometry) ? null : createImageTexture(opaqueTextureImage(image)));
     case 'model':
       return buildGltfModel(result.glb);
   }
@@ -345,6 +366,11 @@ export interface PipelineRequest {
   removeBg?: typeof removeBackground;
 }
 
+/** The source image as the front view handed to drivers. */
+export function frontView(source: SourceImage, mask: Mask | null): ViewImage {
+  return { id: 'front', image: source.image, mask, file: source.file, origin: 'source' };
+}
+
 export interface PipelineResult {
   model: BuiltModel;
   /** The mask handed to the driver (cache it for the AI mode). */
@@ -363,7 +389,7 @@ export async function runPipeline(req: PipelineRequest): Promise<PipelineResult>
     mask: inputMask,
     file: source.file,
     params: req.params,
-    views: req.views ?? {},
+    views: { ...req.views, front: frontView(source, inputMask) },
     signal,
     onProgress,
   });

@@ -149,6 +149,11 @@ export interface ImageEditRequest {
 export interface ToModelRequest {
   /** 'image-to-3d' uses `front`; 'multiview-to-3d' uses every view given. */
   views: Partial<Record<ViewId, Blob>>;
+  /**
+   * Which capability (and so which configured model) to use. Omitted: multi-view
+   * when views besides the front are given and the config offers it, else image-to-3d.
+   */
+  capability?: 'image-to-3d' | 'multiview-to-3d';
   signal: AbortSignal;
   onProgress?: (p: Progress) => void;
 }

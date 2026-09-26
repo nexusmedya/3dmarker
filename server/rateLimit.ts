@@ -89,16 +89,19 @@ export class InFlight {
     return this.all;
   }
 
-  /** Take a slot for `key`; the returned function gives it back (only its first call counts). */
-  acquire(key: string): () => void {
-    this.counts.set(key, this.count(key) + 1);
-    this.all++;
+  /**
+   * Take `weight` slots for `key` (e.g. an upload buffering several images);
+   * the returned function gives them back (only its first call counts).
+   */
+  acquire(key: string, weight = 1): () => void {
+    this.counts.set(key, this.count(key) + weight);
+    this.all += weight;
     let held = true;
     return () => {
       if (!held) return;
       held = false;
-      this.all--;
-      const n = this.count(key) - 1;
+      this.all -= weight;
+      const n = this.count(key) - weight;
       if (n > 0) this.counts.set(key, n);
       else this.counts.delete(key);
     };

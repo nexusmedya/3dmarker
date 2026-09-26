@@ -1,6 +1,21 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest';
-import { BoxGeometry, DoubleSide, FrontSide, Mesh, MeshBasicMaterial, MeshStandardMaterial, Vector3, Box3 } from 'three';
-import type { DepthMap, Driver, DriverResult, Mask, ParamValues, Progress, RGBAImage } from '../core/types';
+import {
+  AnimationClip,
+  AnimationMixer,
+  BoxGeometry,
+  BufferGeometry,
+  DoubleSide,
+  Float32BufferAttribute,
+  FrontSide,
+  Group,
+  Mesh,
+  MeshBasicMaterial,
+  MeshStandardMaterial,
+  Vector3,
+  VectorKeyframeTrack,
+  Box3,
+} from 'three';
+import type { DepthMap, Driver, DriverResult, Mask, ParamValues, Progress, RGBAImage, ViewSet } from '../core/types';
 import { AbortError } from '../core/types';
 import { LocalizedError } from '../core/errors';
 import { exportObject } from '../core/export/exporters';
@@ -8,8 +23,11 @@ import { computeMeshStats } from '../core/mesh/stats';
 import {
   WORKING_MAX_SIDE,
   buildDepthModel,
+  buildGeometryModel,
   buildGltfModel,
   buildModel,
+  frontView,
+  hasVertexColors,
   createImageTexture,
   isAbortError,
   meshKeyOf,
@@ -300,6 +318,13 @@ describe('normalizeToFrame / statsForObject', () => {
     expect(s.vertices).toBe(8);
     expect(s.watertight).toBe(true);
   });
+
+  it('skips empty meshes (e.g. a rig placeholder), which would make it look open', () => {
+    const group = new Group();
+    group.add(new Mesh(new BoxGeometry(1, 1, 1)), new Mesh(new BufferGeometry()));
+    expect(statsForObject(group)).toEqual({ vertices: 8, triangles: 12, watertight: true });
+    expect(statsForObject(new Mesh(new BufferGeometry()))).toEqual({ vertices: 0, triangles: 0, watertight: false });
+  });
 });
 
 describe('buildModel', () => {
@@ -312,6 +337,29 @@ describe('buildModel', () => {
     expect(model.remesh).toBeNull();
   });
 
+  it('vertex-coloured geometry results are shown with their colours and no texture', async () => {
+    const geometry = new BoxGeometry(1, 1, 1);
+    geometry.setAttribute('color', new Float32BufferAttribute(new Float32Array(geometry.getAttribute('position').count * 3).fill(0.5), 3));
+    expect(hasVertexColors(geometry)).toBe(true);
+    const model = await buildModel({ kind: 'geometry', geometry }, image(8, 8), null, {});
+    const mat = (model.object as Mesh).material as MeshStandardMaterial;
+    expect(mat).toBeInstanceOf(MeshStandardMaterial);
+    expect(mat.vertexColors).toBe(true);
+    expect(mat.map).toBeNull();
+    expect(mat.side).toBe(FrontSide);
+    // A texture handed in anyway is released, not shown.
+    const tex = createImageTexture(image(4, 4));
+    let disposed = false;
+    tex.addEventListener('dispose', () => (disposed = true));
+    const g2 = new BoxGeometry(1, 1, 1);
+    g2.setAttribute('color', new Float32BufferAttribute(new Float32Array(g2.getAttribute('position').count * 3), 3));
+    const m2 = buildGeometryModel(g2, tex);
+    expect(((m2.object as Mesh).material as MeshStandardMaterial).map).toBeNull();
+    expect(disposed).toBe(true);
+    // Without colours: textured as before.
+    expect(hasVertexColors(new BoxGeometry(1, 1, 1))).toBe(false);
+  });
+
   it('model results: GLB is parsed and normalised to the frame', async () => {
     const src = new Mesh(new BoxGeometry(10, 4, 2), new MeshStandardMaterial({ color: 0x888888 }));
     const glb = await (await exportObject(src, 'glb')).arrayBuffer();
@@ -320,6 +368,22 @@ describe('buildModel', () => {
     const size = new Box3().setFromObject(model.object).getSize(new Vector3());
     expect(Math.max(size.x, size.y, size.z)).toBeCloseTo(2);
     expect(model.stats.triangles).toBe(12);
+    expect(model.animations).toBeUndefined();
+  });
+
+  it('model results: embedded animation clips are kept (and still bind under the normalising group)', async () => {
+    const src = new Mesh(new BoxGeometry(1, 1, 1), new MeshStandardMaterial());
+    src.name = 'Spinner';
+    const clip = new AnimationClip('spin', 1, [new VectorKeyframeTrack('Spinner.position', [0, 1], [0, 0, 0, 0, 2, 0])]);
+    const glb = await (await exportObject(src, 'glb', { animations: [clip] })).arrayBuffer();
+    const model = await buildGltfModel(glb);
+    expect(model.animations?.map((c) => c.name)).toEqual(['spin']);
+    const mixer = new AnimationMixer(model.object);
+    mixer.clipAction(model.animations![0]).play();
+    const node = model.object.getObjectByName('Spinner')!;
+    const y0 = node.position.y;
+    mixer.update(0.5); // halfway: 1 unit up
+    expect(node.position.y - y0).toBeCloseTo(1, 3);
   });
 });
 
@@ -346,6 +410,33 @@ describe('runPipeline', () => {
     expect(model.mask).toBe(inputMask); // result.mask null → input mask used for meshing
     expect(model.stats.triangles).toBeGreaterThan(0);
     expect(labels.some((p) => p.label.en === 'Building mesh…')).toBe(true);
+  });
+
+  it('hands the driver every view: the source as the front plus the extra views', async () => {
+    const img = image(16, 16, { transparentBorder: 3 });
+    const src = source(img);
+    const back: ViewSet['back'] = { id: 'back', image: image(16, 16), mask: null, file: new Blob(['b']), origin: 'ai' };
+    const driver = fakeDriver(() => ({ kind: 'depth', depth: dome(16, 16), mask: null }));
+    const { inputMask } = await runPipeline({
+      source: src,
+      bgMode: 'auto',
+      driver,
+      params: {},
+      meshParams: { resolution: 16 },
+      signal: new AbortController().signal,
+      onProgress: noop,
+      views: { back },
+    });
+    const views = (driver.run as ReturnType<typeof vi.fn>).mock.calls[0][0].views as ViewSet;
+    expect(Object.keys(views).sort()).toEqual(['back', 'front']);
+    expect(views.back).toBe(back);
+    expect(views.front).toEqual({ id: 'front', image: img, mask: inputMask, file: src.file, origin: 'source' });
+    expect(frontView(src, null).mask).toBeNull();
+
+    // No extra views: still the front.
+    const d2 = fakeDriver(() => ({ kind: 'depth', depth: dome(16, 16), mask: null }));
+    await runPipeline({ source: src, bgMode: 'none', driver: d2, params: {}, meshParams: { resolution: 16 }, signal: new AbortController().signal, onProgress: noop });
+    expect(Object.keys((d2.run as ReturnType<typeof vi.fn>).mock.calls[0][0].views)).toEqual(['front']);
   });
 
   it('uses a provided (cached) mask instead of recomputing', async () => {

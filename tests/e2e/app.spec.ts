@@ -29,15 +29,24 @@ function collectErrors(page: Page): string[] {
   return errors;
 }
 
+/** Opens a step of the studio's step navigator (1 image … 4 '3d' … 6 rig). */
+async function step(page: Page, id: 'image' | 'prep' | 'views' | '3d' | 'edit' | 'rig') {
+  await page.getByTestId(`step-${id}`).click();
+  await expect(page.getByTestId(`step-${id}`)).toHaveAttribute('aria-selected', 'true');
+}
+
 async function open(page: Page, lang: 'en' | 'tr' = 'en') {
   await page.goto('/');
-  await expect(page.getByTestId('driver-select')).toBeVisible();
+  await expect(page.getByTestId('step-image')).toBeVisible();
   await page.getByTestId(`lang-${lang}`).click();
 }
 
+/** Loads a sample (step 1), then opens step 4 where the driver, its parameters and the mesh options live. */
 async function loadSample(page: Page, index: number) {
+  await step(page, 'image');
   await page.getByTestId(`sample-${index}`).click();
   await expect(page.getByTestId('generate')).toBeEnabled();
+  await step(page, '3d');
 }
 
 async function triangles(page: Page): Promise<number> {
@@ -150,6 +159,8 @@ test.describe('studio', () => {
   test('loads, lists every driver and logs no console errors', async ({ page }) => {
     const errors = collectErrors(page);
     await page.goto('/');
+    await expect(page.getByTestId('step-image')).toBeVisible();
+    await step(page, '3d');
     await expect(page.getByTestId('driver-select')).toBeVisible();
     const values = await page.getByTestId('driver-select').locator('option').evaluateAll((opts) => opts.map((o) => (o as HTMLOptionElement).value));
     expect(values.sort()).toEqual(DRIVERS.map((d) => d.id).sort());
@@ -381,6 +392,7 @@ test.describe('studio', () => {
 
   test('language toggle switches visible text TR ↔ EN', async ({ page }) => {
     await open(page, 'en');
+    await step(page, '3d');
     await expect(page.getByTestId('generate')).toContainText('Generate 3D');
     await expect(page.locator('#driver-title')).toContainText('Driver');
     await expect(page.locator('html')).toHaveAttribute('lang', 'en');
@@ -423,7 +435,7 @@ test.describe('phone layout', () => {
   test('a long error keeps the sticky Generate footer compact', async ({ page, context }) => {
     await context.route(/huggingface\.co|hf\.co|cdn\.jsdelivr\.net/, (r) => r.abort('internetdisconnected'));
     await page.goto('/');
-    await expect(page.getByTestId('driver-select')).toBeVisible();
+    await expect(page.getByTestId('step-image')).toBeVisible();
     await page.getByTestId('lang-tr').click();
     await loadSample(page, SAMPLE.landscape);
     await page.getByTestId('driver-select').selectOption('depth-anything-v2-small');
@@ -454,7 +466,7 @@ for (const scheme of ['light', 'dark'] as const) {
 
     test('a first visit follows it without persisting it; a toggle is persisted', async ({ page }) => {
       await page.goto('/');
-      await expect(page.getByTestId('driver-select')).toBeVisible();
+      await expect(page.getByTestId('step-image')).toBeVisible();
       await expect(page.locator('html')).toHaveAttribute('data-theme', scheme);
       expect(await savedTheme(page)).toBeUndefined();
       await page.getByTestId('theme-toggle').click();

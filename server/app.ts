@@ -1,16 +1,20 @@
 /**
- * 3D Marker API (Hono): a health check plus a thin proxy to Tripo3D's
- * image → 3D API, so the Tripo key stays on the server.
+ * 3D Marker API (Hono): a health check, a thin proxy to Tripo3D's image → 3D
+ * API, so the Tripo key stays on the server, and the AI provider routes
+ * (./ai/routes.ts: managed providers, per-kind API proxy, output downloads).
  *
  *   GET  /api/health                  { ok: true }
  *   GET  /api/tripo/status            { configured }
  *   POST /api/tripo/tasks             multipart `image` (+ model_version, texture, pbr, face_limit) → { taskId }
+ *   POST /api/tripo/multiview-tasks   multipart `front` + ≥ 1 of `left` / `back` / `right` (+ the same fields) → { taskId }
  *   GET  /api/tripo/tasks/:id         { status, progress, reason?, error? }
  *   GET  /api/tripo/tasks/:id/model   GLB stream (HEAD: headers only, no download)
+ *   GET  /api/ai/providers, ANY /api/ai/proxy/<kind>/<path>, GET /api/ai/fetch?url=   see ./ai/routes.ts
  *
- * The three task routes require the `x-3dmarker-client: 1` header (sent by
- * our driver; see CLIENT_HEADER) and refuse cross-site Sec-Fetch-Site, so
- * other sites cannot spend the server's key through visitors' browsers.
+ * The task, proxy and fetch routes require the `x-3dmarker-client: 1` header
+ * (sent by our client; see CLIENT_HEADER) and refuse cross-site
+ * Sec-Fetch-Site, so other sites cannot spend the server's keys through
+ * visitors' browsers.
  *
  * Key resolution: TRIPO_API_KEY, else the `x-tripo-key` header (the user's
  * own key; ignored when the server has one), else 401. Keys are never logged
@@ -23,10 +27,11 @@
  * downloads in progress at once (a few; uploads are buffered in memory before
  * they are checked), plus TRIPO_MAX_CONCURRENT_UPLOADS over all clients.
  *
- * Environment (all optional, see ServerEnv): TRIPO_API_KEY, TRIPO_API_BASE,
- * TRIPO_ALLOWED_MODEL_HOSTS, TRIPO_RATE_LIMIT, TRIPO_RATE_LIMIT_BYOK,
- * TRIPO_RATE_WINDOW_SEC, TRIPO_READ_RATE_LIMIT, TRIPO_MAX_CONCURRENT_UPLOADS,
- * TRUST_PROXY, CROSS_ORIGIN_ISOLATION.
+ * Environment (all optional, see ServerEnv and AiServerEnv): TRIPO_API_KEY,
+ * TRIPO_API_BASE, TRIPO_ALLOWED_MODEL_HOSTS, TRIPO_RATE_LIMIT,
+ * TRIPO_RATE_LIMIT_BYOK, TRIPO_RATE_WINDOW_SEC, TRIPO_READ_RATE_LIMIT,
+ * TRIPO_MAX_CONCURRENT_UPLOADS, TRIPO_MULTIVIEW_ORDER, TRUST_PROXY,
+ * CROSS_ORIGIN_ISOLATION, and the AI provider keys / AI_PROXY_* / AI_FETCH_*.
  */
 import { isIP } from 'node:net';
 import { Hono, type Context, type MiddlewareHandler } from 'hono';
@@ -45,6 +50,8 @@ import {
   MODEL_VERSION_PATTERN,
   TASK_ID_PATTERN,
   TRIPO_KEY_HEADER,
+  TRIPO_MULTIVIEW_FIELDS,
+  TRIPO_MULTIVIEW_TASKS_PATH,
   TRIPO_STATUS_PATH,
   TRIPO_TASKS_PATH,
   type ApiErrorBody,
@@ -54,6 +61,7 @@ import {
 } from '../src/drivers/cloud/api';
 import {
   DEFAULT_MODEL_HOSTS,
+  DEFAULT_MULTIVIEW_ORDER,
   DEFAULT_TIMEOUTS,
   FILE_TYPE_BY_MIME,
   TRIPO_API_BASE,
@@ -61,15 +69,21 @@ import {
   TripoError,
   openModelDownload,
   parseHostList,
+  parseMultiviewOrder,
   redactSecrets,
   resolveModelUrl,
-  type ImageToModelOptions,
+  type ModelTaskOptions,
+  type MultiviewFile,
+  type MultiviewSlot,
+  type TripoImageMime,
   type TripoTask,
 } from './providers/tripo';
+import { allServerKeys, type AiServerEnv } from './ai/providers';
+import { registerAiRoutes } from './ai/routes';
 import { FixedWindowRateLimiter, InFlight } from './rateLimit';
 import { sniffImageMime } from './sniff';
 
-export interface ServerEnv {
+export interface ServerEnv extends AiServerEnv {
   /** Server-side Tripo key. When set, user-supplied keys are ignored. */
   TRIPO_API_KEY?: string;
   /** Tripo OpenAPI base URL (default https://api.tripo3d.ai/v2/openapi). */
@@ -96,6 +110,11 @@ export interface ServerEnv {
    * One client IP can never have more than MAX_UPLOADS_PER_CLIENT in progress.
    */
   TRIPO_MAX_CONCURRENT_UPLOADS?: string;
+  /**
+   * Order of the four views in Tripo's multiview_to_model `files` list
+   * (default 'front,left,back,right'; ASSUMPTION, see DEFAULT_MULTIVIEW_ORDER).
+   */
+  TRIPO_MULTIVIEW_ORDER?: string;
   /** '1' behind exactly one reverse proxy: identify clients by the last X-Forwarded-For hop. */
   TRUST_PROXY?: string;
   /** '1' to send COEP: credentialless (with COOP) so onnxruntime-web can use threaded WASM. */
@@ -103,7 +122,7 @@ export interface ServerEnv {
 }
 
 export interface AppDeps {
-  /** Used for every upstream call (Tripo API and model downloads). */
+  /** Used for every upstream call (Tripo API, AI provider APIs and downloads). */
   fetch?: typeof fetch;
   env?: ServerEnv;
   /** Clock for the rate limiter (ms). */
@@ -114,7 +133,7 @@ export interface AppDeps {
 type KeySource = 'server' | 'user';
 type Auth = { key: string; source: KeySource };
 
-/** State handed from the pre-body middleware of POST /api/tripo/tasks to its handler. */
+/** State handed from the pre-body middleware of the task-creation routes to their handlers. */
 interface UploadSlot {
   auth: Auth;
   /** Rate-limit key: key source + client IP. */
@@ -125,8 +144,14 @@ interface UploadSlot {
 
 export type AppEnv = { Variables: { upload: UploadSlot } };
 
-/** Uploads one client may have in progress (bodies are buffered before they can be checked). */
+/**
+ * Upload slots one client may hold (bodies are buffered before they can be
+ * checked): three single-image uploads, or one multi-view upload (which
+ * weighs one slot per possible image).
+ */
 export const MAX_UPLOADS_PER_CLIENT = 3;
+/** Slots a multi-view upload takes (it may carry four images). */
+const MULTIVIEW_UPLOAD_WEIGHT = TRIPO_MULTIVIEW_FIELDS.length;
 /** Model downloads one client may have in progress (each holds an upstream CDN connection). */
 export const MAX_DOWNLOADS_PER_CLIENT = 4;
 /** Retry-After for "too many in progress" answers. */
@@ -193,7 +218,7 @@ export function toTaskState(task: Pick<TripoTask, 'status' | 'progress'>): TaskS
   }
 }
 
-type TaskFields = Omit<ImageToModelOptions, 'fileType'>;
+type TaskFields = ModelTaskOptions;
 
 /** Validate the optional multipart fields of POST /api/tripo/tasks. */
 export function parseTaskFields(body: Record<string, unknown>): { ok: true; fields: TaskFields } | { ok: false; error: string } {
@@ -245,10 +270,12 @@ export function createApp(deps: AppDeps = {}): Hono<AppEnv> {
   const pendingHits = new InFlight();
   const downloads = new InFlight();
   const trustProxy = flagEnv(env.TRUST_PROXY);
+  const multiviewOrder = parseMultiviewOrder(env.TRIPO_MULTIVIEW_ORDER) ?? DEFAULT_MULTIVIEW_ORDER;
   let warnedBadForwardedFor = false;
 
   const tripo = (key: string) => new TripoClient({ apiKey: key, baseUrl: apiBase, fetch: deps.fetch });
-  const scrub = (text: string, auth?: Auth) => redactSecrets(text, [serverKey ?? '', auth?.key ?? '']);
+  const aiKeys = allServerKeys(env);
+  const scrub = (text: string, auth?: Auth) => redactSecrets(text, [serverKey ?? '', auth?.key ?? '', ...aiKeys]);
 
   /** Resolve the key to use for this request, or the 401 response. */
   const resolveKey = (c: Context): Auth | Response => {
@@ -364,26 +391,30 @@ export function createApp(deps: AppDeps = {}): Hono<AppEnv> {
 
   app.get(TRIPO_STATUS_PATH, (c) => c.json({ configured: serverKey !== null } satisfies StatusResponse));
 
-  app.post(
-    TRIPO_TASKS_PATH,
-    sameOriginOnly,
-    // Cheap checks before the body is read, and a slot held until the response:
-    // bodies are buffered in memory, and invalid ones never count as hits.
+  /**
+   * Cheap checks before a task-creation body is read, and a slot held until
+   * the response: bodies are buffered in memory, and invalid ones never count
+   * as hits. `weight` = images the body may carry (slots taken).
+   */
+  const uploadGate =
+    (weight: number): MiddlewareHandler<AppEnv> =>
     async (c, next) => {
       const auth = resolveKey(c);
       if (auth instanceof Response) return auth;
       const rateKey = `${auth.source}:${clientIp(c)}`;
       const rate = limiter.peek(rateKey, limits[auth.source]);
       if (!rate.allowed) return tooMany(c, rate.retryAfterSec);
+      const mine = uploads.count(rateKey);
       if (
-        uploads.count(rateKey) >= MAX_UPLOADS_PER_CLIENT ||
-        (maxUploads > 0 && uploads.total >= maxUploads) ||
+        (mine > 0 && mine + weight > MAX_UPLOADS_PER_CLIENT) ||
+        // A heavy upload may start alone even when it alone exceeds the cap.
+        (maxUploads > 0 && uploads.total > 0 && uploads.total + weight > maxUploads) ||
         // Uploads still arriving could use up the rest of the window: let them finish first.
         rate.remaining <= pendingHits.count(rateKey)
       ) {
         return busy(c, 'uploads');
       }
-      const release = uploads.acquire(rateKey);
+      const release = uploads.acquire(rateKey, weight);
       const settle = pendingHits.acquire(rateKey);
       c.set('upload', { auth, rateKey, settle });
       try {
@@ -392,13 +423,41 @@ export function createApp(deps: AppDeps = {}): Hono<AppEnv> {
         settle();
         release();
       }
-    },
+    };
+
+  /** Count the creation against the window (after validation); a 429 response when the window is used up. */
+  const countCreation = (c: Context<AppEnv>): Response | null => {
+    const { auth, rateKey, settle } = c.get('upload');
+    const limit = limits[auth.source];
+    settle(); // from here on the window count covers this upload
+    const rate = limiter.hit(rateKey, limit);
+    if (!rate.allowed) return tooMany(c, rate.retryAfterSec);
+    if (limit > 0) {
+      c.header('X-RateLimit-Limit', String(limit));
+      c.header('X-RateLimit-Remaining', String(rate.remaining));
+    }
+    return null;
+  };
+
+  /** Validate one uploaded image field; its sniffed type, or the error response. */
+  const checkImage = async (c: Context, value: unknown, what: string): Promise<TripoImageMime | Response> => {
+    if (!(value instanceof Blob)) return fail(c, 400, `Missing "${what}" file`);
+    if (value.size === 0) return fail(c, 400, `The ${what} image is empty`);
+    if (value.size > MAX_IMAGE_BYTES) return fail(c, 413, `The ${what} image is larger than ${MAX_IMAGE_BYTES / 1024 / 1024} MB`);
+    const mime = sniffImageMime(new Uint8Array(await value.slice(0, 16).arrayBuffer()));
+    return mime ?? fail(c, 415, `Unsupported ${what} image type: upload a PNG, JPEG or WEBP file`);
+  };
+
+  app.post(
+    TRIPO_TASKS_PATH,
+    sameOriginOnly,
+    uploadGate(1),
     bodyLimit({
       maxSize: MAX_IMAGE_BYTES + FORM_OVERHEAD_BYTES,
       onError: (c) => fail(c, 413, `Image is larger than ${MAX_IMAGE_BYTES / 1024 / 1024} MB`),
     }),
     async (c) => {
-      const { auth, rateKey, settle } = c.get('upload');
+      const { auth } = c.get('upload');
       let body: Record<string, unknown>;
       try {
         body = await c.req.parseBody();
@@ -413,15 +472,8 @@ export function createApp(deps: AppDeps = {}): Hono<AppEnv> {
       if (!mime) return fail(c, 415, 'Unsupported image type: upload a PNG, JPEG or WEBP file');
       const parsed = parseTaskFields(body);
       if (!parsed.ok) return fail(c, 400, parsed.error);
-
-      const limit = limits[auth.source];
-      settle(); // from here on the window count covers this upload
-      const rate = limiter.hit(rateKey, limit);
-      if (!rate.allowed) return tooMany(c, rate.retryAfterSec);
-      if (limit > 0) {
-        c.header('X-RateLimit-Limit', String(limit));
-        c.header('X-RateLimit-Remaining', String(rate.remaining));
-      }
+      const refused = countCreation(c);
+      if (refused) return refused;
 
       const client = tripo(auth.key);
       const signal = c.req.raw.signal;
@@ -429,6 +481,56 @@ export function createApp(deps: AppDeps = {}): Hono<AppEnv> {
         const token = await client.uploadImage(image, mime, signal);
         const taskId = await client.createImageToModelTask(token, { fileType: FILE_TYPE_BY_MIME[mime], ...parsed.fields }, signal);
         log.info(`Tripo task ${taskId} created (${auth.source} key)`);
+        return c.json({ taskId } satisfies CreateTaskResponse);
+      } catch (e) {
+        return upstreamFailure(c, e, auth, 'create');
+      }
+    },
+  );
+
+  app.post(
+    TRIPO_MULTIVIEW_TASKS_PATH,
+    sameOriginOnly,
+    uploadGate(MULTIVIEW_UPLOAD_WEIGHT),
+    bodyLimit({
+      maxSize: MULTIVIEW_UPLOAD_WEIGHT * MAX_IMAGE_BYTES + FORM_OVERHEAD_BYTES,
+      onError: (c) => fail(c, 413, `The views are larger than ${MAX_IMAGE_BYTES / 1024 / 1024} MB each`),
+    }),
+    async (c) => {
+      const { auth } = c.get('upload');
+      let body: Record<string, unknown>;
+      try {
+        body = await c.req.parseBody();
+      } catch {
+        return fail(c, 400, 'Expected multipart/form-data with "front" and at least one of "left", "back", "right" images');
+      }
+      const views: Partial<Record<MultiviewSlot, { image: Blob; mime: TripoImageMime }>> = {};
+      for (const slot of TRIPO_MULTIVIEW_FIELDS) {
+        if (body[slot] === undefined) continue;
+        const mime = await checkImage(c, body[slot], slot);
+        if (mime instanceof Response) return mime;
+        views[slot] = { image: body[slot] as Blob, mime };
+      }
+      if (!views.front) return fail(c, 400, 'Missing "front" file');
+      if (!views.left && !views.back && !views.right) {
+        return fail(c, 400, 'A multi-view task needs at least one of the "left", "back" or "right" images besides "front"');
+      }
+      const parsed = parseTaskFields(body);
+      if (!parsed.ok) return fail(c, 400, parsed.error);
+      const refused = countCreation(c);
+      if (refused) return refused;
+
+      const client = tripo(auth.key);
+      const signal = c.req.raw.signal;
+      try {
+        const files: Partial<Record<MultiviewSlot, MultiviewFile>> = {};
+        // One at a time: each is a Tripo API call, and they are small next to the generation.
+        for (const slot of TRIPO_MULTIVIEW_FIELDS) {
+          const v = views[slot];
+          if (v) files[slot] = { fileType: FILE_TYPE_BY_MIME[v.mime], fileToken: await client.uploadImage(v.image, v.mime, signal) };
+        }
+        const taskId = await client.createMultiviewToModelTask(files, parsed.fields, signal, multiviewOrder);
+        log.info(`Tripo multi-view task ${taskId} created with ${Object.keys(files).length} views (${auth.source} key)`);
         return c.json({ taskId } satisfies CreateTaskResponse);
       } catch (e) {
         return upstreamFailure(c, e, auth, 'create');
@@ -501,6 +603,8 @@ export function createApp(deps: AppDeps = {}): Hono<AppEnv> {
     if (length && /^\d+$/.test(length) && !upstream.headers.get('content-encoding')) headers.set('Content-Length', length);
     return new Response(upstream.body, { status: 200, headers });
   });
+
+  registerAiRoutes(app, { env, fetch: deps.fetch, now: deps.now, log, clientIp, sameOriginOnly, tripoModelHosts: allowedHosts });
 
   // Unmatched API paths stay JSON (and never fall through to the SPA fallback).
   app.all('/api/*', (c) => fail(c, 404, 'Not found'));

@@ -7,7 +7,10 @@
  * top-left origin). `z` uses the same pixel scale as x and follows
  * MediaPipe's convention: smaller (more negative) z = closer to the camera.
  */
-import type { DepthMap, Mask, Progress, RGBAImage } from '../types';
+import type { DepthMap, I18nText, Mask, Progress, RGBAImage } from '../types';
+
+/** The three MediaPipe detectors. */
+export type HumanDetector = 'faces' | 'hands' | 'pose';
 
 export interface Landmark {
   x: number;
@@ -33,6 +36,7 @@ export interface FaceResult {
 export interface HandResult {
   /** 21 HandLandmarker points (wrist, then 4 per finger: thumb, index, middle, ring, pinky). */
   landmarks: Landmark[];
+  /** The subject's own left / right hand (not the side of the image it appears on). */
   handedness: 'Left' | 'Right';
   box: Box;
 }
@@ -53,6 +57,13 @@ export interface HumanAnalysis {
   isHuman: boolean;
   /** Set when detection could not run (models unreachable, no WebGL…); the lists are then empty. */
   unavailableReason?: string;
+  /** `unavailableReason` for the UI, in both languages. */
+  unavailableText?: I18nText;
+  /**
+   * Detectors that failed while others worked (their list is empty), with the
+   * reason. Partial results are not cached, so a later call retries them.
+   */
+  failed?: Partial<Record<HumanDetector, string>>;
 }
 
 export interface AnalyzeOptions {
@@ -73,6 +84,10 @@ export interface HumanDetailOptions {
    * Provided by the caller because it depends on the depth model in use.
    */
   refineCrop?: (crop: RGBAImage, signal: AbortSignal) => Promise<DepthMap>;
+  /** 0..1.5 — round limbs / torso from the pose skeleton (default 0.3; only tops up missing shape). */
+  bodyStrength?: number;
+  /** Upper bound on `refineCrop` calls, largest regions first (default 6). */
+  maxCrops?: number;
   signal: AbortSignal;
   onProgress?: (p: Progress) => void;
 }

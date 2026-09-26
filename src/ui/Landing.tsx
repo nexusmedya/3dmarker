@@ -1,12 +1,13 @@
-/** Compact SaaS landing below the studio: hero, steps, driver table, pricing, FAQ. */
+/** Compact SaaS landing below the studio: hero + capabilities, the six steps, driver table (from DRIVERS), pricing, FAQ. */
 import { DRIVERS } from '../drivers';
 import { CATEGORY_SHORT, bestFor, groupDrivers, outputKind } from '../app/driverMeta';
 import { FAQ, HERO, HIGHLIGHTS, PLANS, SECTION_TITLES, STEPS } from '../app/content';
 import { useI18n } from './i18n';
 import { Badges, CategoryIcon } from './DriverPicker';
-import { IconCheck, IconCpu, IconCube, IconShield, IconSparkles } from './icons';
+import { IconBone, IconBrush, IconCheck, IconPerson, IconShield, IconSparkles, IconViews, IconWand } from './icons';
 
-const HIGHLIGHT_ICONS = [IconShield, IconCpu, IconCube];
+/** One icon per HIGHLIGHTS entry (privacy, multi-view, AI prep, human detail, sculpt, rig). */
+const HIGHLIGHT_ICONS = [IconShield, IconViews, IconWand, IconPerson, IconBrush, IconBone];
 
 interface Props {
   onTryDriver: (id: string) => void;

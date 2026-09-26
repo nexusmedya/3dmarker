@@ -112,3 +112,27 @@ export const IconChevron = (p: IconProps) => (
 export const IconShield = (p: IconProps) => (
   <Icon {...p}><path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z" /><path d="m9 12 2 2 4-4" /></Icon>
 );
+export const IconViews = (p: IconProps) => (
+  <Icon {...p}><rect x="3" y="4" width="7" height="7" rx="1.5" /><rect x="14" y="4" width="7" height="7" rx="1.5" /><rect x="3" y="14" width="7" height="7" rx="1.5" /><rect x="14" y="14" width="7" height="7" rx="1.5" /></Icon>
+);
+export const IconBrush = (p: IconProps) => (
+  <Icon {...p}><path d="M14.5 4.5 19.5 9.5 11 18l-5-5z" /><path d="M6 13c-2 0-3 1.5-3 3.5V20h3.5C8.5 20 10 19 10 17" /></Icon>
+);
+export const IconBone = (p: IconProps) => (
+  <Icon {...p}><circle cx="12" cy="4.5" r="2" /><path d="M12 6.5v6M12 12.5l-4 7M12 12.5l4 7M5 9.5h14" /></Icon>
+);
+export const IconArrowRight = (p: IconProps) => (
+  <Icon {...p}><path d="M5 12h14M13 6l6 6-6 6" /></Icon>
+);
+export const IconArrowLeft = (p: IconProps) => (
+  <Icon {...p}><path d="M19 12H5M11 6l-6 6 6 6" /></Icon>
+);
+export const IconUndo = (p: IconProps) => (
+  <Icon {...p}><path d="M9 14 4 9l5-5" /><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11" /></Icon>
+);
+export const IconPerson = (p: IconProps) => (
+  <Icon {...p}><circle cx="12" cy="6" r="3" /><path d="M5 21v-2a7 7 0 0 1 14 0v2" /></Icon>
+);
+export const IconKey = (p: IconProps) => (
+  <Icon {...p}><circle cx="8" cy="15" r="4" /><path d="m11 12 9-9M17 6l3 3M15 8l2 2" /></Icon>
+);
