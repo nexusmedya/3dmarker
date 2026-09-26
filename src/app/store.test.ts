@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { Driver, Mask, ParamSpec } from '../core/types';
 import { MESH_PARAMS } from '../core/mesh/options';
 import { DRIVERS } from '../drivers';
-import { createInitialState, reducer, saveState, type AppState } from './store';
+import { canGenerate, createInitialState, meshParamsForJob, reducer, saveState, type Action, type AppState } from './store';
 import type { KeyValueStore } from './persist';
 import type { SourceImage } from './pipeline';
 
@@ -81,6 +81,30 @@ describe('createInitialState', () => {
     expect(s.meshParams.resolution).toBe(128);
   });
 
+  it('follows the OS light preference until the user picks a theme, without freezing it into storage', () => {
+    const store = new MemoryStore();
+    const light = createInitialState({ store, languages: 'en', drivers, defaultDriverId: 'ml-a', prefersLight: true });
+    expect(light.theme).toBe('light');
+    expect(light.view.darkBackground).toBe(false);
+    saveState(store, light, drivers);
+    const saved = JSON.parse(store.getItem('3dmarker:settings')!);
+    expect(saved.theme).toBeUndefined();
+    expect(saved.view.darkBackground).toBeUndefined(); // follows the theme
+    expect(saved.view.texture).toBe(true);
+    // Next visit with a dark OS: dark theme and background.
+    const dark = createInitialState({ store, languages: 'en', drivers, defaultDriverId: 'ml-a', prefersLight: false });
+    expect(dark.theme).toBe('dark');
+    expect(dark.view.darkBackground).toBe(true);
+    // An explicit choice is persisted and wins over the OS preference.
+    let s = reducer(dark, { type: 'setTheme', theme: 'dark' });
+    s = reducer(s, { type: 'setView', view: { darkBackground: false } });
+    saveState(store, s, drivers);
+    const again = createInitialState({ store, languages: 'en', drivers, defaultDriverId: 'ml-a', prefersLight: true });
+    expect(again.theme).toBe('dark');
+    expect(again.explicitTheme).toBe(true);
+    expect(again.view.darkBackground).toBe(false); // the toolbar override is kept
+  });
+
   it('falls back when the stored driver no longer exists', () => {
     const store = new MemoryStore();
     store.setItem('3dmarker:settings', JSON.stringify({ driverId: 'gone' }));
@@ -124,6 +148,83 @@ describe('reducer', () => {
     expect(s.meshParams.mode).toBe('solid');
     s = reducer(s, { type: 'selectDriver', driver: ml });
     expect(s.meshParams.mode).toBe('relief');
+  });
+
+  it('defers the suggested mesh mode while a depth result is on screen (no silent re-mesh)', () => {
+    const stats = { vertices: 1, triangles: 1, watertight: true };
+    const done = (driverId: string): Action => ({
+      type: 'jobDone',
+      result: { driverId, kind: 'depth', stats, depthPreview: null, elapsedMs: 1, sourceName: 'a.png' },
+      source: src(),
+      bgMode: 'auto',
+      inputMask: null,
+    });
+    let s = reducer(init(), { type: 'selectDriver', driver: inflate });
+    s = reducer(reducer(s, { type: 'jobStart' }), done('silhouette-inflate'));
+    expect(s.meshParams.mode).toBe('double');
+    const shownParams = s.meshParams;
+
+    // Browsing the driver select must not touch the params the displayed model uses.
+    s = reducer(s, { type: 'selectDriver', driver: ml });
+    expect(s.meshParams).toBe(shownParams);
+    expect(s.pendingMeshMode).toBe('relief');
+    expect(s.meshNotice).toBeNull();
+    expect(meshParamsForJob(s)).toEqual({ ...shownParams, mode: 'relief' });
+
+    // The next job applies it when it replaces the model.
+    s = reducer(s, { type: 'jobStart' });
+    expect(s.meshParams).toBe(shownParams);
+    s = reducer(s, done('ml-a'));
+    expect(s.meshParams.mode).toBe('relief');
+    expect(s.pendingMeshMode).toBeNull();
+
+    // A failed / cancelled job keeps it pending; the user's own mode choice wins.
+    s = reducer(s, { type: 'selectDriver', driver: inflate });
+    expect(s.pendingMeshMode).toBe('double');
+    s = reducer(reducer(reducer(s, { type: 'jobStart' }), { type: 'jobCancelled' }), { type: 'setMeshParam', key: 'resolution', value: 64 });
+    expect(s.pendingMeshMode).toBe('double');
+    s = reducer(s, { type: 'setMeshParam', key: 'mode', value: 'solid' });
+    expect(s.pendingMeshMode).toBeNull();
+    expect(meshParamsForJob(s).mode).toBe('solid');
+    s = reducer(reducer(s, { type: 'jobStart' }), done('silhouette-inflate'));
+    expect(s.meshParams.mode).toBe('solid');
+
+    // Switching to a driver without a suggestion (or back to the matching one) drops it; so does reset.
+    s = reducer(s, { type: 'selectDriver', driver: ml });
+    expect(s.pendingMeshMode).toBe('relief');
+    s = reducer(s, { type: 'selectDriver', driver: lum });
+    expect(s.pendingMeshMode).toBeNull();
+    expect(s.meshParams.mode).toBe('solid');
+    s = reducer(s, { type: 'selectDriver', driver: ml });
+    s = reducer(s, { type: 'resetMeshParams' });
+    expect(s.pendingMeshMode).toBeNull();
+
+    // Geometry / model results are not re-meshed, so the mode still applies at once.
+    s = { ...s, result: { ...s.result!, kind: 'geometry' }, pendingMeshMode: null };
+    s = reducer(s, { type: 'selectDriver', driver: inflate });
+    expect(s.meshParams.mode).toBe('double');
+    expect(s.pendingMeshMode).toBeNull();
+  });
+
+  it('removing the image while another one decodes clears the loading state', () => {
+    let s = reducer(init(), { type: 'imageLoaded', source: src(), mask: null, maskNote: null });
+    s = reducer(s, { type: 'imageLoading' });
+    expect(s.loadingImage).toBe(true);
+    s = reducer(s, { type: 'clearImage' });
+    expect(s.source).toBeNull();
+    expect(s.loadingImage).toBe(false);
+  });
+
+  it('canGenerate: the Generate button and the keyboard shortcut share one guard', () => {
+    const empty = init();
+    const loaded = reducer(empty, { type: 'imageLoaded', source: src(), mask: null, maskNote: null });
+    expect(canGenerate(empty, null)).toBe(false); // no image
+    expect(canGenerate(loaded, null)).toBe(true);
+    expect(canGenerate(reducer(loaded, { type: 'imageLoading' }), null)).toBe(false); // a new image is decoding
+    expect(canGenerate(loaded, { ok: false })).toBe(false);
+    expect(canGenerate(loaded, { ok: false, reason: { tr: 'x', en: 'x' } })).toBe(false);
+    expect(canGenerate(loaded, 'checking')).toBe(true); // like the button: a pending check does not block
+    expect(canGenerate(loaded, { ok: true, reason: { tr: 'x', en: 'x' } })).toBe(true);
   });
 
   it('keeps per-driver params and resets them to defaults', () => {

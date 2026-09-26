@@ -15,6 +15,21 @@ describe('localizeMlError', () => {
     }
   });
 
+  it("maps ONNX Runtime's failed wasm-loader import in every engine's wording", () => {
+    const url = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.0/dist/ort-wasm-simd-threaded.asyncify.mjs';
+    for (const browser of [
+      `Failed to fetch dynamically imported module: ${url}`, // Chromium
+      `error loading dynamically imported module: ${url}`, // Firefox
+      'Importing a module script failed.', // Safari
+    ]) {
+      const e = new Error(`no available backend found. ERR: [wasm] TypeError: ${browser}`);
+      expect(isNetworkError(e), browser).toBe(true);
+      const out = localizeMlError(e, 'org/model');
+      expect(out).toBeInstanceOf(LocalizedError);
+      expect((out as LocalizedError).i18n.en).toContain('ONNX Runtime');
+    }
+  });
+
   it('maps missing weight files', () => {
     const e = new Error('Could not locate file: "https://huggingface.co/x/onnx/model.onnx".');
     e.name = 'ModelFileNotFoundError';

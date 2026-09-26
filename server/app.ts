@@ -5,8 +5,12 @@
  *   GET  /api/health                  { ok: true }
  *   GET  /api/tripo/status            { configured }
  *   POST /api/tripo/tasks             multipart `image` (+ model_version, texture, pbr, face_limit) → { taskId }
- *   GET  /api/tripo/tasks/:id         { status, progress, error? }
- *   GET  /api/tripo/tasks/:id/model   GLB stream
+ *   GET  /api/tripo/tasks/:id         { status, progress, reason?, error? }
+ *   GET  /api/tripo/tasks/:id/model   GLB stream (HEAD: headers only, no download)
+ *
+ * The three task routes require the `x-3dmarker-client: 1` header (sent by
+ * our driver; see CLIENT_HEADER) and refuse cross-site Sec-Fetch-Site, so
+ * other sites cannot spend the server's key through visitors' browsers.
  *
  * Key resolution: TRIPO_API_KEY, else the `x-tripo-key` header (the user's
  * own key; ignored when the server has one), else 401. Keys are never logged
@@ -14,10 +18,17 @@
  * up itself (the client never supplies a URL) and only downloads from an
  * allow-listed host, so it cannot be used for SSRF.
  *
+ * Limits per client IP: task creations per window (TRIPO_RATE_LIMIT[_BYOK]),
+ * task/model reads per minute (TRIPO_READ_RATE_LIMIT), uploads and model
+ * downloads in progress at once (a few; uploads are buffered in memory before
+ * they are checked), plus TRIPO_MAX_CONCURRENT_UPLOADS over all clients.
+ *
  * Environment (all optional, see ServerEnv): TRIPO_API_KEY, TRIPO_API_BASE,
  * TRIPO_ALLOWED_MODEL_HOSTS, TRIPO_RATE_LIMIT, TRIPO_RATE_LIMIT_BYOK,
- * TRIPO_RATE_WINDOW_SEC, TRUST_PROXY, CROSS_ORIGIN_ISOLATION.
+ * TRIPO_RATE_WINDOW_SEC, TRIPO_READ_RATE_LIMIT, TRIPO_MAX_CONCURRENT_UPLOADS,
+ * TRUST_PROXY, CROSS_ORIGIN_ISOLATION.
  */
+import { isIP } from 'node:net';
 import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { HTTPException } from 'hono/http-exception';
@@ -27,6 +38,8 @@ import { getConnInfo } from '@hono/node-server/conninfo';
 import {
   API_HEALTH_PATH,
   API_KEY_PATTERN,
+  CLIENT_HEADER,
+  CLIENT_HEADER_VALUE,
   MAX_FACE_LIMIT,
   MAX_IMAGE_BYTES,
   MODEL_VERSION_PATTERN,
@@ -53,7 +66,7 @@ import {
   type ImageToModelOptions,
   type TripoTask,
 } from './providers/tripo';
-import { FixedWindowRateLimiter } from './rateLimit';
+import { FixedWindowRateLimiter, InFlight } from './rateLimit';
 import { sniffImageMime } from './sniff';
 
 export interface ServerEnv {
@@ -69,6 +82,20 @@ export interface ServerEnv {
   TRIPO_RATE_LIMIT_BYOK?: string;
   /** Rate-limit window in seconds (default 3600). */
   TRIPO_RATE_WINDOW_SEC?: string;
+  /**
+   * Task status polls + model downloads per client IP and minute (default 300,
+   * 0 = unlimited). Each one is an upstream Tripo call with the server's key;
+   * one generation polls about 30 times a minute, and users behind one NAT share it.
+   */
+  TRIPO_READ_RATE_LIMIT?: string;
+  /**
+   * Uploads being received at once over all clients (default 16, 0 = no cap).
+   * Each is buffered in memory (a 20 MB image costs ~100 MB at peak), so this
+   * bounds memory; the trade-off is that someone holding this many slow uploads
+   * from many addresses delays everyone else's uploads until theirs time out.
+   * One client IP can never have more than MAX_UPLOADS_PER_CLIENT in progress.
+   */
+  TRIPO_MAX_CONCURRENT_UPLOADS?: string;
   /** '1' behind exactly one reverse proxy: identify clients by the last X-Forwarded-For hop. */
   TRUST_PROXY?: string;
   /** '1' to send COEP: credentialless (with COOP) so onnxruntime-web can use threaded WASM. */
@@ -86,6 +113,24 @@ export interface AppDeps {
 
 type KeySource = 'server' | 'user';
 type Auth = { key: string; source: KeySource };
+
+/** State handed from the pre-body middleware of POST /api/tripo/tasks to its handler. */
+interface UploadSlot {
+  auth: Auth;
+  /** Rate-limit key: key source + client IP. */
+  rateKey: string;
+  /** Stop counting this upload as a pending window hit (call right before limiter.hit). */
+  settle: () => void;
+}
+
+export type AppEnv = { Variables: { upload: UploadSlot } };
+
+/** Uploads one client may have in progress (bodies are buffered before they can be checked). */
+export const MAX_UPLOADS_PER_CLIENT = 3;
+/** Model downloads one client may have in progress (each holds an upstream CDN connection). */
+export const MAX_DOWNLOADS_PER_CLIENT = 4;
+/** Retry-After for "too many in progress" answers. */
+const BUSY_RETRY_SEC = 5;
 
 const intEnv = (v: string | undefined, def: number): number => {
   if (v === undefined || !v.trim()) return def;
@@ -112,6 +157,20 @@ export function rateKeyForIp(ip: string): string {
   return `${groups.slice(0, 4).map((g) => g.replace(/^0+(?=.)/, '')).join(':')}::/64`;
 }
 
+/**
+ * Last X-Forwarded-For hop → bare IP, or null when it is not an IP. Some
+ * proxies (Azure, IIS ARR) append the client port ('1.2.3.4:5678',
+ * '[2001:db8::1]:443'); that is stripped so every connection does not get a
+ * fresh rate-limit bucket. Bare IPv6 is never port-stripped.
+ */
+export function parseForwardedHop(hop: string): string | null {
+  const h = hop.trim();
+  const bracketed = /^\[([^\]]+)\](?::\d{1,5})?$/.exec(h);
+  const v4port = /^(\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}$/.exec(h);
+  const ip = bracketed ? bracketed[1] : v4port ? v4port[1] : h;
+  return isIP(ip) ? ip : null;
+}
+
 export function toTaskState(task: Pick<TripoTask, 'status' | 'progress'>): TaskStateResponse {
   const progress = Math.round(task.progress);
   switch (task.status) {
@@ -122,13 +181,13 @@ export function toTaskState(task: Pick<TripoTask, 'status' | 'progress'>): TaskS
     case 'success':
       return { status: 'success', progress: 100 };
     case 'failed':
-      return { status: 'failed', progress, error: 'Tripo could not generate a model from this image' };
+      return { status: 'failed', progress, reason: 'failed', error: 'Tripo could not generate a model from this image' };
     case 'cancelled':
       return { status: 'cancelled', progress, error: 'The task was cancelled' };
     case 'banned':
-      return { status: 'failed', progress, error: 'The image was rejected by Tripo content moderation' };
+      return { status: 'failed', progress, reason: 'banned', error: 'The image was rejected by Tripo content moderation' };
     case 'expired':
-      return { status: 'failed', progress, error: 'The task expired on Tripo' };
+      return { status: 'failed', progress, reason: 'expired', error: 'The task expired on Tripo' };
     default:
       return { status: 'unknown', progress };
   }
@@ -166,7 +225,7 @@ export function parseTaskFields(body: Record<string, unknown>): { ok: true; fiel
   return { ok: true, fields };
 }
 
-export function createApp(deps: AppDeps = {}): Hono {
+export function createApp(deps: AppDeps = {}): Hono<AppEnv> {
   const env: ServerEnv = deps.env ?? process.env;
   const log = deps.logger ?? console;
   const serverKey = env.TRIPO_API_KEY?.trim() || null;
@@ -177,7 +236,16 @@ export function createApp(deps: AppDeps = {}): Hono {
     user: intEnv(env.TRIPO_RATE_LIMIT_BYOK, 60),
   };
   const limiter = new FixedWindowRateLimiter(intEnv(env.TRIPO_RATE_WINDOW_SEC, 3600) * 1000, deps.now);
+  const readLimit = intEnv(env.TRIPO_READ_RATE_LIMIT, 300);
+  const readLimiter = new FixedWindowRateLimiter(60_000, deps.now);
+  const maxUploads = intEnv(env.TRIPO_MAX_CONCURRENT_UPLOADS, 16);
+  /** Uploads from the pre-body check until the response (body buffering + Tripo upload). */
+  const uploads = new InFlight();
+  /** Uploads not yet counted by limiter.hit: they may still use up the rest of the window. */
+  const pendingHits = new InFlight();
+  const downloads = new InFlight();
   const trustProxy = flagEnv(env.TRUST_PROXY);
+  let warnedBadForwardedFor = false;
 
   const tripo = (key: string) => new TripoClient({ apiKey: key, baseUrl: apiBase, fetch: deps.fetch });
   const scrub = (text: string, auth?: Auth) => redactSecrets(text, [serverKey ?? '', auth?.key ?? '']);
@@ -196,7 +264,12 @@ export function createApp(deps: AppDeps = {}): Hono {
   const clientIp = (c: Context): string => {
     if (trustProxy) {
       const hops = (c.req.header('x-forwarded-for') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
-      if (hops.length) return rateKeyForIp(hops[hops.length - 1]);
+      const ip = hops.length ? parseForwardedHop(hops[hops.length - 1]) : null;
+      if (ip) return rateKeyForIp(ip);
+      if (hops.length && !warnedBadForwardedFor) {
+        warnedBadForwardedFor = true;
+        log.warn('TRUST_PROXY: unparseable X-Forwarded-For hop; rate-limiting by the proxy address instead');
+      }
     }
     try {
       return rateKeyForIp(getConnInfo(c).remote.address ?? 'unknown');
@@ -208,6 +281,11 @@ export function createApp(deps: AppDeps = {}): Hono {
   const tooMany = (c: Context, retryAfterSec: number) => {
     c.header('Retry-After', String(retryAfterSec));
     return fail(c, 429, `Too many generation requests; try again in ${Math.ceil(retryAfterSec / 60)} min`);
+  };
+
+  const busy = (c: Context, what: string) => {
+    c.header('Retry-After', String(BUSY_RETRY_SEC));
+    return fail(c, 429, `Too many ${what} in progress; try again in a few seconds`);
   };
 
   /** Map a failed upstream call to a JSON error; nothing secret leaves here. */
@@ -241,14 +319,31 @@ export function createApp(deps: AppDeps = {}): Hono {
     return fail(c, 502, `Tripo API error: ${msg}`);
   };
 
-  /** Browsers send Sec-Fetch-Site; refuse cross-site writes (drive-by use of the server's credits). */
+  /**
+   * Refuse cross-site use (drive-by spending of the server's credits from
+   * visitors' browsers). Sec-Fetch-Site alone is not enough: browsers omit it
+   * for plain-HTTP origins. Our client always sends CLIENT_HEADER, which other
+   * sites cannot add without a CORS preflight that this server never approves.
+   */
   const sameOriginOnly: MiddlewareHandler = async (c, next) => {
     const site = c.req.header('sec-fetch-site');
-    if (site === 'cross-site' || site === 'same-site') return fail(c, 403, 'Cross-site requests are not allowed');
+    if (site === 'cross-site' || site === 'same-site' || c.req.header(CLIENT_HEADER) !== CLIENT_HEADER_VALUE) {
+      return fail(c, 403, 'Cross-site requests are not allowed');
+    }
     await next();
   };
 
-  const app = new Hono();
+  /** Per-IP budget for the read routes: every call is an upstream Tripo request. */
+  const readRate: MiddlewareHandler = async (c, next) => {
+    const rate = readLimiter.hit(`read:${clientIp(c)}`, readLimit);
+    if (!rate.allowed) {
+      c.header('Retry-After', String(rate.retryAfterSec));
+      return fail(c, 429, 'Too many requests; try again shortly');
+    }
+    await next();
+  };
+
+  const app = new Hono<AppEnv>();
 
   app.use(
     '*',
@@ -272,20 +367,38 @@ export function createApp(deps: AppDeps = {}): Hono {
   app.post(
     TRIPO_TASKS_PATH,
     sameOriginOnly,
-    // Cheap checks before the body is read.
+    // Cheap checks before the body is read, and a slot held until the response:
+    // bodies are buffered in memory, and invalid ones never count as hits.
     async (c, next) => {
       const auth = resolveKey(c);
       if (auth instanceof Response) return auth;
-      const rate = limiter.peek(`${auth.source}:${clientIp(c)}`, limits[auth.source]);
+      const rateKey = `${auth.source}:${clientIp(c)}`;
+      const rate = limiter.peek(rateKey, limits[auth.source]);
       if (!rate.allowed) return tooMany(c, rate.retryAfterSec);
-      await next();
+      if (
+        uploads.count(rateKey) >= MAX_UPLOADS_PER_CLIENT ||
+        (maxUploads > 0 && uploads.total >= maxUploads) ||
+        // Uploads still arriving could use up the rest of the window: let them finish first.
+        rate.remaining <= pendingHits.count(rateKey)
+      ) {
+        return busy(c, 'uploads');
+      }
+      const release = uploads.acquire(rateKey);
+      const settle = pendingHits.acquire(rateKey);
+      c.set('upload', { auth, rateKey, settle });
+      try {
+        await next();
+      } finally {
+        settle();
+        release();
+      }
     },
     bodyLimit({
       maxSize: MAX_IMAGE_BYTES + FORM_OVERHEAD_BYTES,
       onError: (c) => fail(c, 413, `Image is larger than ${MAX_IMAGE_BYTES / 1024 / 1024} MB`),
     }),
     async (c) => {
-      const auth = resolveKey(c) as Auth; // checked above
+      const { auth, rateKey, settle } = c.get('upload');
       let body: Record<string, unknown>;
       try {
         body = await c.req.parseBody();
@@ -302,7 +415,8 @@ export function createApp(deps: AppDeps = {}): Hono {
       if (!parsed.ok) return fail(c, 400, parsed.error);
 
       const limit = limits[auth.source];
-      const rate = limiter.hit(`${auth.source}:${clientIp(c)}`, limit);
+      settle(); // from here on the window count covers this upload
+      const rate = limiter.hit(rateKey, limit);
       if (!rate.allowed) return tooMany(c, rate.retryAfterSec);
       if (limit > 0) {
         c.header('X-RateLimit-Limit', String(limit));
@@ -322,7 +436,7 @@ export function createApp(deps: AppDeps = {}): Hono {
     },
   );
 
-  app.get(`${TRIPO_TASKS_PATH}/:id`, async (c) => {
+  app.get(`${TRIPO_TASKS_PATH}/:id`, sameOriginOnly, readRate, async (c) => {
     const id = c.req.param('id');
     if (!TASK_ID_PATTERN.test(id)) return fail(c, 400, 'Invalid task id');
     const auth = resolveKey(c);
@@ -335,7 +449,7 @@ export function createApp(deps: AppDeps = {}): Hono {
     }
   });
 
-  app.get(`${TRIPO_TASKS_PATH}/:id/model`, async (c) => {
+  app.get(`${TRIPO_TASKS_PATH}/:id/model`, sameOriginOnly, readRate, async (c) => {
     const id = c.req.param('id');
     if (!TASK_ID_PATTERN.test(id)) return fail(c, 400, 'Invalid task id');
     const auth = resolveKey(c);
@@ -350,6 +464,17 @@ export function createApp(deps: AppDeps = {}): Hono {
     }
     if (!url) return fail(c, 502, 'Tripo returned no model for this task');
 
+    const headers = new Headers({
+      'Content-Type': 'model/gltf-binary',
+      'Content-Disposition': `attachment; filename="tripo-${id}.glb"`,
+      'Cache-Control': 'private, no-store',
+    });
+    // Hono answers HEAD with this handler and drops the body without cancelling
+    // it, so never open the CDN download for one (the size is unknown here).
+    if (c.req.method === 'HEAD') return c.body(null, 200, Object.fromEntries(headers));
+
+    const ip = clientIp(c);
+    if (downloads.count(ip) >= MAX_DOWNLOADS_PER_CLIENT) return busy(c, 'model downloads');
     let upstream: Response;
     try {
       upstream = await openModelDownload(url, {
@@ -357,6 +482,10 @@ export function createApp(deps: AppDeps = {}): Hono {
         fetch: deps.fetch,
         signal: c.req.raw.signal,
         timeoutMs: DEFAULT_TIMEOUTS.downloadMs,
+        idleTimeoutMs: DEFAULT_TIMEOUTS.downloadIdleMs,
+        totalTimeoutMs: DEFAULT_TIMEOUTS.downloadTotalMs,
+        // Held until the relayed body is finished, failed, stalled or cancelled.
+        onSettled: downloads.acquire(ip),
       });
     } catch (e) {
       if (e instanceof TripoError && e.kind === 'untrusted-host') {
@@ -367,11 +496,6 @@ export function createApp(deps: AppDeps = {}): Hono {
       return upstreamFailure(c, e, auth, 'read');
     }
 
-    const headers = new Headers({
-      'Content-Type': 'model/gltf-binary',
-      'Content-Disposition': `attachment; filename="tripo-${id}.glb"`,
-      'Cache-Control': 'private, no-store',
-    });
     const length = upstream.headers.get('content-length');
     // fetch transparently decodes gzip/br, so the length is only valid for identity bodies.
     if (length && /^\d+$/.test(length) && !upstream.headers.get('content-encoding')) headers.set('Content-Length', length);

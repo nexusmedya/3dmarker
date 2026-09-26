@@ -19,7 +19,7 @@ sonuç dokulu bir mesh olarak three.js görüntüleyicide açılır ve **GLB, OB
 - Yapay zekâ derinlik modelleri (Depth Anything V2, MiDaS) **kullanıcının tarayıcısında** çalışır (WebGPU varsa GPU, yoksa WASM). Sunucuya görsel gitmez.
 - Sezgisel sürücüler (şişirme, ekstrüzyon, parlaklık haritası) hiçbir şey indirmeden, anında ve çevrimdışı çalışır.
 - Bulut sürücüsü (Tripo3D) görünmeyen arka yüzleri de tamamlayan **tam 3B** model üretir; API anahtarı sunucuda kalır.
-- Arayüz Türkçe ve İngilizce; açık/koyu tema; ayarlar tarayıcıda saklanır (gizli anahtarlar hariç).
+- Arayüz Türkçe ve İngilizce; açık/koyu tema (ilk ziyarette işletim sisteminin tercihi); ayarlar tarayıcıda saklanır (gizli anahtarlar hariç).
 
 ## Mimari
 
@@ -54,15 +54,16 @@ sonuç dokulu bir mesh olarak three.js görüntüleyicide açılır ve **GLB, OB
 │   POST /api/tripo/tasks (multipart "image")  → Tripo upload + görev        │
 │   GET  /api/tripo/tasks/:id       GET /api/tripo/tasks/:id/model (GLB)     │
 │   • TRIPO_API_KEY sunucuda; yoksa kullanıcının x-tripo-key başlığı          │
-│   • IP başına hız limiti, boyut/MIME kontrolü, çapraz site POST engeli,     │
+│   • IP başına hız limiti (görev + okuma), eşzamanlı yükleme sınırı,        │
+│     boyut/MIME kontrolü, çapraz site engeli (x-3dmarker-client),           │
 │     model indirmede izinli host listesi (SSRF koruması)                    │
-│   • Üretimde dist/ klasörünü (SPA) de sunar                                │
+│   • Geliştirmede yalnızca 127.0.0.1; üretimde dist/ (SPA, gzip) de sunar   │
 └────────────────────────────────┬──────────────────────────────────────────┘
                                  ▼
                      api.tripo3d.ai (image → 3D)
 
  Model ağırlıkları: huggingface.co (ilk kullanımda indirilir, tarayıcı önbelleğinde tutulur)
- ONNX Runtime wasm: cdn.jsdelivr.net (varsayılan; VITE_ORT_WASM_PREFIX ile kendi sunucunuzdan)
+ ONNX Runtime wasm: uygulamanın kendi /assets dosyası (derlemeye gömülü; VITE_ORT_WASM_PREFIX ile başka bir dizin)
 ```
 
 Önemli sözleşmeler (`src/core/types.ts`):
@@ -79,18 +80,20 @@ sonuç dokulu bir mesh olarak three.js görüntüleyicide açılır ve **GLB, OB
 | Depth Anything V2 Base (`depth-anything-v2-base`) | ML, tarayıcı | derinlik (daha ayrıntılı) | solid/double | ~195 MB | Small'dan 3–4× yavaş | Kalite öncelikli | **CC-BY-NC-4.0 — ticari kullanım yok** |
 | DPT Hybrid MiDaS (`dpt-hybrid-midas`) | ML, tarayıcı | derinlik (384×384 sabit) | solid/double | ~125–490 MB | orta | Karşılaştırma, yumuşak sahne derinliği | Intel DPT (model kartını kontrol edin) |
 | Siluet şişirme (`silhouette-inflate`) | Sezgisel | derinlik (balon profili) → çift yüz | evet | yok | anında (~0.5 s) | Maskotlar, karakterler, çıkartmalar, logolar (saydam PNG) | Siluet gerekir |
-| Siluet ekstrüzyon (`silhouette-extrude`) | Sezgisel | geometri (düz + pah) | evet | yok | anında | Logolar, ikonlar, yazılar, 3B baskı | Siluet gerekir |
-| Parlaklık yükseklik haritası (`luminance-heightmap`) | Sezgisel | derinlik (parlaklıktan) | solid/double | yok | anında | Kabartma, litofan, doku, desen | Gerçek derinlik değil |
+| Siluet kalıplama / ekstrüzyon (`silhouette-extrude`) | Sezgisel | geometri (düz + pah) | evet | yok | anında | Logolar, ikonlar, yazılar, 3B baskı | Siluet gerekir |
+| Parlaklık haritası (`luminance-heightmap`) | Sezgisel | derinlik (parlaklıktan) | solid/double | yok | anında | Kabartma, litofan, doku, desen | Gerçek derinlik değil |
 | Tripo3D (`tripo3d-cloud`) | Bulut API | GLB (tam 3B, dokulu) | evet | yok (sunucuda) | 1–3 dk | Gerçekçi, arkası da olan tam model | API anahtarı + kredi; görsel üçüncü tarafa gider |
 
 Mesh seçenekleri (derinlik üreten sürücüler için, **canlı** — sürücüyü yeniden çalıştırmadan yeniden örer):
 `mode` (relief = açık yüzey, solid = düz taban/baskıya uygun, double = aynalı arka), `resolution`, `depthScale`,
 `gamma`, `smoothing`, `useMask`, `discontinuity` (relief'te derinlik sıçramalarında yırtma), `baseThickness`, `invert`.
+Sürücü değiştirmek ekrandaki modeli yeniden örmez; yeni sürücünün önerdiği `mode` bir sonraki oluşturmada uygulanır.
+Siluet seçilen çözünürlükte kaybolursa (çok küçük ya da ince) boş bir mesh yerine anlaşılır bir hata gösterilir ve ekrandaki model korunur.
 
 ### Hangi sürücüyü seçmeliyim?
 
 - **Saydam PNG karakter/maskot** → Siluet şişirme (anında, kapalı, yuvarlak hacim).
-- **Logo, ikon, yazı** → Siluet ekstrüzyon (net kenarlar, pah, baskıya hazır STL).
+- **Logo, ikon, yazı** → Siluet kalıplama / ekstrüzyon (net kenarlar, pah, baskıya hazır STL).
 - **Fotoğraf / manzara** → Depth Anything V2 Small (relief veya solid).
 - **Gerçek 3B nesne, arka yüzü de lazım** → Tripo3D (bulut).
 
@@ -100,7 +103,7 @@ Gereksinimler: Node.js ≥ 22 (öneri 24), npm.
 
 ```bash
 npm ci --ignore-scripts      # onnxruntime-node'un postinstall indirmesi gerekmiyor (tarayıcıda onnxruntime-web kullanılır)
-npm run dev                  # Vite (http://localhost:5173) + API sunucusu (http://localhost:8787), birlikte
+npm run dev                  # Vite (http://localhost:5173) + API sunucusu (http://127.0.0.1:8787, yalnızca yerel), birlikte
 # ya da ayrı ayrı:
 npm run dev:web
 npm run dev:api
@@ -111,40 +114,45 @@ Tarayıcıda http://localhost:5173 adresini açın, örnek görsellerden birine 
 ### Ortam değişkenleri
 
 `.env.example` dosyasını `.env` olarak kopyalayın. Kabuktaki değişkenler `.env`'dekileri ezer.
+API sunucusu ve Vite proxy'si (`PORT`, `CROSS_ORIGIN_ISOLATION`) yalnızca `.env`'i okur; `.env.local` / `.env.[mode]` yalnızca tarayıcı derlemesinin `VITE_*` değişkenlerini etkiler.
 
 | Değişken | Varsayılan | Açıklama |
 |---|---|---|
 | `PORT` | `8787` | API/üretim sunucusu portu (Vite proxy'si de bunu kullanır) |
-| `HOST` | tüm arayüzler | Dinlenecek adres |
+| `HOST` | geliştirmede `127.0.0.1`, üretimde tüm arayüzler | Dinlenecek adres. Geliştirmede ayarlanırsa (ör. `0.0.0.0`) API ve sunucu anahtarı ağa açılır |
 | `STATIC_DIR` | `./dist` | Üretimde sunulan SPA klasörü |
 | `TRIPO_API_KEY` | boş | Sunucu tarafı Tripo3D anahtarı. Boşsa kullanıcılar arayüzde kendi anahtarını girer |
 | `TRIPO_API_BASE` | `https://api.tripo3d.ai/v2/openapi` | Tripo API adresi |
 | `TRIPO_ALLOWED_MODEL_HOSTS` | `tripo3d.ai,tripo3d.com,tripo-data.cdn.bcebos.com` | GLB'nin indirilebileceği hostlar (alt alan adları dahil) |
 | `TRIPO_RATE_LIMIT` / `TRIPO_RATE_LIMIT_BYOK` | `10` / `60` | IP başına pencere başına görev (sunucu anahtarı / kullanıcı anahtarı), 0 = sınırsız |
 | `TRIPO_RATE_WINDOW_SEC` | `3600` | Hız limiti penceresi |
-| `TRUST_PROXY` | kapalı | `1`: tek bir ters proxy arkasında, istemci IP'si son `X-Forwarded-For` |
+| `TRIPO_READ_RATE_LIMIT` | `300` | IP başına dakikada görev durumu sorgusu + model indirme (her biri bir Tripo API çağrısı), 0 = sınırsız |
+| `TRIPO_MAX_CONCURRENT_UPLOADS` | `16` | Tüm istemcilerde aynı anda alınan yükleme sayısı (bellekte tutulur), 0 = sınırsız. IP başına en fazla 3. Çok düşük değer, yavaş yükleme yapan birkaç istemcinin herkesi bekletmesine izin verir |
+| `TRUST_PROXY` | kapalı | `1`: tek bir ters proxy arkasında, istemci IP'si son `X-Forwarded-For` (`ip:port` biçimi de olur) |
 | `CROSS_ORIGIN_ISOLATION` | kapalı | `1`: COOP + `COEP: credentialless` → ONNX Runtime çok iş parçacıklı WASM (CPU'da daha hızlı). Vite dev/preview ve üretim sunucusu uygular |
 | `VITE_MODEL_HOST` | `https://huggingface.co/` | Model dosyaları için ayna (derleme zamanı) |
-| `VITE_ORT_WASM_PREFIX` | jsDelivr | ONNX Runtime wasm dosyalarını kendi sunucunuzdan vermek için dizin (ör. `/ort/`) |
+| `VITE_ORT_WASM_PREFIX` | derlemedeki kopya (`/assets`) | ONNX Runtime wasm dosyalarını başka bir dizinden vermek için (ör. `/ort/`) |
 | `VITE_REPO_URL` | boş | Üst çubuktaki kaynak kodu bağlantısı (boşsa gizli) |
 
 ### Üretim
 
 ```bash
 npm run build                # tsc + vite build → dist/
-npm start                    # NODE_ENV=production: API + dist/ aynı porttan (varsayılan 8787)
+npm start                    # --production: API + dist/ aynı porttan (varsayılan 8787), tüm arayüzlerde
 ```
 
-`/assets/*` bir yıl önbelleklenir, `index.html` `no-cache`; uzantısız yollar SPA'ya düşer, `/api/*` asla.
+`/assets/*` bir yıl önbelleklenir, `index.html` `no-cache`; metin/JS/CSS gzip'lenir; uzantısız yollar SPA'ya düşer, `/api/*` asla.
 Not: `npm start` `tsx` kullanır (devDependency); üretim imajında dev bağımlılıkları kurulu olmalı ya da sunucuyu derleyin.
-Derleme `dist/assets` altına ~27 MB'lık bir ORT wasm kopyası da bırakır; varsayılan ayarda kullanılmaz (wasm jsDelivr'den gelir).
-Kendi sunucunuzdan vermek için `node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded*.{mjs,wasm}` dosyalarını örn. `public/ort/`
-altına kopyalayıp `VITE_ORT_WASM_PREFIX=/ort/` ile derleyin.
+Derleme `dist/assets` altına ~27 MB'lık ORT wasm dosyasını da bırakır; ML sürücüleri onu buradan yükler (CDN gerekmez;
+yalnızca WebGPU'suz Safari < 26 jsDelivr'deki düz sürümü kullanır). Başka bir dizinden vermek için
+`node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded*.{mjs,wasm}` dosyalarını örn. `public/ort/` altına kopyalayıp
+`VITE_ORT_WASM_PREFIX=/ort/` ile derleyin.
 
 ### Testler
 
 ```bash
-npm test                     # vitest: saf mantık (Node, DOM yok) — görüntü işleme, mesh, dışa aktarım, sürücüler, sunucu
+npm test                     # vitest: saf mantık (Node, DOM yok) — görüntü işleme, mesh, dışa aktarım, sürücüler, sunucu;
+                             # src/ui'deki kanca/bileşen testleri jsdom'da (`// @vitest-environment jsdom`)
 npm run typecheck
 npm run test:e2e             # Playwright: gerçek Chromium + SwiftShader WebGL; Vite ve API sunucusunu kendisi başlatır
 npm run check                # hepsi
@@ -152,6 +160,8 @@ npm run check                # hepsi
 
 E2E testleri `tests/e2e/` altında; ekran görüntüleri `test-results/screenshots/` klasörüne yazılır.
 Chromium yoksa `npx playwright install chromium` çalıştırın ya da `CHROMIUM_PATH=/yol/chrome` verin.
+Portlar `E2E_WEB_PORT` (5173) ve `E2E_API_PORT` (8787) ile değişir; `CI` tanımlı değilse bu portlarda zaten çalışan sunucular
+yeniden kullanılır (güncel kodu test etmek için `npm run dev`'i kapatın ya da başka portlar verin). Testler (renk şeması testleri dışında) koyu şemayla çalışır.
 E2E, Hugging Face'e erişimi bilerek keser (ML sürücüsünün hata yolunu test eder) ve Tripo API'sini sahte yanıtlarla taklit eder.
 
 ## Yeni bir sürücü eklemek
@@ -161,6 +171,8 @@ E2E, Hugging Face'e erişimi bilerek keser (ML sürücüsünün hata yolunu test
    `{ kind: 'geometry', geometry }` (hazır `BufferGeometry`, ortak çerçevede) ya da `{ kind: 'model', glb }`.
 2. Parametreleri `ParamSpec[]` olarak tanımlayın; arayüz formu otomatik üretilir (number / boolean / select / text, `secret` destekli).
 3. Uzun işlerde `signal`'e uyun (`throwIfAborted(signal)`), `onProgress({ label: {tr, en}, ratio })` ile ilerleme bildirin.
+   Ana iş parçacığındaki uzun, senkron bir adımdan önce `await yieldToPaint()` (`src/core/yield.ts`) çağırın: etiket ekrana gelir
+   ve bu sırada basılan İptal / Esc işlenir.
    Kullanıcıya gösterilecek hatalar için `LocalizedError` (`src/core/errors.ts`) kullanın.
 4. İlgili kategori listesine ekleyin: `src/drivers/ml/index.ts`, `src/drivers/heuristic/index.ts` veya `src/drivers/cloud/index.ts`.
    `DRIVERS` listesi (açılır liste) buradan oluşur. Saf mantığı yanında `*.test.ts` ile test edin.
@@ -187,13 +199,15 @@ export const myDriver: Driver = {
 ```
 
 Sunucu tarafında çalışan yeni bir bulut sağlayıcı (ör. kendi GPU sunucunuzda TripoSR) için `server/providers/tripo.ts` ve
-`server/app.ts`'deki desen izlenebilir: istemci sürücüsü yalnızca kendi `/api/...` uçlarımızla konuşur, anahtarlar sunucuda kalır.
+`server/app.ts`'deki desen izlenebilir: istemci sürücüsü yalnızca kendi `/api/...` uçlarımızla konuşur ve her istekte
+`CLIENT_HEADER` başlığını gönderir (`src/drivers/cloud/api.ts`; sunucu bu başlık olmadan gelen istekleri çapraz site sayıp reddeder),
+anahtarlar sunucuda kalır.
 
 ## Proje yapısı
 
 ```
 src/
-  core/            sözleşmeler (types, errors), görüntü işleme (image/), mesh kurucu ve istatistik (mesh/),
+  core/            sözleşmeler (types, errors, yield), görüntü işleme (image/), mesh kurucu ve istatistik (mesh/),
                    dışa aktarım (export/), AI arka plan kaldırma (preprocess/)
   drivers/         ml/ (transformers.js depth + worker istemcisi), heuristic/ (inflate, extrude, luminance), cloud/ (tripo)
   workers/         ml.worker.ts (transformers.js boru hatları, WebGPU/WASM seçimi, önbellek, kuyruk)
@@ -210,14 +224,17 @@ tests/e2e/         Playwright uçtan uca testleri
   **gerçek arka yüz yeniden oluşturulmaz**. Arkası da gerçekçi bir model için Tripo3D (veya yol haritasındaki GPU modelleri) gerekir.
 - **ML derinliği göreli:** Depth Anything / MiDaS göreli (ölçeksiz) derinlik verir; metrik ölçü beklemeyin.
 - **İlk kullanımda indirme:** ML sürücüleri model ağırlıklarını ilk kullanımda Hugging Face'ten indirir (~50–490 MB) ve
-  tarayıcı önbelleğinde tutar; ONNX Runtime wasm'ı varsayılan olarak jsDelivr'den gelir. Kurumsal ağlarda bu adresler
-  engelliyse `VITE_MODEL_HOST` / `VITE_ORT_WASM_PREFIX` ile ayna kullanın. Erişilemezse arayüz anlaşılır bir hata gösterir.
-- **WebGPU:** Yoksa WASM'a düşülür (daha yavaş). `CROSS_ORIGIN_ISOLATION=1` WASM'ı çok iş parçacıklı yapar.
+  tarayıcı önbelleğinde tutar; ONNX Runtime wasm'ı uygulamanın kendi sunucusundan gelir. Kurumsal ağlarda Hugging Face
+  engelliyse `VITE_MODEL_HOST` ile ayna kullanın. Erişilemezse arayüz anlaşılır bir hata gösterir.
+- **WebGPU:** Yoksa ya da hata verirse WASM'a düşülür (daha yavaş; hata sonrası iş yeni bir worker'da tekrarlanır).
+  `CROSS_ORIGIN_ISOLATION=1` WASM'ı çok iş parçacıklı yapar.
 - **AI arka plan kaldırma:** Varsayılan model MODNet portre için eğitilmiştir; nesnelerde zayıf kalabilir.
   Saydam PNG veya düz renkli arka plan en iyi sonucu verir.
 - **Tripo3D:** API anahtarı (sunucuda ya da kullanıcının kendi anahtarı) ve kredi gerektirir; görsel üçüncü taraf bir hizmete
   yüklenir. Uç nokta yolları ve yanıt biçimleri canlı API'ye karşı henüz doğrulanmadı (`server/providers/tripo.ts` içinde
   `ASSUMPTION` olarak işaretli). Hız limiti bellek içidir (tek sunucu).
+- **Siluet kalıplama:** En büyük 1500 kontur tutulur; daha yoğun desenlerde (ör. gürültülü maskeler) en küçük delikler dolar.
+  "Kontur yumuşatma" 0 ve "En küçük parça" 0 gibi uç ayarlarda kapakta nadiren birkaç açık kenar kalabilir (earcut).
 - **Dokular:** GLB dokuyu taşır; OBJ (MTL yok), STL ve PLY doku taşımaz. STL varsayılan olarak en uzun kenar 100 mm olacak şekilde ölçeklenir.
 - **Lisanslar:** Depth Anything V2 **Base** CC-BY-NC-4.0'dır (ticari SaaS'ta kullanmayın ya da lisans alın); Small Apache-2.0'dır.
 

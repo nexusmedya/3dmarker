@@ -98,7 +98,7 @@ describe('MlWorkerClient', () => {
     const { client, workers } = setup();
     const ac = new AbortController();
     const p = client.run(job(), { signal: ac.signal });
-    workers[0].reply({ type: 'progress', id: 1, stage: 'inference' });
+    workers[0].reply({ type: 'progress', id: 1, stage: 'inference', device: 'webgpu' });
     ac.abort();
     await expect(p).rejects.toBeInstanceOf(AbortError);
     expect(workers[0].sent.at(-1)!.msg).toEqual({ type: 'cancel', id: 1 });
@@ -119,6 +119,46 @@ describe('MlWorkerClient', () => {
     expect(workers).toHaveLength(2);
     workers[1].reply(depthResult(2));
     await expect(p2).resolves.toMatchObject({ kind: 'depth' });
+  });
+
+  it('terminates the worker when the only pending job is aborted during WASM inference', async () => {
+    const { client, workers } = setup();
+    const ac = new AbortController();
+    const p = client.run(job(), { signal: ac.signal });
+    workers[0].reply({ type: 'progress', id: 1, stage: 'load', device: 'wasm' });
+    workers[0].reply({ type: 'progress', id: 1, stage: 'inference', device: 'wasm' });
+    ac.abort();
+    await expect(p).rejects.toBeInstanceOf(AbortError);
+    expect(workers[0].terminated).toBe(true);
+    // the next job does not queue behind the abandoned inference
+    const p2 = client.run(job());
+    expect(workers).toHaveLength(2);
+    workers[1].reply(depthResult(2));
+    await expect(p2).resolves.toMatchObject({ kind: 'depth' });
+  });
+
+  it('keeps the worker when a WASM inference is aborted while another job is pending', async () => {
+    const { client, workers } = setup();
+    const ac = new AbortController();
+    const p1 = client.run(job(), { signal: ac.signal });
+    const p2 = client.run(job());
+    workers[0].reply({ type: 'progress', id: 1, stage: 'inference', device: 'wasm' });
+    ac.abort();
+    await expect(p1).rejects.toBeInstanceOf(AbortError);
+    expect(workers[0].terminated).toBe(false);
+    expect(workers[0].sent.at(-1)!.msg).toEqual({ type: 'cancel', id: 1 });
+    workers[0].reply(depthResult(2));
+    await expect(p2).resolves.toBeDefined();
+  });
+
+  it('keeps the worker when the job is aborted while its session loads', async () => {
+    const { client, workers } = setup();
+    const ac = new AbortController();
+    const p = client.run(job(), { signal: ac.signal });
+    workers[0].reply({ type: 'progress', id: 1, stage: 'load', device: 'wasm' });
+    ac.abort();
+    await expect(p).rejects.toBeInstanceOf(AbortError);
+    expect(workers[0].terminated).toBe(false);
   });
 
   it('keeps the worker when other jobs are still pending', async () => {
@@ -159,6 +199,120 @@ describe('MlWorkerClient', () => {
     void client.run(job());
     client.configure({ wasmPrefix: '/ort/' });
     expect(workers[0].sent.at(-1)!.msg).toEqual({ type: 'configure', config: { wasmPrefix: '/ort/' } });
+  });
+});
+
+describe('MlWorkerClient recovery (ONNX Runtime keeps failures in module state)', () => {
+  const ortError = (id: number, name = 'Error'): MlResponse => ({
+    type: 'error',
+    id,
+    error: { name, message: 'failed to call OrtRun(). ERROR_CODE: 2, ERROR_MESSAGE: Reshape mismatch' },
+  });
+
+  it('replaces the worker after an error, re-sending the config', async () => {
+    const { client, workers } = setup({ remoteHost: 'https://m/' });
+    const p1 = client.run({ ...job(), device: 'wasm' });
+    workers[0].reply(ortError(1));
+    await expect(p1).rejects.toThrow('OrtRun');
+    expect(workers[0].terminated).toBe(true);
+    const p2 = client.run({ ...job(), device: 'wasm' });
+    expect(workers).toHaveLength(2);
+    expect(workers[1].sent[0].msg).toEqual({ type: 'configure', config: { remoteHost: 'https://m/' } });
+    workers[1].reply(depthResult(2));
+    await expect(p2).resolves.toMatchObject({ kind: 'depth' });
+  });
+
+  it('keeps the worker after a missing-weights error (raised before ORT runs)', async () => {
+    const { client, workers } = setup();
+    const p = client.run(job());
+    workers[0].reply({ type: 'error', id: 1, error: { name: 'ModelFileNotFoundError', message: 'x/onnx/model.onnx' } });
+    await expect(p).rejects.toMatchObject({ name: 'ModelFileNotFoundError' });
+    expect(workers[0].terminated).toBe(false);
+    void client.run(job());
+    expect(workers).toHaveLength(1);
+  });
+
+  it('replaces the worker when an aborted job fails there later', async () => {
+    const { client, workers } = setup();
+    const ac = new AbortController();
+    const p = client.run(job(), { signal: ac.signal });
+    workers[0].reply({ type: 'progress', id: 1, stage: 'inference', device: 'webgpu' });
+    ac.abort();
+    await expect(p).rejects.toBeInstanceOf(AbortError);
+    workers[0].reply(ortError(1, 'WebGpuFailedError'));
+    expect(workers[0].terminated).toBe(true);
+    void client.run(job());
+    expect(workers).toHaveLength(2);
+  });
+
+  it('lets jobs in flight on a failed worker settle there, sending new jobs to a fresh one', async () => {
+    const { client, workers } = setup();
+    const p1 = client.run(job());
+    const p2 = client.run(job());
+    workers[0].reply(ortError(1));
+    await expect(p1).rejects.toThrow('OrtRun');
+    expect(workers[0].terminated).toBe(false); // job 2 still runs there
+    const p3 = client.run(job());
+    expect(workers).toHaveLength(2);
+    expect(workers[1].jobs().map((j) => j.id)).toEqual([3]);
+    workers[0].reply(depthResult(2));
+    await expect(p2).resolves.toBeDefined();
+    expect(workers[0].terminated).toBe(true);
+    workers[1].reply(depthResult(3));
+    await expect(p3).resolves.toBeDefined();
+    expect(workers[1].terminated).toBe(false);
+  });
+
+  it('retries a WebGPU failure on WASM in a fresh worker, then sends that model straight to WASM', async () => {
+    const { client, workers } = setup();
+    const progress: string[] = [];
+    const input = job();
+    input.image.data = new Uint8ClampedArray([9, 8, 7, 255]);
+    const p = client.run(input, { onProgress: (e) => progress.push(`${e.stage}@${e.device}`) });
+    workers[0].reply({ type: 'progress', id: 1, stage: 'inference', device: 'webgpu' });
+    workers[0].reply(ortError(1, 'WebGpuFailedError'));
+    expect(workers[0].terminated).toBe(true);
+    expect(workers).toHaveLength(2);
+    const retry = workers[1].sent[0];
+    expect(retry.msg).toMatchObject({ type: 'depth', id: 1, device: 'wasm', model: input.model, exactSize: true });
+    expect([...(retry.msg as { image: { data: Uint8ClampedArray } }).image.data]).toEqual([9, 8, 7, 255]);
+    expect(retry.transfer).toHaveLength(1);
+    workers[1].reply({ type: 'progress', id: 1, stage: 'inference', device: 'wasm' });
+    workers[1].reply(depthResult(1));
+    await expect(p).resolves.toMatchObject({ kind: 'depth' });
+    expect(progress).toEqual(['inference@webgpu', 'inference@wasm']);
+    expect(client.pendingCount).toBe(0);
+
+    // later 'auto' jobs for that model skip WebGPU; other models still try it
+    void client.run(job());
+    void client.run({ ...job(), model: 'other/model' });
+    expect(workers[1].jobs().slice(1).map((j) => [j.model, j.device])).toEqual([
+      [input.model, 'wasm'],
+      ['other/model', 'auto'],
+    ]);
+  });
+
+  it('rejects with the WASM error when the retry fails too, and does not pin the model to WASM', async () => {
+    const { client, workers } = setup();
+    const p = client.run(job());
+    workers[0].reply({ type: 'error', id: 1, error: { name: 'WebGpuFailedError', message: 'Failed to fetch' } });
+    workers[1].reply({ type: 'error', id: 1, error: { name: 'TypeError', message: 'Failed to fetch dynamically imported module: x' } });
+    await expect(p).rejects.toMatchObject({ name: 'TypeError', message: 'Failed to fetch dynamically imported module: x' });
+    expect(workers[1].terminated).toBe(true);
+    void client.run(job());
+    expect(workers[2].jobs()[0].device).toBe('auto');
+  });
+
+  it('aborting during the WASM retry rejects and stops the retry worker', async () => {
+    const { client, workers } = setup();
+    const ac = new AbortController();
+    const p = client.run(job(), { signal: ac.signal });
+    workers[0].reply(ortError(1, 'WebGpuFailedError'));
+    workers[1].reply({ type: 'progress', id: 1, stage: 'inference', device: 'wasm' });
+    ac.abort();
+    await expect(p).rejects.toBeInstanceOf(AbortError);
+    expect(workers[1].terminated).toBe(true);
+    expect(client.pendingCount).toBe(0);
   });
 });
 

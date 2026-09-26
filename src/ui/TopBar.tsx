@@ -23,7 +23,7 @@ export function TopBar({ theme, onLang, onTheme }: Props) {
           <span className="brand-name">{t('appName')}</span>
           <span className="pill pill-accent">{t('beta')}</span>
         </a>
-        <nav className="topnav" aria-label="primary">
+        <nav className="topnav" aria-label={t('navLabel')}>
           <a href="#studio">{t('navStudio')}</a>
           <a href="#how">{t('navHow')}</a>
           <a href="#drivers">{t('navDrivers')}</a>

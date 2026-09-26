@@ -8,6 +8,7 @@
 import { BufferAttribute, BufferGeometry, ExtrudeGeometry, Path, Shape, Vector2 } from 'three';
 import type { Driver, DriverInput, DriverResult, I18nText, Mask, ParamSpec } from '../../core/types';
 import { throwIfAborted } from '../../core/types';
+import { yieldToPaint } from '../../core/yield';
 import { blurFloat } from '../../core/image/ops';
 import {
   findIntersectingRings, groupContours, pointInPolygon, polygonArea, simplifyGroups, traceIsoContours,
@@ -27,7 +28,7 @@ export interface ExtrudeOptions {
   smooth: number;
   /** RDP tolerance in px at a 512 px working size. */
   simplify: number;
-  /** Parts and holes smaller than this percentage of the image area are dropped. */
+  /** Parts and holes smaller than this percentage of the image area are dropped (and all but the MAX_RINGS largest). */
   minArea: number;
   /** Soft cap on outline vertices; the tolerance grows until it fits. */
   maxPoints: number;
@@ -48,6 +49,14 @@ export const NO_PARTS: I18nText = {
   en: 'No part is large enough to extrude. Try lowering "Min. part size" or "Outline smoothing".',
 };
 
+/**
+ * At most this many outline rings (parts + holes) are extruded; beyond it the
+ * smallest are dropped like parts under minArea. The cap triangulation's
+ * hole bridging grows quadratically with the ring count and runs on the main
+ * thread: dithered or noisy alpha masks can have tens of thousands of rings.
+ */
+export const MAX_RINGS = 1500;
+
 /** Normals of neighbouring side faces closer than this are averaged (smooth bevels / curved walls). */
 const CREASE_ANGLE = (40 * Math.PI) / 180;
 
@@ -65,7 +74,15 @@ export function traceOutline(mask: Mask, opts: ExtrudeOptions): ContourGroup[] {
     field = blurFloat(f, w, h, radius, 3);
   }
   const minAreaPx = (Math.max(0, opts.minArea) / 100) * w * h;
-  const contours = traceIsoContours(field, w, h, 0.5).filter((c) => Math.abs(polygonArea(c.points)) >= minAreaPx);
+  const traced = traceIsoContours(field, w, h, 0.5).map((c) => ({ c, area: Math.abs(polygonArea(c.points)) }));
+  let kept = traced.filter((t) => t.area >= minAreaPx);
+  if (kept.length > MAX_RINGS) {
+    // Keep the largest rings (ties: first traced), in their original order.
+    // A ring's container is always larger than the ring, so nesting survives.
+    const order = kept.map((_, i) => i).sort((a, b) => kept[b].area - kept[a].area || a - b);
+    kept = order.slice(0, MAX_RINGS).sort((a, b) => a - b).map((i) => kept[i]);
+  }
+  const contours = kept.map((t) => t.c);
   return simplifyGroups(groupContours(contours), Math.max(0, opts.simplify) * k, { maxPoints: opts.maxPoints });
 }
 
@@ -195,14 +212,41 @@ export function fitBevel(rings: Point[][], size: number): { rings: Point[][]; si
     // inset outer ring and outside each other. (A bevel wider than a stroke
     // can leave simple rings that overshot the outline or swapped nesting.)
     if (findIntersectingRings([...ok, ...inset]).size > 0) continue;
-    const inside = (ring: Point[], [x, y]: Point) => pointInPolygon(x, y, ring);
-    const inSolid = (p: Point) => inside(ok[0], p) && !ok.slice(1).some((h) => inside(h, p));
+    // Point-in-ring tests with a bounding-box pre-check (thousands of holes).
+    const okBox = ok.map(ringBox), insetBox = inset.map(ringBox);
+    const inside = (rs: Point[][], boxes: Box[], i: number, [x, y]: Point) => {
+      const b = boxes[i];
+      return x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3] && pointInPolygon(x, y, rs[i]);
+    };
+    const inSolid = (p: Point) => {
+      if (!inside(ok, okBox, 0, p)) return false;
+      for (let h = 1; h < ok.length; h++) if (inside(ok, okBox, h, p)) return false;
+      return true;
+    };
     if (!inset.every((r) => inSolid(r[0]))) continue;
-    const holes = inset.slice(1);
-    if (!holes.every((h, i) => inside(inset[0], h[0]) && !holes.some((o, j) => j !== i && inside(o, h[0])))) continue;
+    const holesOk = inset.every((h, i) => {
+      if (i === 0) return true;
+      if (!inside(inset, insetBox, 0, h[0])) return false;
+      for (let j = 1; j < inset.length; j++) if (j !== i && inside(inset, insetBox, j, h[0])) return false;
+      return true;
+    });
+    if (!holesOk) continue;
     return { rings: ok, size: s };
   }
   return { rings, size: 0 };
+}
+
+type Box = [number, number, number, number];
+
+function ringBox(r: Point[]): Box {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const [x, y] of r) {
+    if (x < x0) x0 = x;
+    if (x > x1) x1 = x;
+    if (y < y0) y0 = y;
+    if (y > y1) y1 = y;
+  }
+  return [x0, y0, x1, y1];
 }
 
 /**
@@ -269,36 +313,33 @@ export function extrudeMask(mask: Mask, opts: ExtrudeOptions): BufferGeometry {
 
 /**
  * Turn ExtrudeGeometry's triangle soup into an indexed geometry: shift Z,
- * flat front/back normals, crease-angle smoothed side normals (angle
- * weighted), planar UVs from X/Y, and vertices shared wherever position and
- * normal agree (hard edges stay split).
+ * close the caps' T-junctions, flat front/back normals, crease-angle
+ * smoothed side normals (angle weighted), planar UVs from X/Y, and vertices
+ * shared wherever position and normal agree (hard edges stay split).
  */
 function finalizeGeometry(parts: { geometry: BufferGeometry; zShift: number }[], halfW: number, halfH: number): BufferGeometry {
-  let nv = 0;
-  for (const { geometry } of parts) nv += geometry.getAttribute('position').count;
-  const nf = nv / 3;
-  const p = new Float64Array(nv * 3);
+  let nv0 = 0;
+  for (const { geometry } of parts) nv0 += geometry.getAttribute('position').count;
+  const p0 = new Float64Array(nv0 * 3);
   // Groups with material 0 are the front/back caps, 1 the side walls.
-  const cap = new Uint8Array(nf);
+  const cap0 = new Uint8Array(nv0 / 3);
   let base = 0;
   for (const { geometry, zShift } of parts) {
     const pos = geometry.getAttribute('position').array as Float32Array;
     for (let i = 0; i < pos.length; i += 3) {
-      p[3 * base + i] = pos[i];
-      p[3 * base + i + 1] = pos[i + 1];
-      p[3 * base + i + 2] = pos[i + 2] + zShift;
+      p0[3 * base + i] = pos[i];
+      p0[3 * base + i + 1] = pos[i + 1];
+      p0[3 * base + i + 2] = pos[i + 2] + zShift;
     }
     for (const g of geometry.groups) {
       if (g.materialIndex !== 0) continue;
-      for (let f = (base + g.start) / 3; f < (base + g.start + g.count) / 3; f++) cap[f] = 1;
+      for (let f = (base + g.start) / 3; f < (base + g.start + g.count) / 3; f++) cap0[f] = 1;
     }
     base += pos.length / 3;
   }
-
-  // Weld corners that share a position (ExtrudeGeometry copies exact values).
-  const q = (v: number) => Math.round(v * 1e6);
-  const posId = new Int32Array(nv);
-  const nPos = hashIds(nv, 3, (i, c) => q(p[3 * i + c]), posId);
+  // Also welds corners that share a position (ExtrudeGeometry copies exact values).
+  const { p, cap, posId, nPos } = repairCapTJunctions(p0, cap0);
+  const nv = p.length / 3, nf = nv / 3;
 
   // Face normals, corner angles and a flag for (numerically) degenerate slivers,
   // whose normals are noise and must not leak into their neighbours.
@@ -394,6 +435,131 @@ function finalizeGeometry(parts: { geometry: BufferGeometry; zShift: number }[],
 }
 
 /**
+ * ExtrudeGeometry triangulates the caps with earcut, which drops ring
+ * vertices lying exactly on the line through their neighbours (easily the
+ * case for pixel-aligned outlines, e.g. across rings after hole bridging).
+ * A cap triangle then spans A→C across vertex B while the side walls still
+ * use A–B and B–C: a zero-width T-junction crack that leaves the mesh open.
+ * Split such cap triangles at the skipped vertices (a fan from the opposite
+ * corner), found by following the unmatched edges along the line. Triangle
+ * soup in and out (9 coordinates and one cap flag per face), plus the ids of
+ * the welded positions of the result.
+ */
+function repairCapTJunctions(p: Float64Array, cap: Uint8Array): { p: Float64Array; cap: Uint8Array; posId: Int32Array; nPos: number } {
+  for (let pass = 0; ; pass++) {
+    const nv = p.length / 3, nf = nv / 3;
+    const id = new Int32Array(nv);
+    const nPos = hashIds(nv, 3, (i, c) => Math.round(p[3 * i + c] * 1e6), id);
+    const done = { p, cap, posId: id, nPos };
+    if (pass === 4) return done;
+    const next = (i: number) => i - (i % 3) + ((i + 1) % 3);
+    // Ids for the directed edges a→b of all corners (items 0..nv-1) and their
+    // reverses b→a (items nv..2nv-1): an edge is unmatched when its reverse
+    // shares an id with no forward edge.
+    const eid = new Int32Array(2 * nv);
+    const nE = hashIds(2 * nv, 2, (k, c) => {
+      const i = k < nv ? k : k - nv;
+      return (k < nv) === (c === 0) ? id[i] : id[next(i)];
+    }, eid);
+    const used = new Uint8Array(nE);
+    for (let i = 0; i < nv; i++) used[eid[i]] = 1;
+    const open = (i: number) => used[eid[nv + i]] === 0;
+    // Unmatched edges as an undirected adjacency, and one corner per position for its coordinates.
+    const adj = new Map<number, number[]>();
+    const link = (u: number, v: number) => {
+      const list = adj.get(u);
+      if (list) list.push(v);
+      else adj.set(u, [v]);
+    };
+    const rep = new Int32Array(nPos);
+    let anyOpenCap = false;
+    for (let i = 0; i < nv; i++) {
+      rep[id[i]] = i;
+      if (!open(i)) continue;
+      if (cap[(i / 3) | 0]) anyOpenCap = true;
+      link(id[i], id[next(i)]);
+      link(id[next(i)], id[i]);
+    }
+    if (!anyOpenCap) return done;
+
+    // Positions strictly inside segment a→b (same cap plane) reachable from a
+    // or b along unmatched edges that stay on the segment, ordered from a to
+    // b; null if none. (Skipped vertices can chain, and spanning cap edges can
+    // overlap each other along one line.)
+    const chainOf = (a: number, b: number): number[] | null => {
+      const ra = 3 * rep[a], rb = 3 * rep[b];
+      const ax = p[ra], ay = p[ra + 1], az = p[ra + 2];
+      const dx = p[rb] - ax, dy = p[rb + 1] - ay, len2 = dx * dx + dy * dy;
+      if (!(len2 > 0)) return null;
+      const len = Math.sqrt(len2);
+      // Stored positions are Float32: allow for their rounding off the line.
+      const tol = 1e-6 * len + 4e-7;
+      const found = new Map<number, number>();
+      const todo = [a, b];
+      while (todo.length > 0) {
+        for (const v of adj.get(todo.pop()!) ?? []) {
+          if (v === a || v === b || found.has(v)) continue;
+          const rv = 3 * rep[v];
+          const x = p[rv] - ax, y = p[rv + 1] - ay;
+          if (Math.abs(p[rv + 2] - az) > 1e-9) continue;
+          const t = (x * dx + y * dy) / len2;
+          if (!(t > 1e-9 && t < 1 - 1e-9) || Math.abs(x * dy - y * dx) / len > tol) continue;
+          found.set(v, t);
+          todo.push(v);
+        }
+      }
+      if (found.size === 0) return null;
+      return [...found.keys()].sort((u, v) => found.get(u)! - found.get(v)!);
+    };
+
+    // Per face: the corner starting the split edge and the inner vertices.
+    const splits = new Map<number, { c: number; chain: number[] }>();
+    let added = 0;
+    for (let f = 0; f < nf; f++) {
+      if (!cap[f]) continue;
+      for (let c = 0; c < 3; c++) {
+        const i = 3 * f + c;
+        if (!open(i)) continue;
+        const chain = chainOf(id[i], id[next(i)]);
+        if (!chain) continue;
+        splits.set(f, { c, chain });
+        added += chain.length;
+        break;
+      }
+    }
+    if (splits.size === 0) return done;
+
+    const np = new Float64Array(p.length + 9 * added);
+    const ncap = new Uint8Array(nf + added);
+    let o = 0;
+    const put = (corner: number) => {
+      np[o++] = p[3 * corner];
+      np[o++] = p[3 * corner + 1];
+      np[o++] = p[3 * corner + 2];
+    };
+    for (let f = 0; f < nf; f++) {
+      const split = splits.get(f);
+      if (!split) {
+        ncap[o / 9] = cap[f];
+        for (let c = 0; c < 3; c++) put(3 * f + c);
+        continue;
+      }
+      // Face (a, b, opp) → fan (v_j, v_j+1, opp) along a = v_0 … v_k+1 = b, same winding.
+      const a = 3 * f + split.c, b = 3 * f + ((split.c + 1) % 3), opp = 3 * f + ((split.c + 2) % 3);
+      const path = [a, ...split.chain.map((v) => rep[v]), b];
+      for (let j = 0; j + 1 < path.length; j++) {
+        ncap[o / 9] = 1;
+        put(path[j]);
+        put(path[j + 1]);
+        put(opp);
+      }
+    }
+    p = np;
+    cap = ncap;
+  }
+}
+
+/**
  * Assign ids 0..count-1 to `n` items so that items with equal integer keys
  * (`dims` components from `key`) share an id. Open-addressing hash table.
  */
@@ -432,6 +598,7 @@ function hashIds(n: number, dims: number, key: (i: number, c: number) => number,
   return count;
 }
 
+/** Let queued input (Cancel / Esc) run between steps. */
 const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 
 const PARAMS: ParamSpec[] = [
@@ -484,8 +651,8 @@ const PARAMS: ParamSpec[] = [
     key: 'minArea',
     label: { tr: 'En küçük parça (%)', en: 'Min. part size (%)' },
     hint: {
-      tr: 'Görsel alanının bu yüzdesinden küçük parçalar ve delikler atılır',
-      en: 'Parts and holes smaller than this percentage of the image area are dropped',
+      tr: `Görsel alanının bu yüzdesinden küçük parçalar ve delikler atılır (en fazla ${MAX_RINGS} kontur; fazlasında en küçükler atılır)`,
+      en: `Parts and holes smaller than this percentage of the image area are dropped (at most ${MAX_RINGS} outlines; beyond that the smallest go)`,
     },
     min: 0, max: 2, step: 0.005, default: DEFAULT_EXTRUDE_OPTIONS.minArea,
   },
@@ -528,14 +695,16 @@ export const extrudeDriver: Driver = {
     throwIfAborted(signal);
 
     onProgress({ label: { tr: 'Kontur çıkarılıyor', en: 'Tracing outline' }, ratio: 0.2 });
-    await tick();
+    await yieldToPaint(); // show the label during the synchronous step
+    throwIfAborted(signal);
     const groups = traceOutline(mask, opts);
     if (groups.length === 0) throw new LocalizedError(NO_PARTS);
     await tick();
     throwIfAborted(signal);
 
     onProgress({ label: { tr: 'Katılaştırılıyor', en: 'Extruding' }, ratio: 0.55 });
-    await tick();
+    await yieldToPaint();
+    throwIfAborted(signal);
     const geometry = extrudeOutline(groups, mask.width, mask.height, opts);
     if (signal.aborted) {
       geometry.dispose();

@@ -2,10 +2,12 @@ import { describe, expect, it } from 'vitest';
 import type { BufferGeometry } from 'three';
 import type { DriverInput, Mask, RGBAImage } from '../../core/types';
 import { AbortError, defaultParams } from '../../core/types';
-import { findIntersectingRings, polygonArea } from '../../core/image/contours';
+import { findIntersectingRings, pointInPolygon, polygonArea } from '../../core/image/contours';
+import { computeMeshStats } from '../../core/mesh/stats';
 import type { Point } from '../../core/image/contours';
 import {
-  DEFAULT_EXTRUDE_OPTIONS, extrudeDriver, extrudeMask, fitBevel, insetRing, traceOutline, type ExtrudeOptions,
+  DEFAULT_EXTRUDE_OPTIONS, extrudeDriver, extrudeMask, extrudeOutline, fitBevel, insetRing, MAX_RINGS, traceOutline,
+  type ExtrudeOptions,
 } from './extrude';
 import { LocalizedError } from './inflate';
 
@@ -208,6 +210,75 @@ describe('extrudeMask', () => {
     const dev = (pts: [number, number][]) => Math.max(...pts.map(([x, y]) => Math.abs(Math.hypot(x - 128, y - 128) - 100)));
     expect(dev(smooth)).toBeLessThan(dev(rough));
     expect(dev(smooth)).toBeLessThan(0.3);
+  });
+
+  it('stays watertight on pixel art with exact outlines (cap T-junctions are split)', () => {
+    // Pixel-aligned cells give ring vertices exactly collinear with other rings'
+    // edges, where earcut skips a vertex that the side walls still use.
+    let s = 1994;
+    const r = () => (s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 2 ** 32;
+    const cells = 12 + Math.floor(r() * 30);
+    const on: boolean[] = [];
+    for (let i = 0; i < cells * cells; i++) on.push(r() < 0.5);
+    const cs = 1024 / cells;
+    const m = maskOf(1024, 1024, (x, y) => on[Math.floor(y / cs) * cells + Math.floor(x / cs)]);
+    const area = m.data.reduce((n, v) => n + v, 0) * (2 / 1024) ** 2;
+    for (const bevel of [0.01, 0]) {
+      const g = extrudeMask(m, opts({ smooth: 0, bevel }));
+      expect(computeMeshStats(g).watertight).toBe(true);
+      expect(isClosedManifold(g)).toBe(true);
+      // Splitting cap triangles adds no area and flips nothing.
+      const vol = signedVolume(g) / (area * 0.2);
+      expect(vol).toBeGreaterThan(bevel ? 0.9 : 0.99);
+      expect(vol).toBeLessThan(1.001);
+      for (const t of triangles(g)) if ([t.a, t.b, t.c].every((v) => v[2] > 0.1 - 1e-6)) expect(cross(t)[2]).toBeGreaterThan(0);
+    }
+  });
+
+  it('caps the ring count so noisy masks cannot hang the tab (keeps the largest rings)', () => {
+    // Dithered 55 % alpha, no smoothing, no minimum size: ~20k rings before the cap
+    // (the earcut hole bridging then ran for minutes).
+    let s = 7;
+    const r = () => (s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 2 ** 32;
+    const S2 = 512;
+    const data = new Uint8Array(S2 * S2);
+    for (let i = 0; i < data.length; i++) data[i] = r() < 0.55 ? 1 : 0;
+    const m: Mask = { width: S2, height: S2, data };
+    const o = opts({ smooth: 0, minArea: 0 });
+    const t0 = performance.now();
+    const groups = traceOutline(m, o);
+    expect(groups.reduce((n, g) => n + 1 + g.holes.length, 0)).toBe(MAX_RINGS);
+    for (const g of groups) for (const h of g.holes) expect(pointInPolygon(h[0][0], h[0][1], g.outer)).toBe(true);
+    const g = extrudeMask(m, o);
+    expect(performance.now() - t0).toBeLessThan(15000); // ~1.5 s
+    expect(computeMeshStats(g).watertight).toBe(true);
+  });
+
+  it('keeps holes inside their part when the point cap forces coarse outlines', () => {
+    // 32² checker of 4 px squares: 1 part with 18 holes. A tiny maxPoints used
+    // to collapse the part to a triangle leaving half of the holes outside it.
+    const m = maskOf(32, 32, (x, y) => (Math.floor(x / 4) + Math.floor(y / 4)) % 2 === 1);
+    for (const maxPoints of [10, 57]) {
+      const o = opts({ smooth: 16, maxPoints });
+      const groups = traceOutline(m, o);
+      expect(groups.reduce((n, g) => n + g.holes.length, 0)).toBe(18);
+      for (const g of groups) for (const h of g.holes) expect(pointInPolygon(h[0][0], h[0][1], g.outer)).toBe(true);
+      expect(computeMeshStats(extrudeOutline(groups, 32, 32, o)).watertight).toBe(true);
+    }
+  });
+
+  it('fits the bevel quickly on a part with thousands of holes', () => {
+    const outer: Point[] = [[0, 0], [0, 100], [100, 100], [100, 0]];
+    const holes: Point[][] = [];
+    for (let j = 0; j < 45; j++) for (let i = 0; i < 45; i++) {
+      const x = 1 + i * 2.2, y = 1 + j * 2.2;
+      holes.push([[x, y], [x + 1, y], [x + 1, y + 1], [x, y + 1]]);
+    }
+    const t0 = performance.now();
+    const fit = fitBevel([outer, ...holes], 0.3);
+    expect(performance.now() - t0).toBeLessThan(600); // ~70 ms; all-pairs point-in-polygon took ~1.6 s
+    expect(fit.size).toBe(0.3);
+    expect(fitBevel([outer, ...holes], 1).size).toBeLessThan(0.6); // 1.2 wide bars
   });
 
   it('is fast enough on 1024²', () => {

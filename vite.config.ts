@@ -1,10 +1,28 @@
 /// <reference types="vitest/config" />
-import { defineConfig, loadEnv } from 'vite';
+import { readFileSync } from 'node:fs';
+import { parseEnv } from 'node:util';
+import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-export default defineConfig(({ mode }) => {
-  // Shell variables win over .env (same rule as server/index.ts).
-  const env = { ...loadEnv(mode, process.cwd(), ''), ...process.env };
+/**
+ * Settings shared with the API server (PORT, CROSS_ORIGIN_ISOLATION), read
+ * exactly like server/index.ts does: ./.env only (process.loadEnvFile()), shell
+ * variables win. Not Vite's loadEnv, which also reads .env.local and
+ * .env.[mode](.local) and would make the proxy disagree with the server.
+ * (Vite still loads VITE_* browser variables from all of those files itself.)
+ */
+function serverEnv(): NodeJS.Dict<string> {
+  let file: NodeJS.Dict<string> = {};
+  try {
+    file = parseEnv(readFileSync('.env', 'utf8'));
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+  }
+  return { ...file, ...process.env };
+}
+
+export default defineConfig(() => {
+  const env = serverEnv();
   const apiTarget = `http://localhost:${Number(env.PORT || 8787)}`;
   // Opt-in (same flag as the production server, see server/app.ts): cross-origin
   // isolation lets onnxruntime-web use multi-threaded WASM for the ML drivers.

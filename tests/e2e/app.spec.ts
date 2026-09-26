@@ -316,18 +316,23 @@ test.describe('studio', () => {
     const glb = buildCubeGlb();
     let polls = 0;
     let created: { method: string; key?: string; contentType?: string } | null = null;
+    // The server refuses task requests without our client header (cross-site guard, server/app.ts).
+    const clientHeaders: (string | undefined)[] = [];
     await page.route('**/api/tripo/status', (r) => r.fulfill({ json: { configured: false } }));
     await page.route('**/api/tripo/tasks', (r) => {
       const headers = r.request().headers();
+      clientHeaders.push(headers['x-3dmarker-client']);
       created = { method: r.request().method(), key: headers['x-tripo-key'], contentType: headers['content-type'] };
       return r.fulfill({ json: { taskId: 'task-e2e-1' } });
     });
-    await page.route('**/api/tripo/tasks/task-e2e-1', (r) =>
-      r.fulfill({ json: ++polls < 2 ? { status: 'running', progress: 40 } : { status: 'success', progress: 100 } }),
-    );
-    await page.route('**/api/tripo/tasks/task-e2e-1/model', (r) =>
-      r.fulfill({ body: Buffer.from(glb), headers: { 'content-type': 'model/gltf-binary', 'content-length': String(glb.byteLength) } }),
-    );
+    await page.route('**/api/tripo/tasks/task-e2e-1', (r) => {
+      clientHeaders.push(r.request().headers()['x-3dmarker-client']);
+      return r.fulfill({ json: ++polls < 2 ? { status: 'running', progress: 40 } : { status: 'success', progress: 100 } });
+    });
+    await page.route('**/api/tripo/tasks/task-e2e-1/model', (r) => {
+      clientHeaders.push(r.request().headers()['x-3dmarker-client']);
+      return r.fulfill({ body: Buffer.from(glb), headers: { 'content-type': 'model/gltf-binary', 'content-length': String(glb.byteLength) } });
+    });
 
     await open(page);
     await loadSample(page, SAMPLE.mascot);
@@ -340,12 +345,38 @@ test.describe('studio', () => {
     await expect(page.getByTestId('mesh-stats')).toHaveAttribute('data-watertight', 'true');
     expect(created).toMatchObject({ method: 'POST', key: 'tsk_e2e_test_key', contentType: expect.stringMatching(/^multipart\/form-data/) });
     expect(polls).toBeGreaterThanOrEqual(2);
+    expect(clientHeaders.length).toBeGreaterThanOrEqual(polls + 2);
+    expect(clientHeaders.every((h) => h === '1')).toBe(true);
     const s = await renderStats(page);
     expectSensibleRender(s, { minCoverage: 0.02, minHues: 3 });
     await page.screenshot({ path: `${SHOTS}/tripo-mocked-cube.png` });
     // The secret key is never persisted.
     const stored = await page.evaluate(() => JSON.stringify(Object.entries(localStorage)));
     expect(stored).not.toContain('tsk_e2e_test_key');
+  });
+
+  test('switching the driver does not re-mesh the model on screen', async ({ page }) => {
+    await open(page);
+    await loadSample(page, SAMPLE.mascot);
+    await page.getByTestId('driver-select').selectOption('silhouette-inflate');
+    const tris = await generate(page);
+    const stats = page.getByTestId('mesh-stats');
+    await expect(stats).toHaveAttribute('data-watertight', 'true');
+    const mode = page.getByTestId('mesh-section').getByTestId('param-mode').locator('select');
+    await expect(mode).toHaveValue('double');
+    await page.getByTestId('driver-select').selectOption('depth-anything-v2-small');
+    await expect(page.getByTestId('mesh-pending')).toBeVisible();
+    await page.waitForTimeout(500); // longer than the re-mesh debounce
+    await expect(mode).toHaveValue('double');
+    expect(await triangles(page)).toBe(tris);
+    await expect(stats).toHaveAttribute('data-watertight', 'true');
+    // Extrude results cannot be re-meshed: no "Live" mesh form for them, even with a depth driver selected.
+    await page.getByTestId('driver-select').selectOption('silhouette-extrude');
+    await expect(page.getByTestId('mesh-live')).toBeVisible(); // the inflate model on screen still re-meshes
+    await generate(page);
+    await page.getByTestId('driver-select').selectOption('luminance-heightmap');
+    await expect(page.getByTestId('mesh-section')).toBeVisible();
+    await expect(page.getByTestId('mesh-live')).toHaveCount(0);
   });
 
   test('language toggle switches visible text TR ↔ EN', async ({ page }) => {
@@ -368,3 +399,69 @@ test.describe('studio', () => {
     await expect(page.getByTestId('generate')).toContainText('3D Oluştur');
   });
 });
+
+test.describe('phone layout', () => {
+  test.use({ viewport: { width: 375, height: 812 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+
+  for (const lang of ['en', 'tr'] as const) {
+    test(`no horizontal page overflow at 375 px (${lang})`, async ({ page }) => {
+      await page.addInitScript((l) => localStorage.setItem('3dmarker:settings', JSON.stringify({ lang: l })), lang);
+      await page.goto('/');
+      await expect(page.getByTestId('driver-table')).toBeAttached();
+      await expect(page.locator('html')).toHaveAttribute('lang', lang);
+      const m = await page.evaluate(() => ({
+        inner: window.innerWidth,
+        scroll: document.documentElement.scrollWidth,
+        client: document.documentElement.clientWidth,
+      }));
+      // With mobile emulation the layout viewport grows to the content width if anything overflows.
+      expect(m.inner).toBe(375);
+      expect(m.scroll).toBeLessThanOrEqual(m.client);
+    });
+  }
+
+  test('a long error keeps the sticky Generate footer compact', async ({ page, context }) => {
+    await context.route(/huggingface\.co|hf\.co|cdn\.jsdelivr\.net/, (r) => r.abort('internetdisconnected'));
+    await page.goto('/');
+    await expect(page.getByTestId('driver-select')).toBeVisible();
+    await page.getByTestId('lang-tr').click();
+    await loadSample(page, SAMPLE.landscape);
+    await page.getByTestId('driver-select').selectOption('depth-anything-v2-small');
+    await page.getByTestId('generate').click();
+    const alert = page.getByTestId('error');
+    await expect(alert).toBeVisible({ timeout: 45_000 });
+    for (const lang of ['tr', 'en'] as const) {
+      await page.getByTestId(`lang-${lang}`).click();
+      const footer = await page.locator('.generate-panel').evaluate((el) => el.getBoundingClientRect().height);
+      expect(footer, `footer height (${lang})`).toBeLessThan(240);
+      await expect(alert.getByRole('button')).toBeInViewport();
+    }
+    await page.screenshot({ path: `${SHOTS}/phone-ml-error.png` });
+  });
+});
+
+for (const scheme of ['light', 'dark'] as const) {
+  test.describe(`OS ${scheme} colour scheme`, () => {
+    test.use({ colorScheme: scheme });
+    const other = scheme === 'light' ? 'dark' : 'light';
+    const savedTheme = (page: Page) => page.evaluate(() => JSON.parse(localStorage.getItem('3dmarker:settings') ?? '{}').theme as unknown);
+
+    test('the pre-paint script follows it when no theme is saved', async ({ page }) => {
+      await page.route('**/src/main.tsx', (r) => r.abort()); // the inline script alone, no React
+      await page.goto('/');
+      await expect(page.locator('html')).toHaveAttribute('data-theme', scheme);
+    });
+
+    test('a first visit follows it without persisting it; a toggle is persisted', async ({ page }) => {
+      await page.goto('/');
+      await expect(page.getByTestId('driver-select')).toBeVisible();
+      await expect(page.locator('html')).toHaveAttribute('data-theme', scheme);
+      expect(await savedTheme(page)).toBeUndefined();
+      await page.getByTestId('theme-toggle').click();
+      await expect(page.locator('html')).toHaveAttribute('data-theme', other);
+      await expect.poll(() => savedTheme(page)).toBe(other);
+      await page.reload();
+      await expect(page.locator('html')).toHaveAttribute('data-theme', other);
+    });
+  });
+}

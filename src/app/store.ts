@@ -3,10 +3,10 @@
  * persisted parts. Heavy three.js objects live outside the state (see
  * useStudio); this module stays pure and Node-testable.
  */
-import type { Driver, I18nText, Lang, Mask, ParamValue, ParamValues, Progress, RGBAImage } from '../core/types';
+import type { Availability, Driver, I18nText, Lang, Mask, ParamValue, ParamValues, Progress, RGBAImage } from '../core/types';
 import { defaultParams } from '../core/types';
 import type { MeshStats } from '../core/mesh/stats';
-import { MESH_PARAMS } from '../core/mesh/options';
+import { MESH_PARAMS, type MeshMode } from '../core/mesh/options';
 import { detectLang, type UIKey } from './i18n';
 import { suggestedMeshMode } from './driverMeta';
 import { isBackgroundMode, type BackgroundMode, type MaskNote, type SourceImage } from './pipeline';
@@ -37,6 +37,8 @@ export interface ResultInfo {
 export interface AppState {
   lang: Lang;
   theme: Theme;
+  /** True once the theme came from the user (stored or toggled); otherwise it follows the OS and is not persisted. */
+  explicitTheme: boolean;
   source: SourceImage | null;
   loadingImage: boolean;
   bgMode: BackgroundMode;
@@ -51,6 +53,12 @@ export interface AppState {
   meshParams: ParamValues;
   /** Shown once after the mesh mode was auto-set for the selected driver. */
   meshNotice: I18nText | null;
+  /**
+   * Mesh mode suggested for the selected driver while a re-meshable result
+   * of another run is on screen: applied by the next generation (and on its
+   * jobDone) instead of silently re-meshing the displayed model. Not persisted.
+   */
+  pendingMeshMode: MeshMode | null;
   status: JobStatus;
   progress: Progress | null;
   error: I18nText | null;
@@ -102,7 +110,7 @@ export function reducer(state: AppState, action: Action): AppState {
       return { ...state, lang: action.lang };
     case 'setTheme':
       // The viewer background follows the theme (the viewer toolbar can still override it).
-      return { ...state, theme: action.theme, view: { ...state.view, darkBackground: action.theme === 'dark' } };
+      return { ...state, theme: action.theme, explicitTheme: true, view: { ...state.view, darkBackground: action.theme === 'dark' } };
     case 'imageLoading':
       return { ...state, loadingImage: true, error: null };
     case 'imageLoaded':
@@ -119,7 +127,8 @@ export function reducer(state: AppState, action: Action): AppState {
     case 'imageFailed':
       return { ...state, loadingImage: false, error: action.error, errorTitle: 'imageErrorTitle' };
     case 'clearImage':
-      return { ...state, source: null, mask: null, maskNote: null, aiMask: null };
+      // Any load still in flight is superseded (useStudio bumps its sequence) and never reports back.
+      return { ...state, source: null, mask: null, maskNote: null, aiMask: null, loadingImage: false };
     case 'setBgMode': {
       // The cached AI mask survives mode switches so going back to 'ai' is instant.
       const cached = action.mode === 'ai' && state.aiMask && state.aiMask.source === state.source ? state.aiMask : null;
@@ -135,16 +144,22 @@ export function reducer(state: AppState, action: Action): AppState {
     case 'selectDriver': {
       const { driver } = action;
       const params = state.params[driver.id] ? state.params : { ...state.params, [driver.id]: defaultParams(driver.params) };
+      if (driver.id === state.driverId) return { ...state, params, meshNotice: null };
       const mode = suggestedMeshMode(driver);
       let meshParams = state.meshParams;
       let meshNotice: I18nText | null = null;
-      if (driver.id !== state.driverId && mode && meshParams.mode !== mode) {
-        meshParams = { ...meshParams, mode };
-        const option = MESH_PARAMS.find((p) => p.key === 'mode');
-        const label = option?.kind === 'select' ? option.options.find((o) => o.value === mode)?.label : undefined;
-        if (label) meshNotice = label;
+      let pendingMeshMode: MeshMode | null = null;
+      if (mode && meshParams.mode !== mode) {
+        // The mesh params drive the live re-mesh of the model on screen: while a
+        // depth result is shown, changing them would silently rebuild it (under
+        // its old driver's label / export name). Defer to the next generation.
+        if (state.result?.kind === 'depth') pendingMeshMode = mode;
+        else {
+          meshParams = { ...meshParams, mode };
+          meshNotice = meshModeLabel(mode);
+        }
       }
-      return { ...state, driverId: driver.id, params, meshParams, meshNotice };
+      return { ...state, driverId: driver.id, params, meshParams, meshNotice, pendingMeshMode };
     }
     case 'setParam': {
       const current = state.params[action.driverId] ?? {};
@@ -153,15 +168,27 @@ export function reducer(state: AppState, action: Action): AppState {
     case 'resetParams':
       return { ...state, params: { ...state.params, [action.driver.id]: defaultParams(action.driver.params) } };
     case 'setMeshParam':
-      return { ...state, meshParams: { ...state.meshParams, [action.key]: action.value }, meshNotice: null };
+      return {
+        ...state,
+        meshParams: { ...state.meshParams, [action.key]: action.value },
+        meshNotice: null,
+        // An explicit mode choice wins over the pending suggestion.
+        pendingMeshMode: action.key === 'mode' ? null : state.pendingMeshMode,
+      };
     case 'resetMeshParams':
-      return { ...state, meshParams: defaultParams(MESH_PARAMS), meshNotice: null };
+      return { ...state, meshParams: defaultParams(MESH_PARAMS), meshNotice: null, pendingMeshMode: null };
     case 'jobStart':
       return { ...state, status: 'running', progress: null, error: null };
     case 'jobProgress':
       return state.status === 'running' ? { ...state, progress: action.progress } : state;
     case 'jobDone': {
       const next: AppState = { ...state, status: 'done', progress: null, result: action.result };
+      // generate() built the new model with the pending mode; the params follow
+      // only now, so the previous model was never re-meshed while the job ran.
+      if (state.pendingMeshMode) {
+        next.meshParams = { ...state.meshParams, mode: state.pendingMeshMode };
+        next.pendingMeshMode = null;
+      }
       if (action.bgMode === 'ai') {
         next.aiMask = { source: action.source, mask: action.inputMask };
         if (state.source === action.source && state.bgMode === 'ai') {
@@ -186,6 +213,27 @@ export function reducer(state: AppState, action: Action): AppState {
   }
 }
 
+/** Localised label of a mesh mode, as shown in the mesh form's select. */
+export function meshModeLabel(mode: MeshMode): I18nText | null {
+  const option = MESH_PARAMS.find((p) => p.key === 'mode');
+  return (option?.kind === 'select' ? option.options.find((o) => o.value === mode)?.label : undefined) ?? null;
+}
+
+/** Mesh params for the next generation (the pending suggested mode applied). */
+export function meshParamsForJob(state: AppState): ParamValues {
+  return state.pendingMeshMode ? { ...state.meshParams, mode: state.pendingMeshMode } : state.meshParams;
+}
+
+/**
+ * Whether Generate may run: an image is loaded, no new image is being decoded
+ * and the driver is not known to be unavailable ('checking' does not block).
+ * Shared by the Generate button and the Ctrl/Cmd+Enter shortcut.
+ */
+export function canGenerate(state: AppState, availability: Availability | 'checking' | null): boolean {
+  const unavailable = !!availability && availability !== 'checking' && !availability.ok;
+  return !!state.source && !state.loadingImage && !unavailable;
+}
+
 interface StoredSettings {
   lang?: unknown;
   theme?: unknown;
@@ -207,7 +255,8 @@ export interface InitEnv {
 export function createInitialState(env: InitEnv): AppState {
   const settings = (loadJSON(env.store, 'settings') ?? {}) as StoredSettings;
   const lang: Lang = settings.lang === 'tr' || settings.lang === 'en' ? settings.lang : detectLang(env.languages);
-  const theme: Theme = settings.theme === 'light' || settings.theme === 'dark' ? settings.theme : env.prefersLight ? 'light' : 'dark';
+  const explicitTheme = settings.theme === 'light' || settings.theme === 'dark';
+  const theme: Theme = explicitTheme ? (settings.theme as Theme) : env.prefersLight ? 'light' : 'dark';
   const known = (id: unknown) => typeof id === 'string' && env.drivers.some((d) => d.id === id);
   const driverId = known(settings.driverId)
     ? (settings.driverId as string)
@@ -223,6 +272,7 @@ export function createInitialState(env: InitEnv): AppState {
   return {
     lang,
     theme,
+    explicitTheme,
     source: null,
     loadingImage: false,
     bgMode: isBackgroundMode(settings.bgMode) ? settings.bgMode : 'auto',
@@ -234,6 +284,7 @@ export function createInitialState(env: InitEnv): AppState {
     params,
     meshParams: sanitizeParams(MESH_PARAMS, loadJSON(env.store, 'mesh')),
     meshNotice: null,
+    pendingMeshMode: null,
     status: 'idle',
     progress: null,
     error: null,
@@ -244,14 +295,19 @@ export function createInitialState(env: InitEnv): AppState {
   };
 }
 
-/** Persist settings, mesh params and every driver's non-secret params. */
+/**
+ * Persist settings, mesh params and every driver's non-secret params. The
+ * theme is saved only once the user chose it, and the viewer background only
+ * when it differs from the theme's, so both keep following the OS otherwise.
+ */
 export function saveState(store: KeyValueStore | null, state: AppState, drivers: Driver[]): void {
+  const { darkBackground, ...view } = state.view;
   saveJSON(store, 'settings', {
     lang: state.lang,
-    theme: state.theme,
+    theme: state.explicitTheme ? state.theme : undefined,
     driverId: state.driverId,
     bgMode: state.bgMode,
-    view: state.view,
+    view: darkBackground === (state.theme === 'dark') ? view : state.view,
     stlSizeMm: state.stlSizeMm,
     showMask: state.showMask,
   });

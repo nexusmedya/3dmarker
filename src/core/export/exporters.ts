@@ -1,6 +1,7 @@
 /**
  * Export a three.js object to GLB / OBJ / STL / PLY using the stock
- * three.js exporters.
+ * three.js exporters (OBJ of meshes: an equivalent writer that yields to the
+ * event loop, see writeObjParts).
  *
  * Every format bakes the object's world transform (including its parents',
  * e.g. a viewer turntable) into the file, times an optional uniform scale.
@@ -18,8 +19,8 @@
  * hands the exporter a row-flipped copy instead. Float DataTextures are not
  * supported by GLTFExporter.
  */
-import { Matrix4, TextureSource } from 'three';
-import type { DataTexture, Material, Mesh, Object3D, Texture } from 'three';
+import { BufferAttribute, BufferGeometry, Matrix3, Matrix4, TextureSource, Vector3 } from 'three';
+import type { DataTexture, InterleavedBufferAttribute, Line, Material, Mesh, Object3D, Points, Texture } from 'three';
 import type { I18nText } from '../types';
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
 import { OBJExporter } from 'three/examples/jsm/exporters/OBJExporter.js';
@@ -77,11 +78,17 @@ export async function exportObject(object: Object3D, format: ExportFormat, opts:
       if (typeof (out as ArrayBuffer).byteLength !== 'number') throw new Error('GLTFExporter returned JSON instead of GLB');
       return new Blob([out as ArrayBuffer], { type });
     }
-    case 'obj':
+    case 'obj': {
+      let linesOrPoints = false;
+      root.traverse((o) => { linesOrPoints ||= !!((o as Line).isLine || (o as Points).isPoints); });
+      // Meshes only (every model this app builds): chunked, see writeObjParts.
+      if (!linesOrPoints) return new Blob(await writeObjParts(root), { type });
       return new Blob([new OBJExporter().parse(root)], { type });
+    }
     case 'stl':
       return new Blob([new STLExporter().parse(root, { binary: true })], { type });
     case 'ply': {
+      floatifyPlyAttributes(root);
       // Passing no onDone keeps the exporter synchronous (with one it schedules requestAnimationFrame).
       const noCallback = undefined as unknown as (res: ArrayBuffer) => void;
       const out = new PLYExporter().parse(root, noCallback, { binary: true, littleEndian: true });
@@ -89,6 +96,79 @@ export async function exportObject(object: Object3D, format: ExportFormat, opts:
       return new Blob([out], { type });
     }
   }
+}
+
+/** Let the browser paint and handle input between chunks of a long export. */
+const yieldToEventLoop = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+/**
+ * The OBJ text for the meshes under `root`, identical to three's OBJExporter
+ * (world transform baked, normals through the normal matrix, 1-based indices
+ * continuing across meshes) but built as Blob parts of ~16k lines, yielding
+ * to the event loop every ~40 ms. A million-triangle mesh is ~150 MB of text
+ * and seconds of string building, which in one piece froze the page (and the
+ * export spinner) and needed the whole file as a single string.
+ */
+export async function writeObjParts(root: Object3D): Promise<string[]> {
+  const parts: string[] = [];
+  let chunk = '', lines = 0, last = performance.now();
+  const push = (line: string) => {
+    chunk += line;
+    if (++lines === 16384) {
+      parts.push(chunk);
+      chunk = '';
+      lines = 0;
+    }
+  };
+  const pause = async () => {
+    if (performance.now() - last < 40) return;
+    await yieldToEventLoop();
+    last = performance.now();
+  };
+
+  const meshes: Mesh[] = [];
+  root.traverse((o) => { if ((o as Mesh).isMesh) meshes.push(o as Mesh); });
+  const v = new Vector3(), normalMatrix = new Matrix3();
+  let baseV = 0, baseT = 0, baseN = 0;
+  for (const mesh of meshes) {
+    const g = mesh.geometry;
+    const pos = g.getAttribute('position'), normal = g.getAttribute('normal'), uv = g.getAttribute('uv'), index = g.getIndex();
+    const nV = pos ? pos.count : 0, nT = uv ? uv.count : 0, nN = normal ? normal.count : 0;
+    push(`o ${mesh.name}\n`);
+    const mat = mesh.material as Material | Material[] | undefined;
+    if (mat && !Array.isArray(mat) && mat.name) push(`usemtl ${mat.name}\n`);
+    for (let i = 0; i < nV; i++) {
+      v.fromBufferAttribute(pos, i).applyMatrix4(mesh.matrixWorld);
+      push(`v ${v.x} ${v.y} ${v.z}\n`);
+      if ((i & 4095) === 4095) await pause();
+    }
+    for (let i = 0; i < nT; i++) {
+      push(`vt ${uv.getX(i)} ${uv.getY(i)}\n`);
+      if ((i & 4095) === 4095) await pause();
+    }
+    if (normal) normalMatrix.getNormalMatrix(mesh.matrixWorld);
+    for (let i = 0; i < nN; i++) {
+      v.fromBufferAttribute(normal, i).applyMatrix3(normalMatrix).normalize();
+      push(`vn ${v.x} ${v.y} ${v.z}\n`);
+      if ((i & 4095) === 4095) await pause();
+    }
+    const corner = (k: number) => {
+      const j = k + 1;
+      return normal || uv ? `${baseV + j}/${uv ? baseT + j : ''}${normal ? `/${baseN + j}` : ''}` : `${baseV + j}`;
+    };
+    const nCorners = index ? index.count : nV;
+    for (let t = 0, i = 0; i + 2 < nCorners; t++, i += 3) {
+      const a = index ? index.getX(i) : i, b = index ? index.getX(i + 1) : i + 1, c = index ? index.getX(i + 2) : i + 2;
+      push(`f ${corner(a)} ${corner(b)} ${corner(c)}\n`);
+      if ((t & 4095) === 4095) await pause();
+    }
+    baseV += nV;
+    baseT += nT;
+    baseN += nN;
+    await pause();
+  }
+  if (chunk) parts.push(chunk);
+  return parts;
 }
 
 /** File name for a download: the source name without its extension (sanitised) + the format's extension. */
@@ -146,6 +226,37 @@ export function makeTexturesExportable(root: Object3D): void {
     const mesh = o as Mesh;
     if (!mesh.isMesh) return;
     mesh.material = Array.isArray(mesh.material) ? mesh.material.map(fix) : fix(mesh.material);
+  });
+}
+
+/**
+ * PLYExporter declares each property with the type of the source array
+ * (short, char, ushort… for quantized glTF / KHR_mesh_quantization) but writes
+ * the de-normalised, transformed float values through it, truncating them.
+ * Give `root`'s meshes and points geometries whose position, normal and uv are
+ * plain Float32 copies instead. Only the affected geometries are replaced (a
+ * shallow copy sharing everything else); nothing is mutated, so call it on a
+ * clone (see bakeWorldTransform). Colours are scaled correctly by the exporter.
+ */
+export function floatifyPlyAttributes(root: Object3D): void {
+  const needsFloat = (a: BufferAttribute | InterleavedBufferAttribute | undefined) =>
+    !!a && (a.normalized || !(a.array instanceof Float32Array));
+  root.traverse((o) => {
+    const obj = o as Mesh | Points;
+    if (!(obj as Mesh).isMesh && !(obj as Points).isPoints) return;
+    const src = obj.geometry;
+    const names = ['position', 'normal', 'uv'].filter((n) => needsFloat(src.getAttribute(n)));
+    if (names.length === 0) return;
+    const g = new BufferGeometry();
+    g.setIndex(src.getIndex());
+    for (const [name, attr] of Object.entries(src.attributes)) g.setAttribute(name, attr);
+    for (const name of names) {
+      const a = src.getAttribute(name);
+      const out = new Float32Array(a.count * a.itemSize);
+      for (let i = 0; i < a.count; i++) for (let c = 0; c < a.itemSize; c++) out[i * a.itemSize + c] = a.getComponent(i, c);
+      g.setAttribute(name, new BufferAttribute(out, a.itemSize));
+    }
+    obj.geometry = g;
   });
 }
 

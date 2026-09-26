@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ImageLoadError, MAX_DECODE_SIDE, capSize, isRejectedType, loadImageFile } from './load';
+import { ImageLoadError, MAX_DECODE_SIDE, VECTOR_RASTER_SIDE, capSize, isRejectedType, loadImageFile } from './load';
 
 describe('capSize / isRejectedType', () => {
   it('caps the longest side without upscaling', () => {
@@ -40,6 +40,34 @@ function stubBrowser(width: number, height: number) {
   return { drawn, close };
 }
 
+/** <img> stand-in: a detached element reports its width / height attributes, else its natural size. */
+function stubImage(naturalWidth: number, naturalHeight: number) {
+  class FakeImage {
+    decoding = '';
+    src = '';
+    readonly naturalWidth = naturalWidth;
+    readonly naturalHeight = naturalHeight;
+    private w: number | null = null;
+    private h: number | null = null;
+    get width() {
+      return this.w ?? this.naturalWidth;
+    }
+    set width(v: number) {
+      this.w = v;
+    }
+    get height() {
+      return this.h ?? this.naturalHeight;
+    }
+    set height(v: number) {
+      this.h = v;
+    }
+    decode() {
+      return Promise.resolve();
+    }
+  }
+  vi.stubGlobal('Image', FakeImage);
+}
+
 describe('loadImageFile', () => {
   afterEach(() => vi.unstubAllGlobals());
 
@@ -51,7 +79,8 @@ describe('loadImageFile', () => {
     expect(img.data.length).toBe(30 * 20 * 4);
     expect(drawn).toEqual([[0, 0, 30, 20]]);
     expect(close).toHaveBeenCalledOnce();
-    expect(createImageBitmap).toHaveBeenCalledWith(expect.any(Blob), { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
+    // Colour profiles (Display-P3, Adobe RGB …) are converted to sRGB; alpha stays straight.
+    expect(createImageBitmap).toHaveBeenCalledWith(expect.any(Blob), { premultiplyAlpha: 'none', colorSpaceConversion: 'default' });
   });
 
   it('downscales giant images while drawing', async () => {
@@ -59,6 +88,33 @@ describe('loadImageFile', () => {
     const img = await loadImageFile(new Blob([], { type: 'image/png' }));
     expect([img.width, img.height]).toEqual([MAX_DECODE_SIDE, MAX_DECODE_SIDE / 2]);
     expect(drawn[0]).toEqual([0, 0, MAX_DECODE_SIDE, MAX_DECODE_SIDE / 2]);
+  });
+
+  it('draws straight to a smaller maxSide (no full-size intermediate)', async () => {
+    const { drawn } = stubBrowser(8000, 6000);
+    const img = await loadImageFile(new Blob([], { type: 'image/jpeg' }), 1024);
+    expect([img.width, img.height]).toEqual([1024, 768]);
+    expect(drawn).toEqual([[0, 0, 1024, 768]]);
+    expect(img.data.length).toBe(1024 * 768 * 4);
+  });
+
+  it('rasterises SVGs (decoded through <img>) at VECTOR_RASTER_SIDE, keeping the aspect ratio', async () => {
+    const cases: [type: string, natural: [number, number], expected: [number, number]][] = [
+      ['image/svg+xml', [24, 24], [VECTOR_RASTER_SIDE, VECTOR_RASTER_SIDE]], // small icon: scaled up
+      ['image/svg+xml', [300, 150], [VECTOR_RASTER_SIDE, VECTOR_RASTER_SIDE / 2]], // viewBox-only default size
+      ['image/svg+xml', [4000, 1000], [VECTOR_RASTER_SIDE, VECTOR_RASTER_SIDE / 4]], // large: scaled down
+      ['image/svg+xml', [0, 0], [VECTOR_RASTER_SIDE, VECTOR_RASTER_SIDE]], // no intrinsic size
+      ['image/png', [30, 20], [30, 20]], // rasters on the element path are never upscaled
+    ];
+    for (const [type, [nw, nh], expected] of cases) {
+      const { drawn } = stubBrowser(1, 1);
+      vi.stubGlobal('createImageBitmap', vi.fn(async () => Promise.reject(new Error('The source image could not be decoded.'))));
+      stubImage(nw, nh);
+      const img = await loadImageFile(new Blob(['<svg/>'], { type }));
+      expect([img.width, img.height], `${type} ${nw}×${nh}`).toEqual(expected);
+      expect(drawn).toEqual([[0, 0, ...expected]]);
+      vi.unstubAllGlobals();
+    }
   });
 
   it('rejects non-images with a bilingual error', async () => {

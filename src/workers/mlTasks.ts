@@ -18,11 +18,28 @@ import { alphaChannel } from '../core/preprocess/alphaMask';
 
 export type AnyPipeline = DepthEstimationPipeline | BackgroundRemovalPipeline;
 
-/** Browser defaults: never probe /models/ on our origin; fetch from the Hub and keep weights in the Cache API. */
+/** ORT wasm file URLs transformers.js picked at import time (jsDelivr); configureEnv reuses their file names. */
+let ortDefaultPaths: { mjs?: string | URL; wasm?: string | URL } | undefined;
+
+/**
+ * Browser defaults: never probe /models/ on our origin; fetch from the Hub and
+ * keep weights in the Cache API. ONNX Runtime's wasm is served by this app:
+ * the onnxruntime-web bundle transformers.js imports embeds the asyncify
+ * loader and references its .wasm with `new URL(..., import.meta.url)`, which
+ * Vite emits into /assets. transformers.js points both at jsDelivr instead;
+ * unsetting wasmPaths makes ORT use the bundled pair. The plain build (Safari
+ * < 26 without WebGPU) is not embedded, so it keeps the CDN paths.
+ */
 export function initEnv(): void {
   env.allowLocalModels = false;
   env.allowRemoteModels = true;
   env.useBrowserCache = typeof caches !== 'undefined';
+  const wasm = env.backends.onnx.wasm;
+  const cur = wasm?.wasmPaths;
+  if (wasm && cur && typeof cur === 'object') {
+    ortDefaultPaths = { ...cur };
+    if (String(cur.wasm).endsWith('.asyncify.wasm')) wasm.wasmPaths = undefined;
+  }
 }
 
 export function configureEnv(c: MlEnvConfig): void {
@@ -32,10 +49,11 @@ export function configureEnv(c: MlEnvConfig): void {
   if (c.useBrowserCache !== undefined) env.useBrowserCache = c.useBrowserCache && typeof caches !== 'undefined';
   const wasm = env.backends.onnx.wasm;
   if (c.wasmPrefix && wasm) {
-    // transformers.js already chose the right build (asyncify or plain) and
-    // pointed it at jsDelivr; keep the file names and swap the directory.
+    // transformers.js chose the right build (asyncify or plain) and pointed
+    // it at jsDelivr (initEnv switched asyncify to the bundled copy); keep
+    // the file names and swap the directory.
     const prefix = slash(c.wasmPrefix);
-    const cur = wasm.wasmPaths;
+    const cur = ortDefaultPaths ?? wasm.wasmPaths;
     const rebase = (u: string | URL | undefined) => (u ? prefix + String(u).split('/').pop() : undefined);
     wasm.wasmPaths = cur && typeof cur === 'object' ? { mjs: rebase(cur.mjs), wasm: rebase(cur.wasm) } : prefix;
   }

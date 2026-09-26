@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AbortError, defaultParams, type DriverInput, type ParamValues, type Progress } from '../../core/types';
 import { LocalizedError } from '../heuristic/inflate';
-import { MAX_IMAGE_BYTES } from './api';
+import { CLIENT_HEADER, MAX_IMAGE_BYTES } from './api';
 import { buildTaskForm, createTripoDriver, isGlb, tripoDriver, tripoParamsFrom } from './tripo';
 
 function glb(size = 256): Uint8Array<ArrayBuffer> {
@@ -151,6 +151,27 @@ describe('tripoDriver', () => {
     expect((c as LocalizedError).i18n.en).toMatch(/cancelled/);
   });
 
+  it('localises the failure reason instead of echoing the English detail', async () => {
+    const cases: [string, string, RegExp][] = [
+      ['failed', 'Tripo could not generate a model from this image', /^Tripo3D bu görselden model üretemedi\.$/],
+      ['banned', 'The image was rejected by Tripo content moderation', /içerik denetimi/],
+      ['expired', 'The task expired on Tripo', /süresi doldu/],
+    ];
+    const en: string[] = [];
+    for (const [reason, error, tr] of cases) {
+      stubServer({ states: [json({ status: 'failed', progress: 3, reason, error })] });
+      const e = (await failure(driver().run(input().inp))) as LocalizedError;
+      expect(e.i18n.tr).toMatch(tr);
+      expect(e.i18n.tr).not.toMatch(/Tripo could|rejected|expired on/);
+      en.push(e.i18n.en);
+    }
+    expect(en).toEqual([
+      'Tripo3D could not generate a model from this image.',
+      'The image was rejected by Tripo3D content moderation.',
+      'The task expired on Tripo3D.',
+    ]);
+  });
+
   it('maps server errors on task creation', async () => {
     const cases: [Response, RegExp][] = [
       [json({ error: 'no key' }, 401), /No Tripo3D key is configured/],
@@ -262,6 +283,115 @@ describe('tripoDriver', () => {
     stubServer({ model: () => new Response(glb(64)) });
     const res = await driver().run(input().inp);
     expect(res.kind === 'model' && res.glb.byteLength).toBe(64);
+  });
+
+  it('sends the client header on every request', async () => {
+    const { calls } = stubServer();
+    await driver().run(input().inp);
+    expect(calls.length).toBeGreaterThan(2);
+    expect(calls.every((c) => c.headers.get(CLIENT_HEADER) === '1')).toBe(true);
+  });
+
+  it('rejects a malformed own key before sending anything', async () => {
+    const { calls } = stubServer();
+    for (const apiKey of ['tsk_abc…', '“tsk_abcdefgh”', 'tsk abcdefgh', 'short']) {
+      const e = await failure(driver().run(input({ apiKey }).inp));
+      expect(e, apiKey).toBeInstanceOf(LocalizedError);
+      expect((e as LocalizedError).i18n.en).toMatch(/invalid format/);
+      expect((e as LocalizedError).i18n.en).not.toMatch(/Could not reach/);
+      expect((e as LocalizedError).i18n.tr).toMatch(/geçersiz biçimde/);
+    }
+    expect(calls).toHaveLength(0);
+    // Invisible characters picked up when copying are dropped.
+    await driver().run(input({ apiKey: '\u200Btsk_abcdefgh\u200B\uFEFF ' }).inp);
+    expect(calls[0].headers.get('x-tripo-key')).toBe('tsk_abcdefgh');
+  });
+
+  describe('model download retries', () => {
+    const modelCalls = (calls: Call[]) => calls.filter((c) => c.url.endsWith('/model')).length;
+    /** 256-byte GLB whose body breaks off after the first half. */
+    const broken = () => {
+      const data = glb();
+      let sent = false;
+      const body = new ReadableStream<Uint8Array>({
+        pull(c) {
+          if (sent) return c.error(new TypeError('terminated'));
+          sent = true;
+          c.enqueue(data.slice(0, 128));
+        },
+      });
+      return new Response(body, { headers: { 'content-length': '256' } });
+    };
+    const good = () => new Response(glb(), { headers: { 'content-length': '256' } });
+    const sequence = (...replies: (() => Response)[]) => {
+      let n = 0;
+      return () => replies[Math.min(n++, replies.length - 1)]();
+    };
+
+    it('retries a download that breaks off, without creating a new task', async () => {
+      const { calls } = stubServer({ model: sequence(broken, good) });
+      const { inp, progress } = input();
+      const res = await driver().run(inp);
+      expect(res.kind === 'model' && new Uint8Array(res.glb)).toEqual(glb());
+      expect(modelCalls(calls)).toBe(2);
+      expect(calls.filter((c) => c.method === 'POST')).toHaveLength(1);
+      const ratios = progress.map((p) => p.ratio ?? 0);
+      expect(ratios).toEqual([...ratios].sort((a, b) => a - b));
+      expect(ratios.at(-1)).toBe(1);
+    });
+
+    it('retries 5xx and 429 answers', async () => {
+      const { calls } = stubServer({
+        model: sequence(
+          () => json({ error: 'Model download failed (HTTP 503)' }, 502),
+          () => json({ error: 'Too many requests' }, 429, { 'retry-after': '0' }),
+          good,
+        ),
+      });
+      expect((await driver().run(input().inp)).kind).toBe('model');
+      expect(modelCalls(calls)).toBe(3);
+    });
+
+    it('says the download broke off (not that the server is unreachable) once the retries are used up', async () => {
+      const { calls } = stubServer({ model: broken });
+      const e = await failure(createTripoDriver({ pollIntervalMs: 1, maxDownloadAttempts: 3 }).run(input().inp));
+      expect((e as LocalizedError).i18n.en).toMatch(/download was interrupted/);
+      expect((e as LocalizedError).i18n.en).not.toMatch(/API server/);
+      expect((e as LocalizedError).i18n.tr).toMatch(/indirmesi yarıda kesildi/);
+      expect(modelCalls(calls)).toBe(3);
+
+      const down = stubServer({ model: new TypeError('Failed to fetch') });
+      const d = await failure(driver().run(input().inp));
+      expect((d as LocalizedError).i18n.en).toMatch(/download was interrupted/);
+      expect(modelCalls(down.calls)).toBe(3);
+    });
+
+    it('does not retry definitive answers', async () => {
+      for (const [reply, re] of [
+        [json({ error: 'Task not found' }, 404), /Task not found/],
+        [json({ error: 'Tripo rejected the API key' }, 401), /No Tripo3D key/],
+        [new Response('<html>oops</html>'), /valid GLB/],
+      ] as const) {
+        const { calls } = stubServer({ model: reply });
+        const e = await failure(driver().run(input().inp));
+        expect((e as LocalizedError).i18n.en).toMatch(re);
+        expect(modelCalls(calls)).toBe(1);
+      }
+    });
+
+    it('can be aborted while waiting to retry', async () => {
+      const { calls } = stubServer({ model: broken });
+      const { inp, ctl } = input();
+      const d = createTripoDriver({ pollIntervalMs: 1, downloadRetryDelayMs: 10_000 });
+      const p = d.run({
+        ...inp,
+        onProgress: (pr) => {
+          if (pr.label.en === 'Downloading model') setTimeout(() => ctl.abort(), 20);
+        },
+      });
+      expect(await failure(p)).toBeInstanceOf(AbortError);
+      expect(modelCalls(calls)).toBe(1);
+    });
   });
 });
 

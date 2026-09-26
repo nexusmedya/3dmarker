@@ -2,9 +2,11 @@
 import { useState } from 'react';
 import { Box3, Vector3 } from 'three';
 import type { Object3D } from 'three';
+import type { I18nText } from '../core/types';
 import { EXPORT_FORMATS, downloadBlob, exportObject, type ExportFormat } from '../core/export/exporters';
 import type { ResultInfo } from '../app/store';
 import { modelFileName, errorToText, formatSeconds } from '../app/format';
+import { yieldToPaint } from '../app/throttle';
 import { getDriver } from '../drivers';
 import { useI18n } from './i18n';
 import { IconAlert, IconCheck, IconDownload, IconInfo } from './icons';
@@ -48,7 +50,8 @@ export function MeshStatsLine({ result }: { result: ResultInfo }) {
 export function ExportBar({ result, getObject, stlSizeMm, onStlSize, disabled }: Props) {
   const { t, tx } = useI18n();
   const [busy, setBusy] = useState<ExportFormat | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  // Kept bilingual and localised at render, so a language switch updates it.
+  const [error, setError] = useState<I18nText | null>(null);
 
   const run = async (format: ExportFormat) => {
     const obj = getObject();
@@ -56,6 +59,8 @@ export function ExportBar({ result, getObject, stlSizeMm, onStlSize, disabled }:
     setBusy(format);
     setError(null);
     try {
+      // STL / PLY (and most of GLB) export synchronously: paint the spinner first.
+      await yieldToPaint();
       let scale = 1;
       if (format === 'stl') {
         const size = new Box3().setFromObject(obj).getSize(new Vector3());
@@ -66,7 +71,7 @@ export function ExportBar({ result, getObject, stlSizeMm, onStlSize, disabled }:
       downloadBlob(blob, modelFileName(result.sourceName, result.driverId, format));
     } catch (e) {
       console.error(e);
-      setError(t('exportFailed', { msg: tx(errorToText(e)) }));
+      setError(errorToText(e));
     } finally {
       setBusy(null);
     }
@@ -115,7 +120,7 @@ export function ExportBar({ result, getObject, stlSizeMm, onStlSize, disabled }:
       </div>
       {error && (
         <p className="note note-danger small" role="alert">
-          <IconAlert size={14} /> {error}
+          <IconAlert size={14} /> {t('exportFailed', { msg: tx(error) })}
         </p>
       )}
     </div>

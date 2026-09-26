@@ -1,7 +1,7 @@
 /** 3D Marker: top bar, studio (controls + viewer) and the landing below. */
 import { useCallback } from 'react';
+import { t } from './app/i18n';
 import { useStudio } from './ui/useStudio';
-import { useAvailability } from './ui/useAvailability';
 import { LangProvider } from './ui/i18n';
 import { TopBar } from './ui/TopBar';
 import { ControlPanel } from './ui/ControlPanel';
@@ -11,8 +11,7 @@ import { Landing } from './ui/Landing';
 
 export default function App() {
   const studio = useStudio();
-  const { state, driver, model, geometryVersion, coreRef, actions } = studio;
-  const availability = useAvailability(driver);
+  const { state, model, geometryVersion, coreRef, actions } = studio;
   const running = state.status === 'running';
   const getExportObject = useCallback(() => coreRef.current?.getExportObject() ?? null, [coreRef]);
 
@@ -25,8 +24,11 @@ export default function App() {
     <LangProvider value={state.lang}>
       <TopBar theme={state.theme} onLang={actions.setLang} onTheme={actions.setTheme} />
       <main>
+        <h1 className="visually-hidden">
+          {t('appName', state.lang)} — {t('tagline', state.lang)}
+        </h1>
         <section id="studio" className="studio">
-          <ControlPanel studio={studio} availability={availability} />
+          <ControlPanel studio={studio} />
           <div className="stage">
             <Viewer
               model={model}

@@ -29,10 +29,11 @@ import { fitRGBA, hasTransparency, maskArea, maskFromAlpha } from '../core/image
 import { autoMaskFromBorder } from '../core/image/autoMask';
 import { loadImageFile } from '../core/image/load';
 import { removeBackground } from '../core/preprocess/removeBackground';
-import { buildGeometryFromDepth } from '../core/mesh/buildFromDepth';
+import { buildGeometryFromDepth, type DepthMeshUserData } from '../core/mesh/buildFromDepth';
 import { computeMeshStats, type MeshStats } from '../core/mesh/stats';
 import { meshOptionsFromParams, type MeshMode } from '../core/mesh/options';
 import { disposeObject } from './dispose';
+import { yieldToPaint } from './throttle';
 import { UI } from './i18n';
 
 /** Longest side of the working image handed to drivers and used as texture. */
@@ -57,9 +58,11 @@ export interface SourceImage {
 export async function prepareSource(
   file: Blob,
   name: string,
-  load: (f: Blob) => Promise<RGBAImage> = loadImageFile,
+  load: (f: Blob, maxSide?: number) => Promise<RGBAImage> = loadImageFile,
 ): Promise<SourceImage> {
-  const decoded = await load(file);
+  // Decode straight to the working size (the full-size pixels are never used;
+  // cloud drivers upload the original file); fitRGBA is a no-op safety net then.
+  const decoded = await load(file, WORKING_MAX_SIDE);
   return { name, file, image: fitRGBA(decoded, WORKING_MAX_SIDE) };
 }
 
@@ -184,6 +187,26 @@ export interface BuiltModel {
   remesh: ((meshParams: ParamValues) => MeshStats) | null;
 }
 
+/**
+ * Stats of a buildGeometryFromDepth geometry read from its layout, instead of
+ * computeMeshStats' welded edge check (more than half the cost of a re-mesh
+ * at high resolution). Groups: 0 = front (3·nTri indices), 1 = back (same),
+ * 2 = walls (6·nWall); the closed modes use 2·nF + 4·nWall vertices, walls
+ * reusing front / back positions. Closed modes are 2-manifold by
+ * construction (pinch vertices are removed), relief is an open surface.
+ * pipeline.test.ts pins this to computeMeshStats.
+ */
+export function depthMeshStats(g: BufferGeometry): MeshStats {
+  const mode = (g.userData as Partial<DepthMeshUserData>).mode;
+  const front = g.groups[0];
+  if (!mode || !front || front.start !== 0) return computeMeshStats(g); // not a depth mesh
+  const count = g.getAttribute('position')?.count ?? 0;
+  const nTri = front.count / 3;
+  if (mode === 'relief') return { vertices: count, triangles: nTri, watertight: false };
+  const nWall = (g.groups[2]?.count ?? 0) / 6;
+  return { vertices: count - 4 * nWall, triangles: 2 * nTri + 2 * nWall, watertight: nTri > 0 };
+}
+
 /** Stable key of the effective mesh options (equal options → equal key). */
 export function meshKeyOf(meshParams: ParamValues): string {
   return JSON.stringify(meshOptionsFromParams(meshParams));
@@ -191,12 +214,17 @@ export function meshKeyOf(meshParams: ParamValues): string {
 
 export function buildDepthModel(depth: DepthMap, mask: Mask | null, texture: Texture | null, meshParams: ParamValues): BuiltModel {
   const opts = meshOptionsFromParams(meshParams);
-  const mesh = new Mesh(buildGeometryFromDepth(depth, mask, opts), createSurfaceMaterial(texture, sideForMode(opts.mode)));
+  // First: throws LocalizedError(EMPTY_MESH) when the silhouette vanishes on the grid.
+  const geometry = buildGeometryFromDepth(depth, mask, opts);
+  // Keep the surface material itself: the viewer swaps `mesh.material` for
+  // display materials (clay / wireframe / texture off) and exports this one.
+  const material = createSurfaceMaterial(texture, sideForMode(opts.mode));
+  const mesh = new Mesh(geometry, material);
   mesh.name = 'surface';
   const model: BuiltModel = {
     kind: 'depth',
     object: mesh,
-    stats: computeMeshStats(mesh.geometry),
+    stats: depthMeshStats(mesh.geometry),
     depth,
     mask,
     meshKey: meshKeyOf(meshParams),
@@ -206,13 +234,12 @@ export function buildDepthModel(depth: DepthMap, mask: Mask | null, texture: Tex
       const old = mesh.geometry;
       mesh.geometry = next;
       old.dispose();
-      const material = mesh.material as MeshStandardMaterial;
       const side = sideForMode(o.mode);
       if (material.side !== side) {
         material.side = side;
         material.needsUpdate = true;
       }
-      model.stats = computeMeshStats(next);
+      model.stats = depthMeshStats(next);
       model.meshKey = meshKeyOf(p);
       return model.stats;
     },
@@ -320,8 +347,6 @@ export interface PipelineResult {
   inputMask: Mask | null;
 }
 
-const yieldToUi = () => new Promise<void>((r) => setTimeout(r, 0));
-
 export async function runPipeline(req: PipelineRequest): Promise<PipelineResult> {
   const { source, signal, onProgress } = req;
   throwIfAborted(signal);
@@ -339,8 +364,10 @@ export async function runPipeline(req: PipelineRequest): Promise<PipelineResult>
   });
   throwIfAborted(signal);
   onProgress({ label: result.kind === 'model' ? UI.loadingGlb : UI.buildingMesh });
-  await yieldToUi();
+  await yieldToPaint(); // show the label before the synchronous build
   const model = await buildModel(result, source.image, inputMask, req.meshParams);
+  // Let a Cancel / Esc that queued up during the build run before the job completes.
+  await yieldToPaint();
   if (signal.aborted) {
     disposeObject(model.object);
     throw new AbortError();

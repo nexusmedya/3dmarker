@@ -5,6 +5,7 @@
  */
 import type { DepthMap, Driver, DriverInput, DriverResult, Mask, ParamSpec, RGBAImage } from '../../core/types';
 import { throwIfAborted } from '../../core/types';
+import { yieldToPaint } from '../../core/yield';
 import { blurFloat, luminance, resizeMask } from '../../core/image/ops';
 
 export type HeightSource = 'luminance' | 'lightness' | 'saturation';
@@ -128,8 +129,6 @@ export function luminanceDepth(img: RGBAImage, mask: Mask | null, opts: Luminanc
   return { width: w, height: h, data: out };
 }
 
-const tick = () => new Promise<void>((r) => setTimeout(r, 0));
-
 const PARAMS: ParamSpec[] = [
   {
     kind: 'select',
@@ -203,7 +202,7 @@ export const luminanceDriver: Driver = {
     const { image, signal, onProgress } = input;
     throwIfAborted(signal);
     onProgress({ label: { tr: 'Yükseklik haritası hesaplanıyor', en: 'Computing height map' }, ratio: 0.2 });
-    await tick();
+    await yieldToPaint(); // show the label during the synchronous step
     throwIfAborted(signal);
     const mask =
       input.mask && (input.mask.width !== image.width || input.mask.height !== image.height)

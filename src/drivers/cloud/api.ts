@@ -14,6 +14,16 @@ export const taskModelPath = (id: string) => `${taskPath(id)}/model`;
 /** Header carrying the user's own Tripo key (used only when the server has none). */
 export const TRIPO_KEY_HEADER = 'x-tripo-key';
 
+/**
+ * Sent (with CLIENT_HEADER_VALUE) on every task request by our own client.
+ * A custom header cannot come from a plain HTML form, and any other site's
+ * fetch that sets it needs a CORS preflight the server never approves, so it
+ * blocks cross-site use of the server's key even where browsers omit
+ * Sec-Fetch-Site (plain-HTTP origins, older browsers).
+ */
+export const CLIENT_HEADER = 'x-3dmarker-client';
+export const CLIENT_HEADER_VALUE = '1';
+
 /** Largest accepted upload. */
 export const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
@@ -54,11 +64,17 @@ export interface CreateTaskFields {
   face_limit?: string;
 }
 
+/** Why a task ended with status 'failed' (localised by the client). */
+export type TaskFailureReason = 'failed' | 'banned' | 'expired';
+
 /** GET /api/tripo/tasks/:id */
 export interface TaskStateResponse {
   status: TaskStatus;
   /** 0..100 */
   progress: number;
+  /** Set with status 'failed'. */
+  reason?: TaskFailureReason;
+  /** English detail for logs and older clients. */
   error?: string;
 }
 

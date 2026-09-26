@@ -1,8 +1,8 @@
 /** Left column of the studio: image, background, driver, parameters, mesh options, generate. */
-import type { Availability } from '../core/types';
 import { MESH_PARAMS } from '../core/mesh/options';
 import { BACKGROUND_MODES, type BackgroundMode } from '../app/pipeline';
 import type { UIKey } from '../app/i18n';
+import { canGenerate, meshModeLabel } from '../app/store';
 import type { Studio } from './useStudio';
 import { useI18n } from './i18n';
 import { UploadCard } from './UploadCard';
@@ -20,16 +20,19 @@ const BG_LABELS: Record<BackgroundMode, UIKey> = {
 
 interface Props {
   studio: Studio;
-  availability: Availability | 'checking' | null;
 }
 
-export function ControlPanel({ studio, availability }: Props) {
+export function ControlPanel({ studio }: Props) {
   const { t, tx } = useI18n();
-  const { state, driver, actions } = studio;
+  const { state, driver, availability, model, actions } = studio;
   const running = state.status === 'running';
   const params = state.params[driver.id] ?? {};
   const unavailable = availability && availability !== 'checking' && !availability.ok ? availability : null;
-  const blocked = !!unavailable;
+  // Mesh options re-mesh the model on screen; the form also stays for a depth
+  // result after switching to a driver without depth (and the other way round).
+  const liveMesh = !!model?.remesh;
+  const showMesh = driver.producesDepth || liveMesh;
+  const pendingMode = state.pendingMeshMode ? meshModeLabel(state.pendingMeshMode) : null;
   const blockedReason = !state.source
     ? t('needImage')
     : unavailable
@@ -101,22 +104,28 @@ export function ControlPanel({ studio, availability }: Props) {
           />
         )}
 
-        {driver.producesDepth && (
+        {showMesh && (
           <ParamForm
             id="mesh"
             title={t('meshTitle')}
             icon={<IconCube />}
             badge={
-              <span className="pill pill-live" title={t('meshLiveHint')}>
-                {t('meshLive')}
-              </span>
+              (model ? liveMesh : driver.producesDepth) ? (
+                <span className="pill pill-live" title={t('meshLiveHint')} data-testid="mesh-live">
+                  {t('meshLive')}
+                </span>
+              ) : undefined
             }
             specs={MESH_PARAMS}
             values={state.meshParams}
             onChange={actions.setMeshParam}
             onReset={actions.resetMeshParams}
             note={
-              state.meshNotice ? (
+              pendingMode ? (
+                <p className="note small" role="status" data-testid="mesh-pending">
+                  <IconInfo size={14} /> {t('meshPending', { mode: tx(pendingMode) })}
+                </p>
+              ) : state.meshNotice ? (
                 <p className="note small" role="status">
                   <IconInfo size={14} /> {t('meshSuggested', { mode: tx(state.meshNotice) })}
                 </p>
@@ -131,7 +140,7 @@ export function ControlPanel({ studio, availability }: Props) {
         progress={state.progress}
         error={state.error}
         errorTitle={t(state.errorTitle)}
-        canGenerate={!!state.source && !state.loadingImage && !blocked}
+        canGenerate={canGenerate(state, availability)}
         blockedReason={blockedReason}
         hasResult={!!state.result}
         onGenerate={() => void actions.generate()}

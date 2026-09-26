@@ -4,7 +4,7 @@ import { DRIVERS } from '../drivers';
 import { LocalizedError } from '../drivers/heuristic/inflate';
 import { ImageLoadError, NOT_AN_IMAGE } from '../core/image/load';
 import { baseName, errorToText, formatSeconds, modelFileName } from './format';
-import { throttleLatest } from './throttle';
+import { throttleLatest, yieldToPaint } from './throttle';
 import { coveragePercent, maskOverlay } from './overlay';
 import { disposeObject } from './dispose';
 import { createClayMatcap } from './viewer';
@@ -54,6 +54,48 @@ describe('throttleLatest', () => {
     th.push(5);
     expect(queue).toHaveLength(0);
     expect(emit).toHaveBeenCalledOnce();
+  });
+});
+
+describe('yieldToPaint', () => {
+  it('falls back to a macrotask without requestAnimationFrame (Node)', async () => {
+    expect(typeof requestAnimationFrame).toBe('undefined');
+    let done = false;
+    const p = yieldToPaint().then(() => (done = true));
+    await Promise.resolve();
+    expect(done).toBe(false);
+    await p;
+    expect(done).toBe(true);
+  });
+
+  it('waits two frames and then a task, with a timer if frames stop', async () => {
+    vi.useFakeTimers();
+    try {
+      const frames: (() => void)[] = [];
+      vi.stubGlobal('requestAnimationFrame', (cb: () => void) => frames.push(cb));
+      let done = false;
+      void yieldToPaint(250).then(() => (done = true));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(done).toBe(false);
+      frames.shift()!(); // frame N (progress emitted, React commits after it)
+      await vi.advanceTimersByTimeAsync(0);
+      expect(done).toBe(false);
+      frames.shift()!(); // frame N+1 paints the label
+      expect(done).toBe(false);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(done).toBe(true);
+
+      // rAF never fires (tab hidden mid-wait): the safety timer resolves.
+      done = false;
+      void yieldToPaint(250).then(() => (done = true));
+      await vi.advanceTimersByTimeAsync(249);
+      expect(done).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(done).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
   });
 });
 

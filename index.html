@@ -8,10 +8,11 @@
     <title>3D Marker — Image to 3D</title>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <script>
-      // Apply the saved theme / language before first paint (avoids a flash of the wrong theme).
+      // Apply the saved theme (else the OS preference) / language before first paint (avoids a flash of the wrong theme).
       try {
         var s = JSON.parse(localStorage.getItem('3dmarker:settings') || '{}');
         if (s.theme === 'light' || s.theme === 'dark') document.documentElement.dataset.theme = s.theme;
+        else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) document.documentElement.dataset.theme = 'light';
         if (s.lang === 'tr' || s.lang === 'en') document.documentElement.lang = s.lang;
       } catch (e) {}
     </script>

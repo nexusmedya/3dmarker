@@ -43,3 +43,6 @@ export function throttleLatest<T>(emit: (value: T) => void, schedule: Scheduler 
     },
   };
 }
+
+/** Lives in src/core so the main-thread drivers can use it too (see there). */
+export { yieldToPaint } from '../core/yield';

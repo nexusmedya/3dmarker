@@ -119,7 +119,8 @@ export function Viewer({ model, geometryVersion, view, onView, coreRef, depthPre
         <div className="viewer-overlay viewer-overlay-busy">
           <div className="busy-card">
             <span className="spinner spinner-lg" aria-hidden="true" />
-            <ProgressBar progress={progress} testId="viewer-progress" compact />
+            {/* Visual copy of the panel's progress bar, which is the one announced. */}
+            <ProgressBar progress={progress} testId="viewer-progress" compact decorative />
           </div>
         </div>
       )}

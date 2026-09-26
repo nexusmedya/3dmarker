@@ -25,7 +25,10 @@ export interface MlEnvConfig {
   remoteHost?: string;
   /** Path template appended to remoteHost (default '{model}/resolve/{revision}/'). */
   remotePathTemplate?: string;
-  /** Directory URL hosting onnxruntime-web's ort-wasm-simd-threaded.asyncify.{mjs,wasm} (default: jsDelivr). */
+  /**
+   * Directory URL hosting onnxruntime-web's ort-wasm-simd-threaded.asyncify.{mjs,wasm}. Default: the copy
+   * Vite bundles into /assets (jsDelivr only for Safari < 26 without WebGPU, which needs the plain build).
+   */
   wasmPrefix?: string;
   /** Cache downloaded weights in the Cache API (default true). */
   useBrowserCache?: boolean;
@@ -104,6 +107,13 @@ export type MlResponse =
   | ({ type: 'progress'; id: number } & MlProgress)
   | { type: 'result'; id: number; result: MlResult }
   | { type: 'error'; id: number; error: SerializedError };
+
+/**
+ * Error name the worker uses when a WebGPU attempt failed inside ONNX Runtime.
+ * That leaves the worker unusable (see MlEngine.run), so the client retries
+ * the job on WASM in a fresh worker.
+ */
+export const WEBGPU_FAILED_ERROR = 'WebGpuFailedError';
 
 export function serializeError(e: unknown): SerializedError {
   if (e instanceof Error) return { name: e.name, message: e.message, stack: e.stack };

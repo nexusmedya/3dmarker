@@ -17,16 +17,23 @@ import {
   type BackgroundMode,
   type BuiltModel,
 } from '../app/pipeline';
-import { createInitialState, reducer, saveState, type Theme, type ViewSettings } from '../app/store';
+import { canGenerate, createInitialState, meshParamsForJob, reducer, saveState, type Theme, type ViewSettings } from '../app/store';
 import { browserStorage } from '../app/persist';
 import { errorToText } from '../app/format';
+import { t } from '../app/i18n';
 import { throttleLatest } from '../app/throttle';
 import { disposeObject } from '../app/dispose';
 import { renderSample, type SampleSpec } from '../app/samples';
 import type { ViewerCore } from '../app/viewer';
+import { useAvailability } from './useAvailability';
 
 /** Delay before re-meshing after a mesh slider moves. */
 export const REMESH_DEBOUNCE_MS = 150;
+
+/** OS colour-scheme preference (used until the user picks a theme). */
+function prefersLightScheme(): boolean {
+  return typeof window !== 'undefined' && typeof window.matchMedia === 'function' && window.matchMedia('(prefers-color-scheme: light)').matches;
+}
 
 export function useStudio() {
   const store = useMemo(() => browserStorage(), []);
@@ -36,6 +43,7 @@ export function useStudio() {
       languages: typeof navigator !== 'undefined' ? (navigator.languages?.length ? navigator.languages : navigator.language) : undefined,
       drivers: DRIVERS,
       defaultDriverId: DEFAULT_DRIVER_ID,
+      prefersLight: prefersLightScheme(),
     }),
   );
   const [model, setModel] = useState<BuiltModel | null>(null);
@@ -43,18 +51,24 @@ export function useStudio() {
   const coreRef = useRef<ViewerCore | null>(null);
   const jobRef = useRef<AbortController | null>(null);
   const loadSeq = useRef(0);
+  /** Set synchronously while an image decodes (stateRef only catches up on render). */
+  const loadingRef = useRef(false);
   const stateRef = useRef(state);
   stateRef.current = state;
 
   const driver: Driver = getDriver(state.driverId) ?? DRIVERS[0];
+  const availability = useAvailability(driver);
+  const availabilityRef = useRef(availability);
+  availabilityRef.current = availability;
 
   // Persist settings / params (secrets are stripped by saveState).
   useEffect(() => {
     saveState(store, stateRef.current, DRIVERS);
-  }, [store, state.lang, state.theme, state.driverId, state.bgMode, state.view, state.stlSizeMm, state.showMask, state.meshParams, state.params]);
+  }, [store, state.lang, state.theme, state.explicitTheme, state.driverId, state.bgMode, state.view, state.stlSizeMm, state.showMask, state.meshParams, state.params]);
 
   useEffect(() => {
     document.documentElement.lang = state.lang;
+    document.title = t('docTitle', state.lang);
   }, [state.lang]);
   useEffect(() => {
     document.documentElement.dataset.theme = state.theme;
@@ -72,14 +86,20 @@ export function useStudio() {
     async (file: Blob, name: string) => {
       const seq = ++loadSeq.current;
       cancel();
+      loadingRef.current = true;
       dispatch({ type: 'imageLoading' });
       try {
         const source = await prepareSource(file, name);
         if (seq !== loadSeq.current) return;
+        loadingRef.current = false;
         const { mask, note } = quickMask(source.image, stateRef.current.bgMode);
+        // A job started from the previous image while this one decoded must not
+        // finish under the new image's name.
+        cancel();
         dispatch({ type: 'imageLoaded', source, mask, maskNote: note });
       } catch (e) {
         if (seq !== loadSeq.current) return;
+        loadingRef.current = false;
         dispatch({ type: 'imageFailed', error: errorToText(e) });
       }
     },
@@ -100,6 +120,7 @@ export function useStudio() {
 
   const clearImage = useCallback(() => {
     loadSeq.current++;
+    loadingRef.current = false;
     cancel();
     dispatch({ type: 'clearImage' });
   }, [cancel]);
@@ -113,7 +134,8 @@ export function useStudio() {
   const generate = useCallback(async () => {
     const s = stateRef.current;
     const drv = getDriver(s.driverId);
-    if (!s.source || !drv || jobRef.current) return;
+    // Same guard as the Generate button (the Ctrl/Cmd+Enter shortcut lands here too).
+    if (!s.source || !drv || jobRef.current || loadingRef.current || !canGenerate(s, availabilityRef.current)) return;
     const ctrl = new AbortController();
     jobRef.current = ctrl;
     const source = s.source;
@@ -132,7 +154,7 @@ export function useStudio() {
         bgMode,
         driver: drv,
         params: s.params[drv.id] ?? defaultParams(drv.params),
-        meshParams: s.meshParams,
+        meshParams: meshParamsForJob(s),
         signal: ctrl.signal,
         onProgress: progress.push,
         mask,
@@ -249,7 +271,7 @@ export function useStudio() {
     [loadFile, loadSample, clearImage, setBgMode, generate, cancel],
   );
 
-  return { state, driver, model, geometryVersion, coreRef, actions };
+  return { state, driver, availability, model, geometryVersion, coreRef, actions };
 }
 
 export type Studio = ReturnType<typeof useStudio>;

@@ -326,6 +326,7 @@ export class ViewerCore {
   private applyDisplay(): void {
     this.controls.autoRotate = this.display.autoRotate;
     this.clay.wireframe = this.display.wireframe;
+    this.clay.side = DoubleSide; // shared by every model: never inherit a side set from outside
     for (const [mesh, original] of this.originals) {
       if (this.display.clay) mesh.material = this.clay;
       else mesh.material = Array.isArray(original) ? original.map((m) => this.displayMaterial(m)) : this.displayMaterial(original);

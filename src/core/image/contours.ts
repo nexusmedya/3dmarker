@@ -194,6 +194,39 @@ function bbox(points: Point[]): [number, number, number, number] {
   return [x0, y0, x1, y1];
 }
 
+/**
+ * Call `visit(point, box)` for every point inside a box (edges included), with
+ * a uniform grid over the points. Points with NaN coordinates are skipped.
+ */
+function forPointsInBoxes(points: Point[], boxes: [number, number, number, number][], visit: (p: number, b: number) => void): void {
+  const ids = points.map((_, i) => i).filter((i) => points[i][0] === points[i][0] && points[i][1] === points[i][1]);
+  if (ids.length === 0 || boxes.length === 0) return;
+  const [x0, y0, x1, y1] = bbox(ids.map((i) => points[i]));
+  const n = Math.ceil(Math.sqrt(ids.length));
+  const cw = Math.max((x1 - x0) / n, 1e-9), ch = Math.max((y1 - y0) / n, 1e-9);
+  const col = (x: number) => Math.min(n - 1, Math.max(0, Math.floor((x - x0) / cw)));
+  const row = (y: number) => Math.min(n - 1, Math.max(0, Math.floor((y - y0) / ch)));
+  // CSR buckets of point ids per cell.
+  const start = new Int32Array(n * n + 1);
+  for (const i of ids) start[row(points[i][1]) * n + col(points[i][0]) + 1]++;
+  for (let c = 0; c < n * n; c++) start[c + 1] += start[c];
+  const items = new Int32Array(ids.length);
+  const fill = start.slice(0, n * n);
+  for (const i of ids) items[fill[row(points[i][1]) * n + col(points[i][0])]++] = i;
+
+  boxes.forEach(([bx0, by0, bx1, by1], b) => {
+    if (bx1 < x0 || bx0 > x1 || by1 < y0 || by0 > y1) return;
+    for (let r = row(by0); r <= row(by1); r++) {
+      for (let c = col(bx0); c <= col(bx1); c++) {
+        for (let k = start[r * n + c]; k < start[r * n + c + 1]; k++) {
+          const i = items[k], [x, y] = points[i];
+          if (x >= bx0 && x <= bx1 && y >= by0 && y <= by1) visit(i, b);
+        }
+      }
+    }
+  });
+}
+
 /** Squared distance from p to segment ab. */
 function segDist2(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
   const dx = bx - ax, dy = by - ay;
@@ -354,21 +387,55 @@ export interface SimplifyGroupsOptions {
 
 /**
  * Simplify every ring of `groups` with RDP while keeping the result valid:
- * the tolerance is raised until the total vertex count fits `maxPoints`, then
- * rings that end up crossing (themselves or others) or flipping orientation
- * are re-simplified with a smaller tolerance, falling back to the original
- * ring (which traceContours guarantees to be simple and disjoint).
+ * the tolerance is raised until the total vertex count fits `maxPoints`
+ * (unless it cannot: every ring keeps at least 3 points), then rings that end
+ * up crossing (themselves or others), flipping orientation or changing the
+ * nesting (a hole left outside its outer ring, an island outside its hole, a
+ * ring swallowing another) are re-simplified with a smaller tolerance,
+ * falling back to the original ring (which traceContours guarantees to be
+ * simple, disjoint and correctly nested).
  */
 export function simplifyGroups(groups: ContourGroup[], tolerance: number, opts: SimplifyGroupsOptions = {}): ContourGroup[] {
   const maxPoints = opts.maxPoints ?? 20000;
   const rings: Point[][] = [];
-  for (const g of groups) rings.push(g.outer, ...g.holes);
+  // Original nesting: parent[i] is the ring directly around ring i (-1: none).
+  const parent: number[] = [];
+  const outers: number[] = [];
+  for (const g of groups) {
+    const o = rings.length;
+    outers.push(o);
+    rings.push(g.outer);
+    parent.push(-1);
+    for (const h of g.holes) {
+      rings.push(h);
+      parent.push(o);
+    }
+  }
   const areas = rings.map(polygonArea);
+  // Islands: an outer ring lies in the smallest hole (of another group) around it.
+  const holeIds = rings.map((_, i) => i).filter((i) => parent[i] >= 0);
+  if (outers.length > 1 && holeIds.length > 0) {
+    const best = new Float64Array(rings.length).fill(Infinity);
+    forPointsInBoxes(outers.map((o) => rings[o][0]), holeIds.map((h) => bbox(rings[h])), (k, b) => {
+      const o = outers[k], h = holeIds[b], a = Math.abs(areas[h]);
+      if (a < best[o] && parent[h] !== o && pointInPolygon(rings[o][0][0], rings[o][0][1], rings[h])) {
+        best[o] = a;
+        parent[o] = h;
+      }
+    });
+  }
+  const isAncestor = (j: number, i: number) => {
+    for (let k = parent[i]; k >= 0; k = parent[k]) if (k === j) return true;
+    return false;
+  };
 
   let tol = Math.max(0, tolerance);
   let out = rings.map((r) => simplifyPolyline(r, tol));
   const count = () => out.reduce((n, r) => n + r.length, 0);
-  if (count() > maxPoints) {
+  // Below this nothing can be dropped; past it, growing the tolerance would
+  // only collapse every ring to a triangle without meeting maxPoints.
+  const minCount = rings.reduce((n, r) => n + Math.min(3, r.length), 0);
+  if (count() > maxPoints && minCount <= maxPoints) {
     // Past the largest ring's extent every ring is already at its minimum.
     const [x0, y0, x1, y1] = bbox(rings.flat());
     const span = Math.max(x1 - x0, y1 - y0);
@@ -384,6 +451,23 @@ export function simplifyGroups(groups: ContourGroup[], tolerance: number, opts: 
     out.forEach((r, i) => {
       if (r.length < 3 || Math.sign(polygonArea(r)) !== Math.sign(areas[i])) found.add(i);
     });
+    // Nesting, tested with one vertex per ring (rings that cross are flagged
+    // above). Simplified rings keep original vertices, which the original
+    // rings contain exactly when nested, so reverting the containing ring j
+    // repairs a wrong relation: flag j.
+    const moved = rings.map((r, i) => out[i] !== r && out[i].length > 0);
+    const movedIds = rings.map((_, i) => i).filter((i) => moved[i]);
+    if (movedIds.length > 0) {
+      out.forEach((r, i) => {
+        if (r.length === 0) return;
+        for (let j = parent[i]; j >= 0; j = parent[j]) if (moved[j] && !pointInPolygon(r[0][0], r[0][1], out[j])) found.add(j);
+      });
+      const firsts = out.map((r) => r[0] ?? ([NaN, NaN] as Point));
+      forPointsInBoxes(firsts, movedIds.map((j) => bbox(out[j])), (i, b) => {
+        const j = movedIds[b];
+        if (i !== j && !found.has(j) && !isAncestor(j, i) && pointInPolygon(firsts[i][0], firsts[i][1], out[j])) found.add(j);
+      });
+    }
     const bad = [...found].filter((i) => out[i] !== rings[i]);
     if (bad.length === 0) break;
     for (const i of bad) {

@@ -150,3 +150,108 @@ describe('model URL helpers', () => {
     expect(n).toBe(3);
   });
 });
+
+describe('openModelDownload timeouts', () => {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  /** Upstream whose body yields `chunks` chunks, `gapMs` apart, then stalls if `stall`. Errors like undici when aborted. */
+  function cdn(up: { chunks: number; gapMs: number; stall?: boolean; headersAfterMs?: number }) {
+    const state = { sent: 0, cancelled: false, fetches: 0, settled: 0 };
+    const f: typeof fetch = async (_input, init) => {
+      state.fetches++;
+      const signal = init?.signal ?? undefined;
+      const abortable = <T>(p: Promise<T>) =>
+        new Promise<T>((resolve, reject) => {
+          if (signal?.aborted) return reject(signal.reason);
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+          p.then(resolve, reject);
+        });
+      if (up.headersAfterMs) await abortable(sleep(up.headersAfterMs));
+      const body = new ReadableStream<Uint8Array>(
+        {
+          async pull(c) {
+            if (state.sent >= up.chunks) {
+              if (up.stall) await abortable(new Promise(() => {}));
+              return c.close();
+            }
+            await abortable(sleep(up.gapMs));
+            state.sent++;
+            c.enqueue(new Uint8Array(8).fill(state.sent));
+          },
+          cancel() {
+            state.cancelled = true;
+          },
+        },
+        { highWaterMark: 0 },
+      );
+      return new Response(body, { headers: { 'content-length': String(up.chunks * 8) } });
+    };
+    const opts = (extra: object = {}) => ({
+      allowedHosts: ['tripo3d.ai'],
+      fetch: f,
+      timeoutMs: 40,
+      idleTimeoutMs: 60,
+      onSettled: () => void state.settled++,
+      ...extra,
+    });
+    return { opts, state };
+  }
+
+  it('lets a slow but steady body run past the header timeout', async () => {
+    const { opts, state } = cdn({ chunks: 8, gapMs: 15 }); // ~120 ms in total, 3× the header timeout
+    const res = await openModelDownload('https://tripo3d.ai/m.glb', opts());
+    expect(res.headers.get('content-length')).toBe('64');
+    expect(state.settled).toBe(0);
+    const buf = new Uint8Array(await res.arrayBuffer());
+    expect(buf.byteLength).toBe(64);
+    expect(buf[63]).toBe(8);
+    expect(state.cancelled).toBe(false);
+    expect(state.settled).toBe(1);
+  });
+
+  it('fails a body that stalls longer than the idle timeout', async () => {
+    const { opts, state } = cdn({ chunks: 2, gapMs: 5, stall: true });
+    const res = await openModelDownload('https://tripo3d.ai/m.glb', opts());
+    const reader = res.body!.getReader();
+    expect((await reader.read()).done).toBe(false);
+    expect((await reader.read()).done).toBe(false);
+    const e = await rejection(reader.read());
+    expect(e.kind).toBe('timeout');
+    expect(state.cancelled).toBe(true);
+    expect(state.settled).toBe(1);
+  });
+
+  it('still caps the whole transfer', async () => {
+    const { opts } = cdn({ chunks: 100, gapMs: 10 });
+    const res = await openModelDownload('https://tripo3d.ai/m.glb', opts({ totalTimeoutMs: 80 }));
+    expect((await rejection(res.arrayBuffer())).kind).toBe('timeout');
+  });
+
+  it('times out when the headers never arrive', async () => {
+    const { opts, state } = cdn({ chunks: 1, gapMs: 1, headersAfterMs: 10_000 });
+    const started = Date.now();
+    const e = await rejection(openModelDownload('https://tripo3d.ai/m.glb', opts()));
+    expect(e.kind).toBe('timeout');
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(state.settled).toBe(1);
+    // Refused hosts settle too.
+    await rejection(openModelDownload('https://evil.example/m.glb', opts()));
+    expect(state.settled).toBe(2);
+    expect(state.fetches).toBe(1);
+  });
+
+  it('cancels the upstream when the caller aborts mid-body', async () => {
+    const ctl = new AbortController();
+    const { opts, state } = cdn({ chunks: 50, gapMs: 5 });
+    const res = await openModelDownload('https://tripo3d.ai/m.glb', opts({ signal: ctl.signal }));
+    const reader = res.body!.getReader();
+    await reader.read();
+    ctl.abort();
+    expect((await rejection(reader.read())).kind).toBe('aborted');
+    expect(state.cancelled).toBe(true);
+    expect(state.settled).toBe(1);
+    const sent = state.sent;
+    await sleep(30);
+    expect(state.sent).toBe(sent);
+  });
+});

@@ -36,6 +36,9 @@ export default defineConfig({
       use: {
         ...devices['Desktop Chrome'],
         viewport: { width: 1440, height: 900 },
+        // The app follows the OS theme on a first visit; keep the studio tests on
+        // its default dark look (the colour-scheme tests override this).
+        colorScheme: 'dark',
         launchOptions: {
           executablePath,
           args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'],

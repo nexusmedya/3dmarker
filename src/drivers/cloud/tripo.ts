@@ -7,6 +7,9 @@ import type { Availability, Driver, DriverInput, DriverResult, I18nText, ParamSp
 import { AbortError, throwIfAborted } from '../../core/types';
 import { LocalizedError } from '../../core/errors';
 import {
+  API_KEY_PATTERN,
+  CLIENT_HEADER,
+  CLIENT_HEADER_VALUE,
   MAX_IMAGE_BYTES,
   TRIPO_KEY_HEADER,
   TRIPO_STATUS_PATH,
@@ -27,6 +30,10 @@ export interface TripoDriverOptions {
   maxWaitMs?: number;
   /** Consecutive transient poll failures tolerated (default 5). */
   maxPollErrors?: number;
+  /** Tries for the model download before giving up (default 3); the task is paid for by then. */
+  maxDownloadAttempts?: number;
+  /** Base delay between download tries, growing linearly (default pollIntervalMs). */
+  downloadRetryDelayMs?: number;
 }
 
 export interface TripoParams {
@@ -63,6 +70,10 @@ const T = {
     tr: 'Tripo3D API anahtarı geçersiz ya da reddedildi. Anahtarı kontrol edin.',
     en: 'The Tripo3D API key is invalid or was rejected. Please check it.',
   },
+  keyFormat: {
+    tr: 'Tripo3D API anahtarı geçersiz biçimde: yalnızca harf, rakam ve _ . - içerebilir (10–200 karakter). Kopyalarken gelen boşluk, tırnak ya da görünmez karakterleri silin.',
+    en: 'The Tripo3D API key has an invalid format: it may only contain letters, digits and _ . - (10–200 characters). Remove any spaces, quotes or hidden characters picked up when copying it.',
+  },
   tooLarge: { tr: 'Görsel 20 MB sınırını aşıyor.', en: 'The image exceeds the 20 MB limit.' },
   unsupported: {
     tr: 'Tripo3D yalnızca PNG, JPEG veya WEBP görselleri kabul eder.',
@@ -80,12 +91,21 @@ const T = {
     tr: `Tripo3D bu görselden model üretemedi${d ? ` (${d})` : ''}.`,
     en: `Tripo3D could not generate a model from this image${d ? ` (${d})` : ''}.`,
   }),
+  banned: {
+    tr: 'Görsel Tripo3D içerik denetimi tarafından reddedildi.',
+    en: 'The image was rejected by Tripo3D content moderation.',
+  },
+  expired: { tr: 'Görevin Tripo3D tarafında süresi doldu.', en: 'The task expired on Tripo3D.' },
   cancelled: { tr: 'Görev Tripo3D tarafında iptal edildi.', en: 'The task was cancelled on Tripo3D.' },
   timeout: (min: number): I18nText => ({
     tr: `Tripo3D ${min} dakika içinde sonuç vermedi.`,
     en: `Tripo3D did not finish within ${min} minutes.`,
   }),
   badModel: { tr: 'Tripo3D geçerli bir GLB dosyası döndürmedi.', en: 'Tripo3D did not return a valid GLB file.' },
+  downloadInterrupted: {
+    tr: 'Model indirmesi yarıda kesildi (model üretildi ancak indirilemedi). Lütfen tekrar deneyin.',
+    en: 'The model download was interrupted (the model was generated, but it could not be fetched). Please try again.',
+  },
   generic: (d: string): I18nText => ({ tr: `Tripo3D hatası: ${d}`, en: `Tripo3D error: ${d}` }),
 };
 
@@ -101,12 +121,20 @@ class HttpError extends Error {
   }
 }
 
+/** The model download broke off (status 0): the API server was reachable moments before. */
+class DownloadInterruptedError extends HttpError {
+  constructor() {
+    super(0, 'download interrupted');
+    this.name = 'DownloadInterruptedError';
+  }
+}
+
 const isTransient = (e: HttpError) => e.status === 0 || e.status === 429 || e.status >= 500;
 
 function localize(e: HttpError, userKey: boolean): LocalizedError {
   switch (e.status) {
     case 0:
-      return new LocalizedError(T.serverUnreachable);
+      return new LocalizedError(e instanceof DownloadInterruptedError ? T.downloadInterrupted : T.serverUnreachable);
     case 401:
       return new LocalizedError(userKey ? T.keyRejected : T.needsKey);
     case 402:
@@ -123,11 +151,14 @@ function localize(e: HttpError, userKey: boolean): LocalizedError {
   }
 }
 
+/** Zero-width characters that trim() keeps and that often come along when a key is copied from a web page. */
+const INVISIBLE = /[\u200B-\u200D\u2060\uFEFF]/g;
+
 export function tripoParamsFrom(p: ParamValues): TripoParams {
   const d = DEFAULT_TRIPO_PARAMS;
   const faceLimit = typeof p.faceLimit === 'number' && Number.isFinite(p.faceLimit) ? Math.max(0, Math.round(p.faceLimit)) : d.faceLimit;
   return {
-    apiKey: typeof p.apiKey === 'string' ? p.apiKey.trim() : d.apiKey,
+    apiKey: typeof p.apiKey === 'string' ? p.apiKey.replace(INVISIBLE, '').trim() : d.apiKey,
     modelVersion: typeof p.modelVersion === 'string' && p.modelVersion ? p.modelVersion : d.modelVersion,
     texture: typeof p.texture === 'boolean' ? p.texture : d.texture,
     pbr: typeof p.pbr === 'boolean' ? p.pbr : d.pbr,
@@ -228,6 +259,8 @@ export function createTripoDriver(options: TripoDriverOptions = {}): Driver {
   const pollIntervalMs = options.pollIntervalMs ?? 2000;
   const maxWaitMs = options.maxWaitMs ?? 15 * 60_000;
   const maxPollErrors = options.maxPollErrors ?? 5;
+  const maxDownloadAttempts = Math.max(1, options.maxDownloadAttempts ?? 3);
+  const downloadRetryDelayMs = options.downloadRetryDelayMs ?? pollIntervalMs;
   const doFetch: typeof fetch = (input, init) => (options.fetch ?? fetch)(input, init);
 
   /** fetch that throws AbortError on abort and HttpError on network failure / non-2xx. */
@@ -260,10 +293,16 @@ export function createTripoDriver(options: TripoDriverOptions = {}): Driver {
     }
   }
 
-  async function downloadModel(taskId: string, headers: HeadersInit, input: DriverInput): Promise<ArrayBuffer> {
-    const { signal, onProgress } = input;
-    onProgress({ label: T.downloading, ratio: GEN_END });
-    const res = await request(taskModelPath(taskId), { headers }, signal);
+  /** One download try; `progress` gets the download's share (0..1), which may restart on a retry. */
+  async function downloadModel(taskId: string, headers: HeadersInit, signal: AbortSignal, progress: (ratio: number) => void): Promise<ArrayBuffer> {
+    progress(0);
+    let res: Response;
+    try {
+      res = await request(taskModelPath(taskId), { headers }, signal);
+    } catch (e) {
+      if (e instanceof HttpError && e.status === 0) throw new DownloadInterruptedError();
+      throw e;
+    }
     const total = Number(res.headers.get('content-length')) || 0;
     try {
       if (!res.body || !total) return await res.arrayBuffer();
@@ -279,7 +318,7 @@ export function createTripoDriver(options: TripoDriverOptions = {}): Driver {
         const pct = Math.min(100, Math.floor((received / total) * 100));
         if (pct !== lastPct) {
           lastPct = pct;
-          onProgress({ label: T.downloading, ratio: GEN_END + (1 - GEN_END) * (pct / 100) });
+          progress(pct / 100);
         }
       }
       const out = new Uint8Array(received);
@@ -291,7 +330,30 @@ export function createTripoDriver(options: TripoDriverOptions = {}): Driver {
       return out.buffer;
     } catch {
       if (signal.aborted) throw new AbortError();
-      throw new HttpError(0, 'download interrupted');
+      throw new DownloadInterruptedError();
+    }
+  }
+
+  /**
+   * Download the finished model, retrying transient failures (network, 429,
+   * 5xx): the task is already paid for, and the server fetches a fresh model
+   * URL on every try.
+   */
+  async function downloadWithRetry(taskId: string, headers: HeadersInit, input: DriverInput): Promise<ArrayBuffer> {
+    const { signal, onProgress } = input;
+    let shown = 0; // never move the bar backwards when a retry starts over
+    const progress = (share: number) => {
+      shown = Math.max(shown, share);
+      onProgress({ label: T.downloading, ratio: GEN_END + (1 - GEN_END) * shown });
+    };
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await downloadModel(taskId, headers, signal, progress);
+      } catch (e) {
+        if (!(e instanceof HttpError) || !isTransient(e) || attempt >= maxDownloadAttempts || signal.aborted) throw e;
+        const wait = e.status === 429 && e.retryAfterSec ? Math.min(e.retryAfterSec * 1000, 60_000) : downloadRetryDelayMs * attempt;
+        await sleep(wait, signal);
+      }
     }
   }
 
@@ -302,7 +364,12 @@ export function createTripoDriver(options: TripoDriverOptions = {}): Driver {
     throwIfAborted(signal);
     if (file.size > MAX_IMAGE_BYTES) throw new LocalizedError(T.tooLarge);
     if (file.type && !ACCEPTED_TYPES.includes(file.type)) throw new LocalizedError(T.unsupported);
-    const headers: Record<string, string> = userKey ? { [TRIPO_KEY_HEADER]: params.apiKey } : {};
+    // Checked here: fetch itself throws on non-Latin-1 header values, which would read as "server unreachable".
+    if (userKey && !API_KEY_PATTERN.test(params.apiKey)) throw new LocalizedError(T.keyFormat);
+    const headers: Record<string, string> = {
+      [CLIENT_HEADER]: CLIENT_HEADER_VALUE,
+      ...(userKey ? { [TRIPO_KEY_HEADER]: params.apiKey } : {}),
+    };
 
     try {
       onProgress({ label: T.upload, ratio: 0.01 });
@@ -329,7 +396,12 @@ export function createTripoDriver(options: TripoDriverOptions = {}): Driver {
         }
         const pct = Math.max(0, Math.min(100, Math.round(Number(state.progress) || 0)));
         if (state.status === 'success') break;
-        if (state.status === 'failed') throw new LocalizedError(T.failed(state.error ?? ''));
+        if (state.status === 'failed') {
+          if (state.reason === 'banned') throw new LocalizedError(T.banned);
+          if (state.reason === 'expired') throw new LocalizedError(T.expired);
+          // Servers without `reason` only send an English detail.
+          throw new LocalizedError(T.failed(state.reason === 'failed' ? '' : state.error ?? ''));
+        }
         if (state.status === 'cancelled') throw new LocalizedError(T.cancelled);
         if (state.status === 'running' || pct > 0) {
           onProgress({ label: T.generating(pct), ratio: GEN_START + (GEN_END - GEN_START) * (pct / 100) });
@@ -338,7 +410,7 @@ export function createTripoDriver(options: TripoDriverOptions = {}): Driver {
         }
       }
 
-      const glb = await downloadModel(taskId, headers, input);
+      const glb = await downloadWithRetry(taskId, headers, input);
       if (!isGlb(glb)) throw new LocalizedError(T.badModel);
       onProgress({ label: T.done, ratio: 1 });
       return { kind: 'model', glb };

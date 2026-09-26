@@ -779,6 +779,8 @@ select {
   color: var(--text);
 }
 
+.sample:disabled { cursor: not-allowed; opacity: 0.55; }
+
 .sample-thumb {
   width: 100%;
   max-width: 72px;
@@ -1313,6 +1315,9 @@ select {
 .step p { margin-top: 6px; color: var(--text-muted); font-size: 13.5px; }
 
 .table-wrap {
+  /* Containing block for the visually-hidden header text, so it is clipped
+     here instead of widening the whole page on phones. */
+  position: relative;
   margin-top: 24px;
   overflow-x: auto;
   border-radius: var(--radius);
@@ -1479,6 +1484,13 @@ select {
     box-shadow: 0 -8px 24px -12px rgba(0, 0, 0, 0.35);
   }
 
+  /* Long errors scroll inside the sticky footer instead of covering the panel. */
+  .generate-panel .alert-body p {
+    max-height: 6em;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
   .stage {
     height: 72vh;
     min-height: 440px;
@@ -1498,6 +1510,10 @@ select {
   .viewer-hint { display: none; }
   .depth-thumb canvas { max-width: 88px; max-height: 88px; }
   .container { padding: 0 16px; }
+}
+
+@media (hover: none) and (pointer: coarse) {
+  .kbd-hint { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {

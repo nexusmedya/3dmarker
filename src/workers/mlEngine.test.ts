@@ -1,6 +1,17 @@
 import { describe, expect, it, vi } from 'vitest';
-import { dtypeCandidates, isMissingWeightsError, MlEngine, SerialQueue, type EngineDeps, type GpuInfo, type LoadRequest } from './mlEngine';
-import type { MlProgress } from './mlProtocol';
+import {
+  detectGpu,
+  dtypeCandidates,
+  isMissingWeightsError,
+  isUnsupportedDtypeError,
+  MlEngine,
+  SerialQueue,
+  type EngineDeps,
+  type GpuInfo,
+  type GpuLike,
+  type LoadRequest,
+} from './mlEngine';
+import { WEBGPU_FAILED_ERROR, type MlProgress } from './mlProtocol';
 
 class ModelFileNotFoundError extends Error {
   constructor(message: string) {
@@ -15,6 +26,7 @@ function setup(opts: {
   gpu?: GpuInfo;
   missing?: string[]; // `${device}|${dtype}` combos whose weights 404
   failLoad?: string[]; // `${device}|${dtype}` combos whose load throws
+  noFp16?: string[]; // `${device}|${dtype}` combos failing transformers.js' fp16 pre-check
   maxCached?: number;
 } = {}) {
   const loads: string[] = [];
@@ -25,6 +37,7 @@ function setup(opts: {
     load: async (req: LoadRequest) => {
       const combo = `${req.device}|${req.dtype}`;
       loads.push(`${req.task}|${req.model}|${combo}`);
+      if (opts.noFp16?.includes(combo)) throw new Error(`The device (${req.device}) does not support fp16.`);
       req.onLoadProgress({ status: 'initiate', file: 'onnx/model.onnx' });
       req.onLoadProgress({ status: 'progress', file: 'onnx/model.onnx', loaded: 50, total: 100 });
       if (opts.missing?.includes(combo)) throw new ModelFileNotFoundError(`Could not locate file: ".../onnx/model_${req.dtype}.onnx".`);
@@ -65,6 +78,46 @@ describe('isMissingWeightsError', () => {
   });
 });
 
+describe('isUnsupportedDtypeError', () => {
+  it("matches transformers.js' fp16 pre-check error only", () => {
+    expect(isUnsupportedDtypeError(new Error('The device (webgpu) does not support fp16.'))).toBe(true);
+    expect(isUnsupportedDtypeError(new Error('failed to call OrtRun(). ERROR_CODE: 1'))).toBe(false);
+    expect(isUnsupportedDtypeError('does not support fp16')).toBe(false);
+  });
+});
+
+describe('detectGpu', () => {
+  const adapter = (fp16: boolean) => ({ features: { has: (f: string) => fp16 && f === 'shader-f16' } });
+  /** Adapters by power preference ('default' = no options, as transformers.js asks). */
+  const gpu = (byPref: Record<string, ReturnType<typeof adapter> | null | Error>) => {
+    const calls: unknown[] = [];
+    const g: GpuLike = {
+      requestAdapter: async (o) => {
+        calls.push(o);
+        const a = byPref[o?.powerPreference ?? 'default'];
+        if (a instanceof Error) throw a;
+        return a ?? null;
+      },
+    };
+    return { g, calls };
+  };
+
+  it('reports no GPU without navigator.gpu or a high-performance adapter', async () => {
+    expect(await detectGpu(undefined)).toEqual({ available: false, fp16: false });
+    expect(await detectGpu(gpu({ 'high-performance': null, default: adapter(true) }).g)).toEqual({ available: false, fp16: false });
+  });
+
+  it('offers fp16 only when the default adapter (transformers.js pre-check) has shader-f16 too', async () => {
+    const both = gpu({ 'high-performance': adapter(true), default: adapter(true) });
+    expect(await detectGpu(both.g)).toEqual({ available: true, fp16: true });
+    expect(both.calls).toEqual([{ powerPreference: 'high-performance' }, undefined]);
+    expect(await detectGpu(gpu({ 'high-performance': adapter(true), default: adapter(false) }).g)).toEqual({ available: true, fp16: false });
+    expect(await detectGpu(gpu({ 'high-performance': adapter(true), default: null }).g)).toEqual({ available: true, fp16: false });
+    expect(await detectGpu(gpu({ 'high-performance': adapter(true), default: new Error('x') }).g)).toEqual({ available: true, fp16: false });
+    expect(await detectGpu(gpu({ 'high-performance': adapter(false), default: adapter(true) }).g)).toEqual({ available: true, fp16: false });
+  });
+});
+
 describe('MlEngine', () => {
   it('runs on WebGPU with fp16 and caches the pipeline', async () => {
     const { engine, loads } = setup();
@@ -97,24 +150,51 @@ describe('MlEngine', () => {
     expect(loads).toHaveLength(2);
   });
 
-  it('retries once on WASM when WebGPU loading fails, then remembers it', async () => {
-    const { engine, loads } = setup({ failLoad: ['webgpu|fp16'] });
+  it('falls back from fp16 to fp32 on WebGPU when the fp16 pre-check fails', async () => {
+    const { engine, loads } = setup({ gpu: { available: true, fp16: true }, noFp16: ['webgpu|fp16'] });
+    const r = await engine.run(spec(), () => {}, async (p) => p.key);
+    expect(r).toMatchObject({ device: 'webgpu', dtype: 'fp32', result: 'm|webgpu|fp32' });
+    expect(loads).toEqual(['depth-estimation|m|webgpu|fp16', 'depth-estimation|m|webgpu|fp32']);
+    await engine.run(spec(), () => {}, async () => null);
+    expect(loads).toHaveLength(2);
+  });
+
+  it('retries once on WASM in the same worker when WebGPU weights are missing, then remembers it', async () => {
+    const { engine, loads } = setup({ missing: ['webgpu|fp16', 'webgpu|fp32'] });
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const r = await engine.run(spec(), () => {}, async (p) => p.key);
     expect(r).toMatchObject({ device: 'wasm', dtype: 'q8' });
     await engine.run(spec(), () => {}, async () => null);
-    expect(loads).toEqual(['depth-estimation|m|webgpu|fp16', 'depth-estimation|m|wasm|q8']);
+    expect(loads).toEqual(['depth-estimation|m|webgpu|fp16', 'depth-estimation|m|webgpu|fp32', 'depth-estimation|m|wasm|q8']);
     warn.mockRestore();
   });
 
-  it('retries on WASM when WebGPU inference throws and disposes the WebGPU pipeline', async () => {
+  it('throws WebGpuFailedError (no WASM retry in this worker) when WebGPU loading fails in ORT', async () => {
+    const { engine, loads } = setup({ failLoad: ['webgpu|fp16'] });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const err = await engine.run(spec(), () => {}, async (p) => p.key).catch((e: unknown) => e);
+    expect(err).toMatchObject({ name: WEBGPU_FAILED_ERROR, message: 'load failed on webgpu|fp16' });
+    expect((err as Error).cause).toBeInstanceOf(Error);
+    expect(loads).toEqual(['depth-estimation|m|webgpu|fp16']);
+    // not remembered here: the client decides once WASM worked in a fresh worker
+    await engine.run(spec(), () => {}, async () => null).catch(() => {});
+    expect(loads).toEqual(['depth-estimation|m|webgpu|fp16', 'depth-estimation|m|webgpu|fp16']);
+    warn.mockRestore();
+  });
+
+  it('throws WebGpuFailedError when WebGPU inference throws and disposes the WebGPU pipeline', async () => {
     const { engine, disposed } = setup();
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const r = await engine.run(spec(), () => {}, async (p, device) => {
-      if (device === 'webgpu') throw new Error('GPU device lost');
-      return p.key;
-    });
-    expect(r.result).toBe('m|wasm|q8');
+    const devices: string[] = [];
+    const err = await engine
+      .run(spec(), () => {}, async (p, device) => {
+        devices.push(device);
+        if (device === 'webgpu') throw new Error('GPU device lost');
+        return p.key;
+      })
+      .catch((e: unknown) => e);
+    expect(err).toMatchObject({ name: WEBGPU_FAILED_ERROR, message: 'GPU device lost' });
+    expect(devices).toEqual(['webgpu']);
     expect(disposed).toEqual(['m|webgpu|fp16']);
     warn.mockRestore();
   });

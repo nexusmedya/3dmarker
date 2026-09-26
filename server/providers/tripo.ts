@@ -78,10 +78,21 @@ export class TripoError extends Error {
 export interface TripoTimeouts {
   uploadMs: number;
   requestMs: number;
+  /** Model download: until the response headers arrive (over all redirect hops). */
   downloadMs: number;
+  /** Model download: longest gap between two body chunks. */
+  downloadIdleMs: number;
+  /** Model download: hard cap on the whole transfer, far above any realistic one. */
+  downloadTotalMs: number;
 }
 
-export const DEFAULT_TIMEOUTS: TripoTimeouts = { uploadMs: 60_000, requestMs: 20_000, downloadMs: 300_000 };
+export const DEFAULT_TIMEOUTS: TripoTimeouts = {
+  uploadMs: 60_000,
+  requestMs: 20_000,
+  downloadMs: 60_000,
+  downloadIdleMs: 60_000,
+  downloadTotalMs: 30 * 60_000,
+};
 
 export interface TripoClientOptions {
   apiKey: string;
@@ -108,8 +119,8 @@ function withTimeout(ms: number, signal?: AbortSignal): { signal: AbortSignal; t
   return { signal: signal ? AbortSignal.any([timeout, signal]) : timeout, timeout };
 }
 
-function transportError(e: unknown, timeout: AbortSignal, signal?: AbortSignal): TripoError {
-  if (timeout.aborted) return new TripoError('Tripo API request timed out', 'timeout');
+function transportError(e: unknown, timedOut: boolean, signal?: AbortSignal): TripoError {
+  if (timedOut) return new TripoError('Tripo API request timed out', 'timeout');
   if (signal?.aborted) return new TripoError('Request aborted', 'aborted');
   if (e instanceof TripoError) return e;
   return new TripoError('Could not reach the Tripo API', 'network');
@@ -200,7 +211,7 @@ export class TripoClient {
       res = await this.fetchImpl(`${this.baseUrl}${path}`, { ...init, headers, signal });
       text = await res.text();
     } catch (e) {
-      throw transportError(e, timeout, callerSignal);
+      throw transportError(e, timeout.aborted, callerSignal);
     }
     let json: unknown = null;
     try {
@@ -248,44 +259,153 @@ export interface ModelDownloadOptions {
   allowedHosts: string[];
   fetch?: typeof fetch;
   signal?: AbortSignal;
+  /** Until the response headers arrive, over all redirect hops (default DEFAULT_TIMEOUTS.downloadMs). */
   timeoutMs?: number;
+  /** Longest gap between two body chunks (default DEFAULT_TIMEOUTS.downloadIdleMs). */
+  idleTimeoutMs?: number;
+  /** Cap on the whole transfer, headers included (default DEFAULT_TIMEOUTS.downloadTotalMs). */
+  totalTimeoutMs?: number;
   maxRedirects?: number;
+  /**
+   * Called exactly once when the download is over: the body finished, failed,
+   * timed out or was cancelled, or this function threw.
+   */
+  onSettled?: () => void;
 }
 
 /**
  * Open a streaming download of a model URL returned by Tripo. Every hop
  * (including redirects) must pass the host allow-list, and no credentials are
  * sent. Throws TripoError('untrusted-host') with the refused host in `message`.
+ *
+ * The body is relayed at the browser's pace, so after the headers only
+ * progress is timed (`idleTimeoutMs` between chunks), so a slow but moving
+ * transfer is only cut by the generous `totalTimeoutMs`. A stalled or
+ * over-long body errors with TripoError('timeout') and the upstream is closed.
  */
 export async function openModelDownload(modelUrl: string, opts: ModelDownloadOptions): Promise<Response> {
   const f = opts.fetch ?? fetch;
-  const { signal, timeout } = withTimeout(opts.timeoutMs ?? DEFAULT_TIMEOUTS.downloadMs, opts.signal);
   const maxRedirects = opts.maxRedirects ?? 3;
+  let settled = false;
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    opts.onSettled?.();
+  };
   let url: URL;
   try {
     url = new URL(modelUrl);
   } catch {
+    settle();
     throw new TripoError('Tripo returned an invalid model URL', 'invalid-response');
   }
-  for (let hop = 0; ; hop++) {
-    if (!isTrustedModelUrl(url, opts.allowedHosts)) throw new TripoError(url.hostname || url.protocol, 'untrusted-host');
-    let res: Response;
-    try {
-      res = await f(url.toString(), { method: 'GET', redirect: 'manual', credentials: 'omit', signal });
-    } catch (e) {
-      throw transportError(e, timeout, opts.signal);
+
+  const ctrl = new AbortController();
+  const signal = opts.signal ? AbortSignal.any([ctrl.signal, opts.signal]) : ctrl.signal;
+  let timeoutError: TripoError | null = null;
+  const expire = (message: string) => () => {
+    timeoutError ??= new TripoError(message, 'timeout');
+    ctrl.abort(timeoutError);
+  };
+  const total = setTimeout(expire('Model download took too long'), opts.totalTimeoutMs ?? DEFAULT_TIMEOUTS.downloadTotalMs);
+  const headersTimer = setTimeout(expire('Model download timed out'), opts.timeoutMs ?? DEFAULT_TIMEOUTS.downloadMs);
+  let idle: ReturnType<typeof setTimeout> | undefined;
+  const clearTimers = () => {
+    clearTimeout(total);
+    clearTimeout(headersTimer);
+    clearTimeout(idle);
+  };
+
+  let res: Response;
+  try {
+    for (let hop = 0; ; hop++) {
+      if (!isTrustedModelUrl(url, opts.allowedHosts)) throw new TripoError(url.hostname || url.protocol, 'untrusted-host');
+      try {
+        res = await f(url.toString(), { method: 'GET', redirect: 'manual', credentials: 'omit', signal });
+      } catch (e) {
+        throw transportError(e, timeoutError !== null, opts.signal);
+      }
+      if (res.status >= 300 && res.status < 400) {
+        const location = res.headers.get('location');
+        await res.body?.cancel().catch(() => {});
+        if (!location || hop >= maxRedirects) throw new TripoError('Too many redirects downloading the model', 'http', res.status);
+        url = new URL(location, url);
+        continue;
+      }
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        throw new TripoError(`Model download failed (HTTP ${res.status})`, 'http', res.status);
+      }
+      break;
     }
-    if (res.status >= 300 && res.status < 400) {
-      const location = res.headers.get('location');
-      await res.body?.cancel().catch(() => {});
-      if (!location || hop >= maxRedirects) throw new TripoError('Too many redirects downloading the model', 'http', res.status);
-      url = new URL(location, url);
-      continue;
-    }
-    if (!res.ok) {
-      await res.body?.cancel().catch(() => {});
-      throw new TripoError(`Model download failed (HTTP ${res.status})`, 'http', res.status);
-    }
+  } catch (e) {
+    clearTimers();
+    settle();
+    throw e;
+  }
+  clearTimeout(headersTimer);
+  if (!res.body) {
+    clearTimers();
+    settle();
     return res;
   }
+
+  // Relay the body, re-arming the idle timer on every chunk.
+  const reader = res.body.getReader();
+  const idleMs = opts.idleTimeoutMs ?? DEFAULT_TIMEOUTS.downloadIdleMs;
+  let finished = false;
+  let out!: ReadableStreamDefaultController<Uint8Array>;
+  const finish = () => {
+    finished = true;
+    clearTimers();
+    signal.removeEventListener('abort', onAbort);
+    settle();
+  };
+  const onAbort = () => {
+    if (finished) return;
+    finish();
+    const reason = timeoutError ?? new TripoError('Request aborted', 'aborted');
+    out.error(reason);
+    reader.cancel(reason).catch(() => {});
+  };
+  const arm = () => {
+    clearTimeout(idle);
+    idle = setTimeout(expire('Model download stalled'), idleMs);
+  };
+  const body = new ReadableStream<Uint8Array>(
+    {
+      start(c) {
+        out = c;
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) onAbort();
+        else arm();
+      },
+      async pull(c) {
+        let chunk: ReadableStreamReadResult<Uint8Array>;
+        try {
+          chunk = await reader.read();
+        } catch (e) {
+          if (!finished) {
+            finish();
+            c.error(timeoutError ?? e);
+          }
+          return;
+        }
+        if (finished) return;
+        if (chunk.done) {
+          finish();
+          c.close();
+        } else {
+          arm();
+          c.enqueue(chunk.value);
+        }
+      },
+      cancel(reason) {
+        finish();
+        return reader.cancel(reason);
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
 }

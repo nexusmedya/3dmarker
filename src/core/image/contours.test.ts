@@ -237,6 +237,48 @@ describe('simplifyGroups', () => {
     }
   });
 
+  it('keeps holes inside their outer ring and islands inside their hole', () => {
+    // A 64-gon whose simplified triangle can pass between the pieces inside it
+    // without touching them. y-down: outers have a positive area, holes negative.
+    const circle = (cx: number, cy: number, r: number, hole: boolean): Point[] => {
+      const pts: Point[] = [];
+      for (let k = 0; k < 64; k++) pts.push([cx + r * Math.cos((k * Math.PI) / 32), cy + r * Math.sin((k * Math.PI) / 32)]);
+      return hole ? pts.reverse() : pts;
+    };
+    const square = (x: number, y: number, hole: boolean): Point[] => {
+      const pts: Point[] = [[x, y], [x + 2, y], [x + 2, y + 2], [x, y + 2]];
+      return hole ? pts.reverse() : pts;
+    };
+    const nested = (groups: ReturnType<typeof simplifyGroups>, islandIn: (g: number) => Point[] | null) => {
+      for (const [gi, g] of groups.entries()) {
+        for (const h of g.holes) expect(pointInPolygon(h[0][0], h[0][1], g.outer)).toBe(true);
+        const parent = islandIn(gi);
+        if (parent) expect(pointInPolygon(g.outer[0][0], g.outer[0][1], parent)).toBe(true);
+      }
+      expect(findIntersectingRings(groups.flatMap((g) => [g.outer, ...g.holes])).size).toBe(0);
+    };
+
+    // Two holes, above and below the centre.
+    const holes = simplifyGroups([{ outer: circle(20, 20, 10, false), holes: [square(19, 24, true), square(19, 14, true)] }], 0, { maxPoints: 9 });
+    expect(holes[0].holes).toHaveLength(2);
+    nested(holes, () => null);
+
+    // An island off the centre of a round hole.
+    const withIsland = simplifyGroups([
+      { outer: [[0, 0], [40, 0], [40, 40], [0, 40]], holes: [circle(20, 20, 10, true)] },
+      { outer: square(19, 24, false), holes: [] },
+    ], 0, { maxPoints: 10 });
+    nested(withIsland, (g) => (g === 1 ? withIsland[0].holes[0] : null));
+  });
+
+  it('does not collapse every ring when maxPoints cannot be met', () => {
+    // 3 points per ring already exceed maxPoints: leave the tolerance alone.
+    const m = maskOf(40, 40, (x, y) => (Math.floor(x / 4) + Math.floor(y / 4)) % 2 === 1 && x > 0 && y > 0 && x < 39 && y < 39);
+    const groups = groupContours(traceContours(m));
+    const out = simplifyGroups(groups, 0.1, { maxPoints: 10 });
+    expect(out.map((g) => g.outer.length)).toEqual(groups.map((g) => simplifyPolyline(g.outer, 0.1).length));
+  });
+
   it('raises the tolerance to respect maxPoints', () => {
     const m = maskOf(300, 300, (x, y) => Math.hypot(x - 150, y - 150) < 140);
     const groups = groupContours(traceContours(m));

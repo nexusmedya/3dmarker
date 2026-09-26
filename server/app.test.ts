@@ -1,6 +1,15 @@
-import { describe, expect, it } from 'vitest';
-import { MAX_IMAGE_BYTES } from '../src/drivers/cloud/api';
-import { createApp, parseTaskFields, rateKeyForIp, toTaskState, type ServerEnv } from './app';
+import { describe, expect, it, vi } from 'vitest';
+import { CLIENT_HEADER, CLIENT_HEADER_VALUE, MAX_IMAGE_BYTES } from '../src/drivers/cloud/api';
+import {
+  MAX_DOWNLOADS_PER_CLIENT,
+  MAX_UPLOADS_PER_CLIENT,
+  createApp,
+  parseForwardedHop,
+  parseTaskFields,
+  rateKeyForIp,
+  toTaskState,
+  type ServerEnv,
+} from './app';
 
 const SERVER_KEY = 'tsk_serverSecret_9f8e7d6c5b';
 const USER_KEY = 'tsk_userSecret_1a2b3c4d5e';
@@ -87,9 +96,14 @@ function setup(s: Setup = {}) {
   };
   const app = createApp({ fetch: tripo.fetch, env: s.env ?? {}, logger, now: s.now });
   const bodies: string[] = [];
-  /** app.request that also records every response body (for the "no key leaks" checks). */
-  const request = async (path: string, init?: RequestInit) => {
-    const res = await app.request(path, init);
+  /**
+   * app.request that also records every response body (for the "no key leaks"
+   * checks). Sends our client's header unless `client` is false.
+   */
+  const request = async (path: string, init: RequestInit = {}, { client = true } = {}) => {
+    const headers = new Headers(init.headers);
+    if (client && !headers.has(CLIENT_HEADER)) headers.set(CLIENT_HEADER, CLIENT_HEADER_VALUE);
+    const res = await app.request(path, { ...init, headers });
     const buf = new Uint8Array(await res.arrayBuffer());
     const text = new TextDecoder().decode(buf);
     bodies.push(text);
@@ -254,6 +268,12 @@ describe('POST /api/tripo/tasks', () => {
     const { request, calls } = setup({ env: { TRIPO_API_KEY: SERVER_KEY } });
     const r = await request('/api/tripo/tasks', post(imageForm(), { 'sec-fetch-site': 'cross-site' }));
     expect(r.status).toBe(403);
+    // Plain-HTTP origins get no Sec-Fetch-Site: a no-cors form POST from another site lacks our client header.
+    const noCors = await request('/api/tripo/tasks', post(imageForm(), { origin: 'http://evil.example' }), { client: false });
+    expect(noCors.status).toBe(403);
+    expect(noCors.json().error).toMatch(/Cross-site/);
+    const wrong = await request('/api/tripo/tasks', post(imageForm(), { [CLIENT_HEADER]: '0' }));
+    expect(wrong.status).toBe(403);
     expect(calls).toHaveLength(0);
     const same = await request('/api/tripo/tasks', post(imageForm(), { 'sec-fetch-site': 'same-origin' }));
     expect(same.status).toBe(200);
@@ -288,6 +308,19 @@ describe('POST /api/tripo/tasks', () => {
     expect((await request('/api/tripo/tasks', from('10.0.0.1'))).status).toBe(200);
     expect((await request('/api/tripo/tasks', from('10.0.0.1'))).status).toBe(429);
     expect((await request('/api/tripo/tasks', from('10.0.0.2'))).status).toBe(200);
+  });
+
+  it('ignores the port some proxies append to the forwarded client IP', async () => {
+    const { request, logs } = setup({ env: { TRIPO_API_KEY: SERVER_KEY, TRIPO_RATE_LIMIT: '1', TRUST_PROXY: '1' } });
+    const from = (hop: string) => post(imageForm(), { 'x-forwarded-for': hop });
+    expect((await request('/api/tripo/tasks', from('1.2.3.4:50001'))).status).toBe(200);
+    expect((await request('/api/tripo/tasks', from('1.2.3.4:50002'))).status).toBe(429);
+    expect((await request('/api/tripo/tasks', from('[2001:db8::1]:443'))).status).toBe(200);
+    expect((await request('/api/tripo/tasks', from('[2001:db8::2]:444'))).status).toBe(429); // same /64
+    // Garbage falls back to the socket address (one shared bucket here) and is logged once.
+    expect((await request('/api/tripo/tasks', from('garbage'))).status).toBe(200);
+    expect((await request('/api/tripo/tasks', from('garbage:1'))).status).toBe(429);
+    expect(logs.filter((l) => l.includes('X-Forwarded-For'))).toHaveLength(1);
   });
 
   it('uses a separate, larger budget for user keys', async () => {
@@ -334,16 +367,178 @@ describe('POST /api/tripo/tasks', () => {
   });
 });
 
+describe('uploads in progress', () => {
+  type Kind = 'png' | 'gif' | 'garbage' | 'broken';
+
+  /** POST /api/tripo/tasks whose body is held back until `send()`; `pulls` counts reads of it. */
+  async function heldUpload(kind: Kind, headers: Record<string, string> = {}) {
+    let data: Uint8Array;
+    let type: string;
+    if (kind === 'garbage' || kind === 'broken') {
+      data = new TextEncoder().encode('this is not multipart');
+      type = 'multipart/form-data; boundary=----nope';
+    } else {
+      const encoded = new Response(imageForm(bytes(kind === 'png' ? PNG_HEAD : GIF_HEAD)));
+      type = encoded.headers.get('content-type')!;
+      data = new Uint8Array(await encoded.arrayBuffer());
+    }
+    const state = { pulls: 0 };
+    let send!: () => void;
+    const gate = new Promise<void>((resolve) => (send = resolve));
+    const body = new ReadableStream<Uint8Array>(
+      {
+        async pull(c) {
+          state.pulls++;
+          await gate;
+          if (kind === 'broken') return c.error(new Error('client went away'));
+          c.enqueue(data);
+          c.close();
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const init = {
+      method: 'POST',
+      body,
+      duplex: 'half',
+      headers: { 'content-type': type, [CLIENT_HEADER]: CLIENT_HEADER_VALUE, ...headers },
+    } as RequestInit;
+    return { init, state, send };
+  }
+
+  /** Start held uploads and wait until each one is being read (i.e. holds its slot). */
+  async function start(app: ReturnType<typeof setup>['app'], uploads: Awaited<ReturnType<typeof heldUpload>>[]) {
+    const responses = uploads.map((u) => app.request('/api/tripo/tasks', u.init));
+    await vi.waitFor(() => expect(uploads.every((u) => u.state.pulls > 0)).toBe(true));
+    return responses;
+  }
+
+  it(`lets one client have ${MAX_UPLOADS_PER_CLIENT} uploads in progress and refuses more before reading them`, async () => {
+    const { app, request, calls } = setup({ env: { TRIPO_API_KEY: SERVER_KEY, TRIPO_RATE_LIMIT: '0' } });
+    expect(MAX_UPLOADS_PER_CLIENT).toBe(3);
+    const held = await Promise.all((['png', 'gif', 'garbage'] as const).map((k) => heldUpload(k)));
+    const pending = await start(app, held);
+
+    const extra = await heldUpload('png');
+    const refused = await app.request('/api/tripo/tasks', extra.init);
+    expect(refused.status).toBe(429);
+    expect(refused.headers.get('retry-after')).toBe('5');
+    expect((await refused.json()).error).toMatch(/uploads in progress/);
+    expect(extra.state.pulls).toBe(0);
+
+    // Every way out (success, 415, 400) gives the slot back.
+    held.forEach((h) => h.send());
+    expect((await Promise.all(pending)).map((r) => r.status)).toEqual([200, 415, 400]);
+    const again = await Promise.all([1, 2, 3].map(() => request('/api/tripo/tasks', post(imageForm()))));
+    expect(again.map((r) => r.status)).toEqual([200, 200, 200]);
+    expect(calls.filter((c) => c.url.endsWith('/task'))).toHaveLength(4);
+  });
+
+  it('gives the slot back when an upload breaks off', async () => {
+    const { app, request } = setup({ env: { TRIPO_API_KEY: SERVER_KEY } });
+    const held = await Promise.all([1, 2, 3].map(() => heldUpload('broken')));
+    const pending = await start(app, held);
+    held.forEach((h) => h.send());
+    for (const r of await Promise.all(pending)) expect(r.status).toBeGreaterThanOrEqual(400);
+    expect((await request('/api/tripo/tasks', post(imageForm()))).status).toBe(200);
+  });
+
+  it('does not let parallel uploads overshoot the rate limit', async () => {
+    const { app, request, calls } = setup({ env: { TRIPO_API_KEY: SERVER_KEY, TRIPO_RATE_LIMIT: '2' } });
+    const held = await Promise.all([1, 2].map(() => heldUpload('png')));
+    const pending = await start(app, held);
+    const third = await heldUpload('png');
+    const r = await app.request('/api/tripo/tasks', third.init);
+    expect(r.status).toBe(429);
+    expect(third.state.pulls).toBe(0);
+    held.forEach((h) => h.send());
+    expect((await Promise.all(pending)).map((x) => x.status)).toEqual([200, 200]);
+    expect((await request('/api/tripo/tasks', post(imageForm()))).status).toBe(429);
+    expect(calls.filter((c) => c.url.endsWith('/task'))).toHaveLength(2);
+  });
+
+  it('frees pending window slots when those uploads turn out invalid', async () => {
+    const { app, request } = setup({ env: { TRIPO_API_KEY: SERVER_KEY, TRIPO_RATE_LIMIT: '1' } });
+    const [gif] = await Promise.all([heldUpload('gif')]);
+    const pending = await start(app, [gif]);
+    expect((await request('/api/tripo/tasks', post(imageForm()))).status).toBe(429);
+    gif.send();
+    expect((await pending[0]).status).toBe(415);
+    expect((await request('/api/tripo/tasks', post(imageForm()))).status).toBe(200);
+  });
+
+  it('caps uploads in progress over all clients (TRIPO_MAX_CONCURRENT_UPLOADS)', async () => {
+    const env = { TRIPO_API_KEY: SERVER_KEY, TRUST_PROXY: '1', TRIPO_MAX_CONCURRENT_UPLOADS: '2' };
+    const { app, request } = setup({ env });
+    const held = await Promise.all(['10.0.0.1', '10.0.0.2'].map((ip) => heldUpload('png', { 'x-forwarded-for': ip })));
+    const pending = await start(app, held);
+    const other = await heldUpload('png', { 'x-forwarded-for': '10.0.0.3' });
+    expect((await app.request('/api/tripo/tasks', other.init)).status).toBe(429);
+    expect(other.state.pulls).toBe(0);
+    held.forEach((h) => h.send());
+    await Promise.all(pending);
+    expect((await request('/api/tripo/tasks', post(imageForm(), { 'x-forwarded-for': '10.0.0.3' }))).status).toBe(200);
+
+    // 0 turns the global cap off; the per-client cap still applies.
+    const off = setup({ env: { ...env, TRIPO_MAX_CONCURRENT_UPLOADS: '0' } });
+    const many = await Promise.all(['a', 'b', 'c', 'd', 'e'].map((_, i) => heldUpload('png', { 'x-forwarded-for': `10.1.0.${i}` })));
+    const all = await start(off.app, many);
+    many.forEach((h) => h.send());
+    expect((await Promise.all(all)).map((r) => r.status)).toEqual([200, 200, 200, 200, 200]);
+  });
+});
+
+describe('read routes', () => {
+  it('rate-limits task and model reads per client and minute', async () => {
+    let t = 5_000_000;
+    const { request, calls } = setup({ env: { TRIPO_API_KEY: SERVER_KEY, TRIPO_READ_RATE_LIMIT: '3' }, now: () => t });
+    expect((await request('/api/tripo/tasks/abc')).status).toBe(200);
+    expect((await request('/api/tripo/tasks/abc')).status).toBe(200);
+    expect((await request('/api/tripo/tasks/abc/model')).status).toBe(200);
+    const blocked = await request('/api/tripo/tasks/abc');
+    expect(blocked.status).toBe(429);
+    expect(blocked.res.headers.get('retry-after')).toBe('60');
+    expect(blocked.json().error).toMatch(/Too many requests/);
+    expect((await request('/api/tripo/tasks/abc/model')).status).toBe(429);
+    expect(calls.filter((c) => c.url.includes('/task/'))).toHaveLength(3);
+    // Task creation has its own budget.
+    expect((await request('/api/tripo/tasks', post(imageForm()))).status).toBe(200);
+    t += 60_000;
+    expect((await request('/api/tripo/tasks/abc')).status).toBe(200);
+  });
+
+  it('keeps the read budget apart from the creation budget', async () => {
+    const { request } = setup({ env: { TRIPO_API_KEY: SERVER_KEY, TRIPO_RATE_LIMIT: '1' } });
+    expect((await request('/api/tripo/tasks', post(imageForm()))).status).toBe(200);
+    expect((await request('/api/tripo/tasks', post(imageForm()))).status).toBe(429);
+    for (let i = 0; i < 40; i++) expect((await request('/api/tripo/tasks/abc')).status).toBe(200);
+  });
+
+  it('treats 0 as unlimited', async () => {
+    const { request } = setup({ env: { TRIPO_API_KEY: SERVER_KEY, TRIPO_READ_RATE_LIMIT: '0' } });
+    for (let i = 0; i < 400; i++) expect((await request(`/api/tripo/tasks/t${i}`)).status).toBe(200);
+  });
+
+  it('refuses cross-site reads before calling Tripo', async () => {
+    const { request, calls } = setup({ env: { TRIPO_API_KEY: SERVER_KEY } });
+    for (const path of ['/api/tripo/tasks/task-123', '/api/tripo/tasks/task-123/model']) {
+      expect((await request(path, { headers: { 'sec-fetch-site': 'cross-site' } })).status).toBe(403);
+      expect((await request(path, {}, { client: false })).status).toBe(403);
+    }
+    expect(calls).toHaveLength(0);
+  });
+});
+
 describe('GET /api/tripo/tasks/:id', () => {
   it('maps task states', async () => {
     const cases: [Partial<TripoState>, object][] = [
       [{ status: 'queued', progress: 0 }, { status: 'queued', progress: 0 }],
       [{ status: 'running', progress: 42.4 }, { status: 'running', progress: 42 }],
       [{ status: 'success', progress: 99 }, { status: 'success', progress: 100 }],
-      [{ status: 'failed', progress: 10 }, { status: 'failed', progress: 10, error: expect.any(String) }],
+      [{ status: 'failed', progress: 10 }, { status: 'failed', progress: 10, reason: 'failed', error: expect.any(String) }],
       [{ status: 'cancelled', progress: 10 }, { status: 'cancelled', progress: 10, error: expect.any(String) }],
-      [{ status: 'banned', progress: 0 }, { status: 'failed', progress: 0, error: expect.stringMatching(/moderation/) }],
-      [{ status: 'expired', progress: 0 }, { status: 'failed', progress: 0, error: expect.stringMatching(/expired/) }],
+      [{ status: 'banned', progress: 0 }, { status: 'failed', progress: 0, reason: 'banned', error: expect.stringMatching(/moderation/) }],
+      [{ status: 'expired', progress: 0 }, { status: 'failed', progress: 0, reason: 'expired', error: expect.stringMatching(/expired/) }],
       [{ status: 'something-new', progress: 7 }, { status: 'unknown', progress: 7 }],
     ];
     for (const [task, expected] of cases) {
@@ -472,6 +667,45 @@ describe('GET /api/tripo/tasks/:id/model', () => {
     expect(r.status).toBe(502);
     expect(r.json().error).toMatch(/HTTP 403/);
   });
+
+  it('answers HEAD without opening the CDN download', async () => {
+    const { request, calls } = setup({ env: { TRIPO_API_KEY: SERVER_KEY } });
+    const r = await request('/api/tripo/tasks/task-123/model', { method: 'HEAD' });
+    expect(r.status).toBe(200);
+    expect(r.buf.length).toBe(0);
+    expect(r.res.headers.get('content-type')).toBe('model/gltf-binary');
+    expect(calls.map((c) => c.url)).toEqual([`${API}/task/task-123`]);
+    const running = setup({ env: { TRIPO_API_KEY: SERVER_KEY }, task: { status: 'running', progress: 50 } });
+    expect((await running.request('/api/tripo/tasks/task-123/model', { method: 'HEAD' })).status).toBe(409);
+  });
+
+  it(`limits one client to ${MAX_DOWNLOADS_PER_CLIENT} model downloads at a time`, async () => {
+    const cdnBodies: { cancelled: boolean }[] = [];
+    const { app, request } = setup({
+      env: { TRIPO_API_KEY: SERVER_KEY },
+      override: (c) => {
+        if (c.url !== MODEL_URL) return undefined;
+        const state = { cancelled: false };
+        cdnBodies.push(state);
+        const body = new ReadableStream<Uint8Array>({ pull: () => new Promise(() => {}), cancel: () => void (state.cancelled = true) });
+        return new Response(body);
+      },
+    });
+    const open = () => app.request('/api/tripo/tasks/task-123/model', { headers: { [CLIENT_HEADER]: CLIENT_HEADER_VALUE } });
+    const streams: Response[] = [];
+    for (let i = 0; i < MAX_DOWNLOADS_PER_CLIENT; i++) streams.push(await open());
+    expect(streams.map((r) => r.status)).toEqual(Array(MAX_DOWNLOADS_PER_CLIENT).fill(200));
+    const refused = await request('/api/tripo/tasks/task-123/model');
+    expect(refused.status).toBe(429);
+    expect(refused.json().error).toMatch(/model downloads in progress/);
+    expect(cdnBodies).toHaveLength(MAX_DOWNLOADS_PER_CLIENT);
+    // A client going away frees its slot and closes the CDN connection.
+    await streams.shift()!.body!.cancel();
+    expect(cdnBodies[0].cancelled).toBe(true);
+    const next = await open();
+    expect(next.status).toBe(200);
+    await Promise.all([...streams, next].map((r) => r.body!.cancel()));
+  });
 });
 
 describe('secrets', () => {
@@ -525,5 +759,17 @@ describe('helpers', () => {
     expect(rateKeyForIp('2001:db8:0:1:bbbb:cccc:dddd:eeee')).toBe('2001:db8:0:1::/64');
     expect(rateKeyForIp('2001:db8::1')).toBe('2001:db8:0:0::/64');
     expect(rateKeyForIp('fe80::1%eth0')).toBe('fe80:0:0:0::/64');
+  });
+
+  it('parseForwardedHop strips proxy-added ports but never cuts bare IPv6', () => {
+    expect(parseForwardedHop('1.2.3.4:5678')).toBe('1.2.3.4');
+    expect(parseForwardedHop(' 1.2.3.4 ')).toBe('1.2.3.4');
+    expect(parseForwardedHop('[2001:db8::1]:443')).toBe('2001:db8::1');
+    expect(parseForwardedHop('[2001:db8::1]')).toBe('2001:db8::1');
+    expect(parseForwardedHop('2001:db8::1')).toBe('2001:db8::1');
+    expect(parseForwardedHop('::1')).toBe('::1');
+    expect(parseForwardedHop('2001:db8::1234')).toBe('2001:db8::1234');
+    expect(parseForwardedHop('::ffff:1.2.3.4')).toBe('::ffff:1.2.3.4');
+    for (const bad of ['garbage', 'unknown', '1.2.3.4:', '[2001:db8::1]:x', '1.2.3.4:5:6', '']) expect(parseForwardedHop(bad), bad).toBeNull();
   });
 });

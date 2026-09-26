@@ -17,15 +17,23 @@ interface Window {
   count: number;
 }
 
-const SWEEP_THRESHOLD = 10_000;
+/** Most keys kept at once; past it the oldest window is dropped (that client's count restarts). */
+export const MAX_RATE_KEYS = 100_000;
 
 export class FixedWindowRateLimiter {
+  /** Kept in window-start order, so expired windows always form a prefix. */
   private readonly windows = new Map<string, Window>();
 
   constructor(
     private readonly windowMs: number,
     private readonly now: () => number = Date.now,
+    private readonly maxKeys: number = MAX_RATE_KEYS,
   ) {}
+
+  /** Number of keys currently tracked. */
+  get size(): number {
+    return this.windows.size;
+  }
 
   /** Would a hit for `key` be allowed? Does not count. `limit` ≤ 0 disables limiting. */
   peek(key: string, limit: number): RateDecision {
@@ -44,7 +52,10 @@ export class FixedWindowRateLimiter {
     if (!w || t - w.start >= this.windowMs) {
       w = { start: t, count: 0 };
       if (count) {
-        if (this.windows.size >= SWEEP_THRESHOLD) this.sweep(t);
+        // Re-insert (not just overwrite) so the key moves to the back with its new start time.
+        this.windows.delete(key);
+        this.sweep(t);
+        if (this.windows.size >= this.maxKeys) this.windows.delete(this.windows.keys().next().value!);
         this.windows.set(key, w);
       }
     }
@@ -54,7 +65,42 @@ export class FixedWindowRateLimiter {
     return { allowed: true, remaining: limit - w.count, retryAfterSec };
   }
 
+  /** Drop expired windows: they are the oldest, so stop at the first live one (amortised O(1)). */
   private sweep(t: number): void {
-    for (const [k, w] of this.windows) if (t - w.start >= this.windowMs) this.windows.delete(k);
+    for (const [k, w] of this.windows) {
+      if (t - w.start < this.windowMs) break;
+      this.windows.delete(k);
+    }
+  }
+}
+
+/** Requests in progress per key (e.g. uploads whose body is still arriving); empty keys are dropped. */
+export class InFlight {
+  private readonly counts = new Map<string, number>();
+  private all = 0;
+
+  /** In progress for `key`. */
+  count(key: string): number {
+    return this.counts.get(key) ?? 0;
+  }
+
+  /** In progress over all keys. */
+  get total(): number {
+    return this.all;
+  }
+
+  /** Take a slot for `key`; the returned function gives it back (only its first call counts). */
+  acquire(key: string): () => void {
+    this.counts.set(key, this.count(key) + 1);
+    this.all++;
+    let held = true;
+    return () => {
+      if (!held) return;
+      held = false;
+      this.all--;
+      const n = this.count(key) - 1;
+      if (n > 0) this.counts.set(key, n);
+      else this.counts.delete(key);
+    };
   }
 }

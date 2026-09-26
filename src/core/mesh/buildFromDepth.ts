@@ -35,9 +35,16 @@
  * style them separately (a single material ignores groups).
  */
 import { BufferAttribute, BufferGeometry } from 'three';
-import type { DepthMap, Mask } from '../types';
+import type { DepthMap, I18nText, Mask } from '../types';
+import { LocalizedError } from '../errors';
 import { blurFloat, resizeMask, sampleBilinear } from '../image/ops';
 import type { MeshMode, MeshOptions } from './options';
+
+/** Thrown by buildGeometryFromDepth when a non-empty mask leaves no triangle on the grid. */
+export const EMPTY_MESH: I18nText = {
+  tr: 'Mesh boş çıktı: siluet bu çözünürlük için çok küçük ya da ince. "Çözünürlük" değerini artırın, "Siluet kalıplama (ekstrüzyon)" sürücüsünü deneyin ya da "Saydam alanları kes" seçeneğini kapatın.',
+  en: 'The mesh came out empty: the silhouette is too small or thin for this resolution. Raise "Resolution", try the "Silhouette extrude" driver, or turn off "Cut transparent areas".',
+};
 
 /** Minimum front/back separation (scene units) in the closed modes. */
 export const MIN_THICKNESS = 1e-3;
@@ -173,7 +180,11 @@ function shapeDepth(src: Float32Array, fg: Uint8Array | null, gw: number, gh: nu
   return out;
 }
 
-/** Build the mesh for a depth map (see the file comment for the modes and frame). */
+/**
+ * Build the mesh for a depth map (see the file comment for the modes and
+ * frame). An all-background mask gives an empty geometry; a mask whose
+ * foreground is too small or thin for the grid throws LocalizedError(EMPTY_MESH).
+ */
 export function buildGeometryFromDepth(depth: DepthMap, mask: Mask | null, opts: MeshOptions): BufferGeometry {
   const [gw, gh] = gridSize(depth.width, depth.height, opts.resolution);
   const grid = sampleDepthGrid(depth, opts.useMask ? mask : null, gw, gh);
@@ -247,6 +258,9 @@ export function buildGeometryFromDepth(depth: DepthMap, mask: Mask | null, opts:
     vmap[triV[o]] = vmap[triV[o + 1]] = vmap[triV[o + 2]] = 0;
     if (closed) for (let k = 0; k < 3; k++) if (edgeUse[triE[o + k]] === 1) nWall++;
   }
+  // The majority vote per grid vertex erases silhouettes thinner than about
+  // 1.5 cells; say so rather than returning an invisible, empty model.
+  if (nTri === 0 && fg && mask && mask.data.some((v) => v !== 0)) throw new LocalizedError(EMPTY_MESH);
   let nF = 0;
   for (let k = 0; k < vmap.length; k++) if (vmap[k] === 0) vmap[k] = nF++;
 

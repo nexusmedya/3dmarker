@@ -3,15 +3,23 @@
  * singleton worker, promise-based requests with progress callbacks and
  * AbortSignal support. The client class takes a worker factory so its logic
  * can be unit-tested with a fake worker.
+ *
+ * transformers.js queues every ONNX Runtime session create/run on
+ * module-level promise chains without error handling, and ORT caches a failed
+ * backend/wasm init: after one ORT failure every later job in that worker
+ * fails the same way. So a worker that reported an error is replaced, and a
+ * WebGPU failure is retried on WASM in a fresh worker.
  */
 import { AbortError } from '../../core/types';
 import { localizeMlError } from './errors';
 import {
   deserializeError,
+  WEBGPU_FAILED_ERROR,
   type AlphaPayload,
   type BackgroundRemovalJob,
   type DepthJob,
   type DepthPayload,
+  type MlDevice,
   type MlEnvConfig,
   type MlJob,
   type MlProgress,
@@ -41,13 +49,24 @@ interface Pending {
   resolve: (r: MlResult) => void;
   reject: (e: unknown) => void;
   onProgress?: (p: MlProgress) => void;
+  /** The worker running the request. */
+  worker: WorkerLike;
   stage?: MlStage;
+  device?: MlDevice;
+  /** device 'auto' jobs: the same job on WASM with its own copy of the pixels (the posted ones are transferred). */
+  wasmRetry?: MlJob;
+  /** Model id, set while the job re-runs on WASM after WebGPU failed. */
+  wasmFallback?: string;
 }
 
 export class MlWorkerClient {
   private worker: WorkerLike | null = null;
+  /** Replaced workers that still have requests in flight; terminated once those settle. */
+  private retired = new Set<WorkerLike>();
   private pending = new Map<number, Pending>();
   private nextId = 1;
+  /** Models whose WebGPU path failed while WASM worked: later 'auto' jobs go straight to WASM. */
+  private wasmOnly = new Set<string>();
 
   constructor(
     private readonly factory: () => WorkerLike,
@@ -58,10 +77,12 @@ export class MlWorkerClient {
    * Send a job. The image buffer is transferred (the caller's array is
    * detached), so pass a freshly allocated image.
    * Rejects with AbortError when `signal` aborts; the worker may finish the
-   * job anyway and its result is ignored.
+   * job anyway and its result is ignored. A job whose WebGPU attempt fails is
+   * retried on WASM in a fresh worker.
    */
-  run(job: MlJobInput, { signal, onProgress }: MlRequestOptions = {}): Promise<MlResult> {
+  run(input: MlJobInput, { signal, onProgress }: MlRequestOptions = {}): Promise<MlResult> {
     if (signal?.aborted) return Promise.reject(new AbortError());
+    const job: MlJobInput = input.device === 'auto' && this.wasmOnly.has(input.model) ? { ...input, device: 'wasm' } : input;
     let worker: WorkerLike;
     try {
       worker = this.ensureWorker();
@@ -72,21 +93,24 @@ export class MlWorkerClient {
     return new Promise<MlResult>((resolve, reject) => {
       const onAbort = () => this.abort(id);
       const cleanup = () => signal?.removeEventListener('abort', onAbort);
-      this.pending.set(id, {
+      const p: Pending = {
         resolve: (r) => { cleanup(); resolve(r); },
         reject: (e) => { cleanup(); reject(e); },
         onProgress,
-      });
+        worker,
+      };
+      this.pending.set(id, p);
       signal?.addEventListener('abort', onAbort, { once: true });
       try {
         const data = job.image.data;
         const whole = data.buffer instanceof ArrayBuffer && data.byteOffset === 0 && data.byteLength === data.buffer.byteLength;
         const pixels = whole ? data : data.slice();
-        worker.postMessage({ ...job, id, image: { ...job.image, data: pixels } } as MlJob, [pixels.buffer as ArrayBuffer]);
+        const msg = { ...job, id, image: { ...job.image, data: pixels } } as MlJob;
+        if (job.device === 'auto') p.wasmRetry = { ...msg, device: 'wasm', image: { ...job.image, data: data.slice() } } as MlJob;
+        worker.postMessage(msg, [pixels.buffer as ArrayBuffer]);
       } catch (e) {
-        const p = this.pending.get(id);
         this.pending.delete(id);
-        p?.reject(e);
+        p.reject(e);
       }
     });
   }
@@ -102,10 +126,11 @@ export class MlWorkerClient {
     this.worker?.postMessage({ type: 'dispose' });
   }
 
-  /** Kill the worker; pending requests reject with AbortError. */
+  /** Kill the workers; pending requests reject with AbortError. */
   terminate(): void {
-    this.failAll(new AbortError());
-    this.reset();
+    this.fail(new AbortError());
+    for (const w of [...this.retired]) this.kill(w);
+    if (this.worker) this.kill(this.worker);
   }
 
   get pendingCount(): number {
@@ -115,28 +140,63 @@ export class MlWorkerClient {
   private ensureWorker(): WorkerLike {
     if (this.worker) return this.worker;
     const w = this.factory();
-    w.onmessage = (e) => this.onMessage(e.data);
+    w.onmessage = (e) => this.onMessage(w, e.data);
     w.onerror = (e) => {
       e.preventDefault?.();
-      this.failAll(new Error(`ML worker error: ${e.message || 'failed to start'}`));
-      this.reset();
+      this.kill(w);
+      this.fail(new Error(`ML worker error: ${e.message || 'failed to start'}`), w);
     };
     if (Object.keys(this.config).length > 0) w.postMessage({ type: 'configure', config: this.config });
     this.worker = w;
     return w;
   }
 
-  private onMessage(msg: MlResponse): void {
-    const p = this.pending.get(msg.id);
-    if (!p) return; // aborted, or from a terminated generation
+  private onMessage(w: WorkerLike, msg: MlResponse): void {
+    const found = this.pending.get(msg.id);
+    const p = found?.worker === w ? found : undefined; // else aborted, or from a replaced worker
     if (msg.type === 'progress') {
-      p.stage = msg.stage;
-      p.onProgress?.(msg);
+      if (p) {
+        p.stage = msg.stage;
+        if (msg.device) p.device = msg.device;
+        if (msg.device === 'wasm') p.wasmRetry = undefined; // past WebGPU: free the pixel copy
+        p.onProgress?.(msg);
+      }
       return;
     }
-    this.pending.delete(msg.id);
-    if (msg.type === 'result') p.resolve(msg.result);
-    else p.reject(deserializeError(msg.error));
+    // Any failure may have poisoned ORT in this worker (see the header), even
+    // for an aborted job. Missing weight files are reported before ORT runs.
+    if (msg.type === 'error' && msg.error.name !== 'ModelFileNotFoundError') this.retire(w);
+    if (p) {
+      if (msg.type === 'error' && msg.error.name === WEBGPU_FAILED_ERROR && p.wasmRetry) {
+        this.retryOnWasm(msg.id, p);
+      } else {
+        this.pending.delete(msg.id);
+        if (msg.type === 'result') {
+          // Only blame WebGPU once WASM worked (a network error fails both).
+          if (p.wasmFallback) this.wasmOnly.add(p.wasmFallback);
+          p.resolve(msg.result);
+        } else {
+          p.reject(deserializeError(msg.error));
+        }
+      }
+    }
+    this.reap(w);
+  }
+
+  /** Re-run a job whose WebGPU attempt failed on WASM in a fresh worker (same id, callbacks and abort handling). */
+  private retryOnWasm(id: number, p: Pending): void {
+    const job = p.wasmRetry!;
+    p.wasmRetry = undefined;
+    p.wasmFallback = job.model;
+    p.stage = undefined;
+    p.device = undefined;
+    try {
+      p.worker = this.ensureWorker();
+      p.worker.postMessage(job, [job.image.data.buffer as ArrayBuffer]);
+    } catch (e) {
+      this.pending.delete(id);
+      p.reject(e);
+    }
   }
 
   private abort(id: number): void {
@@ -144,29 +204,49 @@ export class MlWorkerClient {
     if (!p) return;
     this.pending.delete(id);
     p.reject(new AbortError());
-    if (p.stage === 'download' && this.pending.size === 0) {
-      // Nobody else is waiting: kill the worker to stop the download
-      // (transformers.js caches files only once fully read).
-      this.reset();
-    } else {
-      this.worker?.postMessage({ type: 'cancel', id });
+    // Neither a download nor WASM inference (synchronous on the worker thread)
+    // can be interrupted, and the next job would silently queue behind it. If
+    // nobody else is waiting, kill the worker. By the inference stage every
+    // weight file is in the Cache API, so a new worker only re-creates the ORT
+    // session. Not on 'load': it is also emitted while the last downloaded file
+    // may still be written to the cache. WebGPU inference is fast: keep its
+    // warm pipelines and let the worker drop the result.
+    const killable = p.stage === 'download' || (p.stage === 'inference' && p.device === 'wasm');
+    if (!this.busy(p.worker) && (killable || this.retired.has(p.worker))) this.kill(p.worker);
+    else p.worker.postMessage({ type: 'cancel', id });
+  }
+
+  /** Reject pending requests (only those running on `w`, if given). */
+  private fail(err: unknown, w?: WorkerLike): void {
+    for (const [id, p] of [...this.pending]) {
+      if (w && p.worker !== w) continue;
+      this.pending.delete(id);
+      p.reject(err);
     }
   }
 
-  private failAll(err: unknown): void {
-    const all = [...this.pending.values()];
-    this.pending.clear();
-    for (const p of all) p.reject(err);
+  private busy(w: WorkerLike): boolean {
+    for (const p of this.pending.values()) if (p.worker === w) return true;
+    return false;
   }
 
-  private reset(): void {
-    const w = this.worker;
+  /** New requests go to a fresh worker; `w` is terminated once its in-flight requests settle. */
+  private retire(w: WorkerLike): void {
+    if (w !== this.worker) return;
     this.worker = null;
-    if (w) {
-      w.onmessage = null;
-      w.onerror = null;
-      w.terminate();
-    }
+    this.retired.add(w);
+  }
+
+  private reap(w: WorkerLike): void {
+    if (this.retired.has(w) && !this.busy(w)) this.kill(w);
+  }
+
+  private kill(w: WorkerLike): void {
+    if (w === this.worker) this.worker = null;
+    this.retired.delete(w);
+    w.onmessage = null;
+    w.onerror = null;
+    w.terminate();
   }
 }
 

@@ -8,7 +8,7 @@
  * `new Worker(new URL('../../workers/ml.worker.ts', import.meta.url), { type: 'module' })`.
  */
 import type { BackgroundRemovalPipeline, DepthEstimationPipeline } from '@huggingface/transformers';
-import { MlEngine, SerialQueue, type GpuInfo } from './mlEngine';
+import { detectGpu, MlEngine, SerialQueue, type GpuLike } from './mlEngine';
 import { serializeError, type MlJob, type MlProgress, type MlRequest, type MlResponse, type MlResult } from './mlProtocol';
 import { configureEnv, initEnv, loadPipeline, runBackgroundRemoval, runDepth, type AnyPipeline } from './mlTasks';
 
@@ -23,16 +23,12 @@ interface WorkerScope {
 }
 const scope = self as unknown as WorkerScope;
 
-async function detectGpu(): Promise<GpuInfo> {
-  type Adapter = { features: { has(f: string): boolean } };
-  const gpu = (navigator as unknown as { gpu?: { requestAdapter(o?: object): Promise<Adapter | null> } }).gpu;
-  if (!gpu) return { available: false, fp16: false };
-  const adapter = await gpu.requestAdapter({ powerPreference: 'high-performance' });
-  return adapter ? { available: true, fp16: adapter.features.has('shader-f16') } : { available: false, fp16: false };
-}
-
 initEnv();
-const engine = new MlEngine<AnyPipeline>({ load: loadPipeline, dispose: (p) => p.dispose(), detectGpu });
+const engine = new MlEngine<AnyPipeline>({
+  load: loadPipeline,
+  dispose: (p) => p.dispose(),
+  detectGpu: () => detectGpu((navigator as unknown as { gpu?: GpuLike }).gpu),
+});
 const queue = new SerialQueue();
 
 function post(msg: MlResponse, transfer: Transferable[] = []): void {

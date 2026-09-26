@@ -47,9 +47,13 @@ export function UploadCard({ source, loading, mask, showMask, onShowMask, onFile
       ref={inputRef}
       id="file-input"
       type="file"
-      accept="image/png,image/jpeg,image/webp,image/*"
+      accept="image/png,image/jpeg,image/webp,image/svg+xml,image/*"
       className="visually-hidden"
       data-testid="file-input"
+      // Named and focus-ringed by the dropzone <label>; once an image is shown
+      // the visible "Change" button opens it, so it leaves the tab order.
+      tabIndex={source ? -1 : undefined}
+      aria-hidden={source ? true : undefined}
       onChange={(e) => {
         const file = e.target.files?.[0];
         if (file) onFile(file);

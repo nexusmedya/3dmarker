@@ -3,6 +3,7 @@
  * (transformers.js 'depth-estimation' pipeline in a worker).
  */
 import { throwIfAborted, type Availability, type Driver, type I18nText, type ParamSpec, type ParamValues } from '../../core/types';
+import { yieldToPaint } from '../../core/yield';
 import { mlProgressToProgress, processDepth, type DepthConvention } from './postprocess';
 import { prepareInferenceImage } from './prepare';
 import { isMlSupported, requestDepth } from './workerClient';
@@ -149,6 +150,8 @@ export function createDepthDriver(spec: DepthModelSpec): Driver {
       throwIfAborted(signal);
 
       onProgress({ label: { tr: 'Son işlem…', en: 'Post-processing…' } });
+      await yieldToPaint(); // show the label during the synchronous post-processing
+      throwIfAborted(signal);
       const depth = processDepth(raw, {
         width: image.width,
         height: image.height,

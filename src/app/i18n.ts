@@ -10,8 +10,10 @@ export const LANGS: Lang[] = ['tr', 'en'];
 export const UI = {
   appName: { tr: '3D Marker', en: '3D Marker' },
   tagline: { tr: 'Görselden 3D modele, tarayıcınızda', en: 'Image to 3D, right in your browser' },
+  docTitle: { tr: '3D Marker — Görselden 3D', en: '3D Marker — Image to 3D' },
   beta: { tr: 'beta', en: 'beta' },
 
+  navLabel: { tr: 'Ana gezinme', en: 'Primary' },
   navStudio: { tr: 'Stüdyo', en: 'Studio' },
   navHow: { tr: 'Nasıl çalışır', en: 'How it works' },
   navDrivers: { tr: 'Sürücüler', en: 'Drivers' },
@@ -78,6 +80,10 @@ export const UI = {
     en: 'Mesh settings apply instantly without re-running the driver',
   },
   meshSuggested: { tr: 'Mesh tipi bu sürücü için “{mode}” olarak ayarlandı.', en: 'Mesh type set to “{mode}” for this driver.' },
+  meshPending: {
+    tr: 'Mesh tipi bir sonraki oluşturmada bu sürücü için “{mode}” olarak ayarlanacak.',
+    en: 'Mesh type will be set to “{mode}” for this driver on the next generation.',
+  },
   reset: { tr: 'Sıfırla', en: 'Reset' },
   noParams: { tr: 'Bu sürücünün ayarı yok.', en: 'This driver has no settings.' },
   show: { tr: 'Göster', en: 'Show' },
@@ -96,6 +102,7 @@ export const UI = {
   loadingModule: { tr: 'Model yükleniyor…', en: 'Loading model…' },
   buildingMesh: { tr: 'Mesh oluşturuluyor…', en: 'Building mesh…' },
   loadingGlb: { tr: 'GLB modeli açılıyor…', en: 'Opening GLB model…' },
+  percent: { tr: '%{pct}', en: '{pct}%' },
   elapsed: { tr: '{s} sn', en: '{s} s' },
   errorTitle: { tr: 'Oluşturma başarısız', en: 'Generation failed' },
   imageErrorTitle: { tr: 'Görsel yüklenemedi', en: 'Could not load the image' },

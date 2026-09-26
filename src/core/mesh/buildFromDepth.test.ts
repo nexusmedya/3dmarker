@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { BufferGeometry } from 'three';
 import type { DepthMap, Mask } from '../types';
-import { buildGeometryFromDepth, gridSize, MIN_THICKNESS, sampleDepthGrid } from './buildFromDepth';
+import { LocalizedError } from '../errors';
+import { buildGeometryFromDepth, EMPTY_MESH, gridSize, MIN_THICKNESS, sampleDepthGrid } from './buildFromDepth';
 import { DEFAULT_MESH_OPTIONS, type MeshMode, type MeshOptions } from './options';
 import { computeMeshStats } from './stats';
 
@@ -284,6 +285,29 @@ describe('buildGeometryFromDepth', () => {
     const empty = buildGeometryFromDepth(wide, maskOf(50, 25, () => false), opts({ mode: 'solid' }));
     expect(empty.getAttribute('position').count).toBe(0);
     expect(computeMeshStats(empty)).toEqual({ vertices: 0, triangles: 0, watertight: false });
+  });
+
+  it('explains (instead of returning an empty mesh) when the silhouette vanishes on the grid', () => {
+    const flat = depthOf(1024, 1024, () => 0.5);
+    const dot = maskOf(1024, 1024, (x, y) => x > 500 && x < 504 && y > 500 && y < 504); // 4×4 px
+    const line = maskOf(1024, 1024, (x, y) => x > 100 && x < 900 && y > 511 && y < 512); // 800×1 px
+    for (const mode of MODES) {
+      for (const mask of [dot, line]) {
+        const err = (() => {
+          try {
+            buildGeometryFromDepth(flat, mask, opts({ mode, resolution: 256 }));
+          } catch (e) {
+            return e;
+          }
+        })();
+        expect(err).toBeInstanceOf(LocalizedError);
+        expect((err as LocalizedError).i18n).toBe(EMPTY_MESH);
+      }
+      // A finer grid catches the dot; without the mask the full frame is meshed.
+      expect(tris(buildGeometryFromDepth(flat, dot, opts({ mode, resolution: 512 })))).toBeGreaterThan(0);
+      expect(tris(buildGeometryFromDepth(flat, line, opts({ mode, resolution: 256, useMask: false })))).toBeGreaterThan(0);
+    }
+    expect(EMPTY_MESH.en).toMatch(/Resolution/);
   });
 
   it('builds a 512² solid quickly', () => {

@@ -3,13 +3,41 @@
  * selection with fallbacks, and a serial job queue. transformers.js is
  * injected (see ml.worker.ts) so this logic is unit-testable in Node.
  */
-import type { MlDevice, MlDevicePref, MlPrecision, MlProgress, MlTask } from './mlProtocol';
+import { WEBGPU_FAILED_ERROR, type MlDevice, type MlDevicePref, type MlPrecision, type MlProgress, type MlTask } from './mlProtocol';
 import { DownloadProgressTracker, type LoadProgressEvent } from '../drivers/ml/postprocess';
 
 export interface GpuInfo {
   available: boolean;
-  /** Adapter supports 'shader-f16' (required for fp16 models on WebGPU). */
+  /**
+   * fp16 models can run on WebGPU: the adapter ONNX Runtime uses has 'shader-f16', and so does the
+   * default adapter transformers.js' own pre-check (isWebGpuFp16Supported) asks for (see detectGpu).
+   */
   fp16: boolean;
+}
+
+/** The part of `navigator.gpu` detectGpu uses. */
+export interface GpuLike {
+  requestAdapter(options?: { powerPreference?: 'low-power' | 'high-performance' }): Promise<{ features: { has(f: string): boolean } } | null>;
+}
+
+/**
+ * WebGPU capabilities for `navigator.gpu`. ONNX Runtime runs on the
+ * high-performance adapter (transformers.js backends/onnx.js sets
+ * env.webgpu.powerPreference), but transformers.js refuses fp16 unless the
+ * default adapter (`requestAdapter()`, utils/dtypes.js) has 'shader-f16', so
+ * fp16 is offered only when both agree (they can differ on dual-GPU machines).
+ */
+export async function detectGpu(gpu: GpuLike | undefined): Promise<GpuInfo> {
+  if (!gpu) return { available: false, fp16: false };
+  const adapter = await gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) return { available: false, fp16: false };
+  let fallback: Awaited<ReturnType<GpuLike['requestAdapter']>> = null;
+  try {
+    fallback = await gpu.requestAdapter();
+  } catch {
+    // transformers.js treats this as "no fp16" too
+  }
+  return { available: true, fp16: adapter.features.has('shader-f16') && !!fallback?.features.has('shader-f16') };
 }
 
 export interface LoadRequest {
@@ -51,11 +79,31 @@ export function isMissingWeightsError(e: unknown): boolean {
   return e instanceof Error && e.name === 'ModelFileNotFoundError' && /\.onnx/.test(e.message);
 }
 
+/**
+ * transformers.js' fp16 pre-check failed (models/session.js getSession throws
+ * "The device (webgpu) does not support fp16." before any .onnx download or
+ * ORT session), so the next dtype on the same device is safe to try.
+ */
+export function isUnsupportedDtypeError(e: unknown): boolean {
+  return e instanceof Error && /does not support fp16/.test(e.message);
+}
+
+/**
+ * The WebGPU attempt failed inside ONNX Runtime (or somewhere we cannot tell):
+ * wrap it so the client retries on WASM in a fresh worker. Keeps the message.
+ */
+export function webGpuFailedError(cause: unknown): Error {
+  const err = new Error(cause instanceof Error ? cause.message : String(cause), { cause });
+  err.name = WEBGPU_FAILED_ERROR;
+  if (cause instanceof Error && cause.stack) err.stack = cause.stack;
+  return err;
+}
+
 export class MlEngine<P> {
   private cache = new Map<string, P>();
   /** (task, model, device, precision) → cache key of the dtype that loaded. */
   private resolved = new Map<string, string>();
-  /** Models whose WebGPU path failed while WASM worked; they go straight to WASM. */
+  /** Models whose WebGPU weights were unusable while WASM worked; they go straight to WASM. */
   private webgpuBroken = new Set<string>();
   private gpu: Promise<GpuInfo> | null = null;
 
@@ -63,7 +111,13 @@ export class MlEngine<P> {
 
   /**
    * Run `fn` with a (cached) pipeline. Tries WebGPU first when allowed and
-   * available, and retries once on WASM if WebGPU loading/inference throws.
+   * available. If WebGPU fails before ONNX Runtime is involved (missing
+   * weights, fp16 pre-check), retries once on WASM here. Any other WebGPU
+   * failure throws WebGpuFailedError: transformers.js queues every ORT session
+   * create/run on a module-level promise chain without error handling
+   * (backends/onnx.js webInitChain/webInferenceChain) and ORT caches a failed
+   * backend init, so every later ORT call in this worker would fail the same
+   * way. The client retries on WASM in a fresh worker instead.
    */
   async run<R>(
     spec: RunSpec,
@@ -85,9 +139,11 @@ export class MlEngine<P> {
         return { result, device, dtype };
       } catch (e) {
         if (device === 'wasm') throw e;
-        console.warn(`[ml] WebGPU failed for ${spec.model}, retrying on WASM:`, e);
-        webgpuFailed = true;
         await this.drop(`${spec.task}|${spec.model}|webgpu|`);
+        const beforeOrt = isMissingWeightsError(e) || isUnsupportedDtypeError(e);
+        console.warn(`[ml] WebGPU failed for ${spec.model}, retrying on WASM${beforeOrt ? '' : ' in a fresh worker'}:`, e);
+        if (!beforeOrt) throw webGpuFailedError(e);
+        webgpuFailed = true;
       }
     }
     throw new Error('unreachable: the WASM attempt either returns or throws');
@@ -134,7 +190,7 @@ export class MlEngine<P> {
         this.resolved.set(resolvedKey, key);
         return { pipe, dtype };
       } catch (e) {
-        if (isMissingWeightsError(e) && i < candidates.length - 1) continue;
+        if ((isMissingWeightsError(e) || isUnsupportedDtypeError(e)) && i < candidates.length - 1) continue;
         throw e;
       }
     }

@@ -207,17 +207,25 @@ function boxPass(
  */
 export function normalizeDepth(depth: DepthMap, mask: Mask | null = null, robust = true): DepthMap {
   const { width, height, data } = depth;
-  const vals: number[] = [];
-  for (let i = 0; i < data.length; i++) if (!mask || mask.data[i]) vals.push(data[i]);
-  if (vals.length === 0) return { width, height, data: new Float32Array(data.length) };
+  let count = 0;
+  for (let i = 0; i < data.length; i++) if (!mask || mask.data[i]) count++;
+  if (count === 0) return { width, height, data: new Float32Array(data.length) };
+  // A typed array sorts numerically without a comparator, ~4× faster than a
+  // number[] with one (this runs on the main thread after every ML inference).
+  const vals = new Float32Array(count);
+  for (let i = 0, k = 0; i < data.length; i++) if (!mask || mask.data[i]) vals[k++] = data[i];
   let lo: number, hi: number;
-  if (robust && vals.length > 100) {
-    vals.sort((a, b) => a - b);
-    lo = vals[Math.floor(vals.length * 0.01)];
-    hi = vals[Math.min(vals.length - 1, Math.floor(vals.length * 0.99))];
+  if (robust && count > 100) {
+    vals.sort();
+    lo = vals[Math.floor(count * 0.01)];
+    hi = vals[Math.min(count - 1, Math.floor(count * 0.99))];
   } else {
     lo = Infinity; hi = -Infinity;
-    for (const v of vals) { if (v < lo) lo = v; if (v > hi) hi = v; }
+    for (let i = 0; i < count; i++) {
+      const v = vals[i];
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
   }
   const span = hi - lo > 1e-12 ? hi - lo : 1;
   const out = new Float32Array(data.length);

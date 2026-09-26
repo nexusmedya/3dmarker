@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { DriverInput, Mask, RGBAImage } from '../../core/types';
 import { AbortError, defaultParams } from '../../core/types';
 import {
@@ -137,5 +137,30 @@ describe('luminanceDriver', () => {
     const ac = new AbortController();
     ac.abort();
     await expect(run(ramp, null, ac.signal)).rejects.toBeInstanceOf(AbortError);
+  });
+
+  it('waits for a paint after its progress label, before the synchronous step', async () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => frames.push(cb));
+    try {
+      const labels: string[] = [];
+      let settled = false;
+      const job = luminanceDriver
+        .run({
+          image: ramp, mask: null, file: new Blob(), signal: new AbortController().signal,
+          onProgress: (p) => labels.push(p.label.en), params: defaultParams(luminanceDriver.params),
+        })
+        .finally(() => (settled = true));
+      await vi.waitFor(() => expect(frames.length).toBe(1));
+      expect(labels).toEqual(['Computing height map']);
+      expect(settled).toBe(false);
+      frames.shift()!(0);
+      await vi.waitFor(() => expect(frames.length).toBe(1));
+      frames.shift()!(0);
+      expect((await job).kind).toBe('depth');
+      expect(labels).toEqual(['Computing height map', 'Done']);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

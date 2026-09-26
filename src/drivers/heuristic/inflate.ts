@@ -7,6 +7,7 @@
  */
 import type { DepthMap, Driver, DriverInput, DriverResult, I18nText, Mask, ParamSpec, RGBAImage } from '../../core/types';
 import { throwIfAborted } from '../../core/types';
+import { yieldToPaint } from '../../core/yield';
 import { LocalizedError } from '../../core/errors';
 import { blurFloat, luminance, maskArea, maskFromAlpha, resizeMask } from '../../core/image/ops';
 import { distanceTransform, unionOfSpheres } from '../../core/image/distance';
@@ -160,6 +161,7 @@ function addDetail(depth: Float32Array, image: RGBAImage, mask: Mask, amount: nu
   return normaliseMax(out, m);
 }
 
+/** Let queued input (Cancel / Esc) run between steps. */
 const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 
 const PARAMS: ParamSpec[] = [
@@ -229,7 +231,8 @@ export const inflateDriver: Driver = {
     await tick();
     throwIfAborted(signal);
     onProgress({ label: { tr: 'Şişiriliyor', en: 'Inflating' }, ratio: 0.4 });
-    await tick();
+    await yieldToPaint(); // show the label during the synchronous step
+    throwIfAborted(signal);
     const depth = inflateDepth(mask, image, optionsFromParams(input.params));
     throwIfAborted(signal);
     onProgress({ label: { tr: 'Tamamlandı', en: 'Done' }, ratio: 1 });

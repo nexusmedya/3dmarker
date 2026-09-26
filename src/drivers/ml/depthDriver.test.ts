@@ -145,4 +145,29 @@ describe('depth driver run()', () => {
     });
     await expect(driver('depth-anything-v2-small').run(input({ signal: ac2.signal }))).rejects.toBeInstanceOf(AbortError);
   });
+
+  it('lets the post-processing label paint before the synchronous step, and honours a cancel meanwhile', async () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => frames.push(cb));
+    try {
+      const ac = new AbortController();
+      const inp = input({ signal: ac.signal });
+      let settled = false;
+      const run = driver('depth-anything-v2-small').run(inp);
+      run.then(
+        () => (settled = true),
+        () => (settled = true),
+      );
+      await vi.waitFor(() => expect(frames.length).toBe(1));
+      expect(inp.progress.at(-1)?.label.en).toBe('Post-processing…');
+      expect(settled).toBe(false);
+      ac.abort(); // e.g. Esc, dispatched while the label is being painted
+      frames.shift()!(0);
+      await vi.waitFor(() => expect(frames.length).toBe(1));
+      frames.shift()!(0);
+      await expect(run).rejects.toBeInstanceOf(AbortError);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });

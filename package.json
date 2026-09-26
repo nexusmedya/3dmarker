@@ -9,7 +9,7 @@
     "dev:api": "tsx watch server/index.ts",
     "build": "tsc -p tsconfig.json && vite build",
     "preview": "vite preview",
-    "start": "NODE_ENV=production tsx server/index.ts",
+    "start": "tsx server/index.ts --production",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",

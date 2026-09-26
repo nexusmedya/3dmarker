@@ -1,8 +1,10 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest';
-import { BoxGeometry, DoubleSide, FrontSide, Mesh, MeshStandardMaterial, Vector3, Box3 } from 'three';
-import type { DepthMap, Driver, DriverResult, Mask, Progress, RGBAImage } from '../core/types';
+import { BoxGeometry, DoubleSide, FrontSide, Mesh, MeshBasicMaterial, MeshStandardMaterial, Vector3, Box3 } from 'three';
+import type { DepthMap, Driver, DriverResult, Mask, ParamValues, Progress, RGBAImage } from '../core/types';
 import { AbortError } from '../core/types';
+import { LocalizedError } from '../core/errors';
 import { exportObject } from '../core/export/exporters';
+import { computeMeshStats } from '../core/mesh/stats';
 import {
   WORKING_MAX_SIDE,
   buildDepthModel,
@@ -92,6 +94,12 @@ describe('prepareSource', () => {
     expect(src.image.width).toBe(WORKING_MAX_SIDE);
     expect(src.image.height).toBe(WORKING_MAX_SIDE / 2);
     expect(src.name).toBe('big.png');
+  });
+
+  it('decodes straight to the working size', async () => {
+    const load = vi.fn(async () => image(8, 8));
+    await prepareSource(new Blob(), 'x.png', load);
+    expect(load).toHaveBeenCalledWith(expect.any(Blob), WORKING_MAX_SIDE);
   });
 
   it('keeps small images untouched', async () => {
@@ -193,6 +201,77 @@ describe('buildDepthModel / remesh', () => {
     expect(mat.side).toBe(FrontSide);
     expect(mat.map).toBe(tex); // texture kept across re-meshing
     expect(model.meshKey).toBe(meshKeyOf({ mode: 'solid', resolution: 48 }));
+  });
+
+  it('re-meshing changes the side of the surface material even while the viewer shows a display material', () => {
+    const model = buildDepthModel(dome(16, 16), null, null, { mode: 'solid', resolution: 16 });
+    const mesh = model.object as Mesh;
+    const orig = mesh.material as MeshStandardMaterial;
+    expect(orig.side).toBe(FrontSide);
+    // Stand-in for ViewerCore's clay / wireframe / texture-off material swap.
+    const display = new MeshBasicMaterial({ side: FrontSide });
+    mesh.material = display;
+    model.remesh!({ mode: 'relief', resolution: 16 });
+    expect(orig.side).toBe(DoubleSide); // the material the viewer restores and exports
+    expect(display.side).toBe(FrontSide); // display material untouched (the viewer resyncs its clones)
+    display.side = DoubleSide;
+    model.remesh!({ mode: 'solid', resolution: 16 });
+    expect(orig.side).toBe(FrontSide);
+    expect(display.side).toBe(DoubleSide);
+    expect(mesh.material).toBe(display);
+  });
+
+  it('depthMeshStats (read from the builder layout) equals the full welded check', () => {
+    const W = 48, H = 40;
+    const maskOf = (f: (x: number, y: number) => boolean): Mask => {
+      const data = new Uint8Array(W * H);
+      for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) data[y * W + x] = f(x, y) ? 1 : 0;
+      return { width: W, height: H, data };
+    };
+    let seed = 7;
+    const rand = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
+    const masks: (Mask | null)[] = [
+      null,
+      maskOf(() => false), // all background → empty geometry
+      maskOf((x, y) => (x - 24) ** 2 + (y - 20) ** 2 < 15 ** 2 && (x - 24) ** 2 + (y - 20) ** 2 > 5 ** 2), // ring (hole)
+      maskOf((x, y) => (x < 14 && y < 14) || (x > 30 && y > 22) || (x >= 14 && x < 16 && y > 5 && y < 30)), // islands, thin bridge
+      maskOf((x, y) => (x + y) % 2 === 0 || (x > 10 && x < 38 && y > 8 && y < 32)), // checkerboard fringe (pinches)
+      maskOf(() => rand() < 0.7), // noise
+    ];
+    const depths = [dome(W, H), { width: W, height: H, data: Float32Array.from({ length: W * H }, () => rand()) }];
+    let checked = 0;
+    for (const mask of masks)
+      for (const depth of depths)
+        for (const mode of ['relief', 'solid', 'double'] as const)
+          for (const extra of [{}, { resolution: 23, smoothing: 0, discontinuity: 0.2 }, { resolution: 64, depthScale: 0, baseThickness: 0 }] as ParamValues[]) {
+            const model = buildDepthModel(depth, mask, null, { mode, resolution: 32, ...extra });
+            const geometry = (model.object as Mesh).geometry;
+            expect(model.stats, `${mode} ${JSON.stringify(extra)}`).toEqual(computeMeshStats(geometry));
+            expect(model.remesh!({ mode, resolution: 40, ...extra })).toEqual(computeMeshStats((model.object as Mesh).geometry));
+            checked++;
+          }
+    expect(checked).toBe(masks.length * depths.length * 9);
+  });
+
+  it('a re-mesh that would come out empty throws and keeps the surface, stats and meshKey', () => {
+    const S = 1024;
+    const depth: DepthMap = { width: S, height: S, data: new Float32Array(S * S).fill(0.5) };
+    const dot: Mask = { width: S, height: S, data: new Uint8Array(S * S) };
+    for (let y = 501; y < 505; y++) for (let x = 501; x < 505; x++) dot.data[y * S + x] = 1; // 4×4 px
+    const model = buildDepthModel(depth, dot, null, { mode: 'solid', resolution: 512 });
+    const mesh = model.object as Mesh;
+    const geometry = mesh.geometry;
+    const stats = model.stats;
+    const key = model.meshKey;
+    expect(stats.triangles).toBeGreaterThan(0);
+    // useStudio turns the error into jobFailed; the model on screen must stay intact.
+    expect(() => model.remesh!({ mode: 'solid', resolution: 256 })).toThrow(LocalizedError);
+    expect(mesh.geometry).toBe(geometry);
+    expect(geometry.getAttribute('position').count).toBeGreaterThan(0);
+    expect(model.stats).toBe(stats);
+    expect(model.meshKey).toBe(key);
+    // And building one from scratch fails before anything is allocated for the viewer.
+    expect(() => buildDepthModel(depth, dot, null, { mode: 'relief', resolution: 256 })).toThrow(LocalizedError);
   });
 
   it('meshKeyOf normalises equivalent params', () => {
@@ -297,6 +376,29 @@ describe('runPipeline', () => {
     await expect(
       runPipeline({ source: source(image(8, 8)), bgMode: 'none', driver, params: {}, meshParams: {}, signal: ctrl.signal, onProgress: noop }),
     ).rejects.toBeInstanceOf(AbortError);
+  });
+
+  it('a cancel that queued up while the mesh was built still aborts the job (and frees the model)', async () => {
+    const ctrl = new AbortController();
+    const geometry = new BoxGeometry(1, 1, 1);
+    const disposed = vi.fn();
+    geometry.addEventListener('dispose', disposed);
+    let frames = 0;
+    // Frames 1–2: the yield before the build; frame 3: the one after it, when the Esc keydown runs.
+    vi.stubGlobal('requestAnimationFrame', (cb: (t: number) => void) => {
+      if (++frames === 3) ctrl.abort();
+      return setTimeout(() => cb(0), 0);
+    });
+    try {
+      const driver = fakeDriver(() => ({ kind: 'geometry', geometry }));
+      await expect(
+        runPipeline({ source: source(image(8, 8)), bgMode: 'none', driver, params: {}, meshParams: {}, signal: ctrl.signal, onProgress: noop }),
+      ).rejects.toBeInstanceOf(AbortError);
+      expect(frames).toBe(4); // two yields of two frames each
+      expect(disposed).toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('propagates driver errors', async () => {

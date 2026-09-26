@@ -67,25 +67,52 @@ export function GeneratePanel({ status, progress, error, errorTitle, canGenerate
   );
 }
 
-export function ProgressBar({ progress, testId = 'progress', compact }: { progress: Progress | null; testId?: string; compact?: boolean }) {
+/** True when a driver's label already shows a percentage ("… 37%", "… %37"). */
+export function labelHasPercent(label: string): boolean {
+  return /\d\s*%|%\s*\d/.test(label);
+}
+
+/**
+ * Progress label + bar. `decorative` renders a visual-only copy (no live
+ * region / progressbar role) so a second bar, e.g. the viewer overlay's, is
+ * not announced twice.
+ */
+export function ProgressBar({
+  progress,
+  testId = 'progress',
+  compact,
+  decorative,
+}: {
+  progress: Progress | null;
+  testId?: string;
+  compact?: boolean;
+  decorative?: boolean;
+}) {
   const { t, tx } = useI18n();
   const ratio = progress?.ratio;
   const known = typeof ratio === 'number' && Number.isFinite(ratio);
   const pct = known ? Math.round(Math.min(1, Math.max(0, ratio)) * 100) : null;
   const label = progress ? tx(progress.label) : t('starting');
+  const pctText = pct !== null ? t('percent', { pct }) : null;
   return (
-    <div className={`progress${compact ? ' progress-compact' : ''}`} data-testid={testId}>
-      <div className="progress-text" aria-live="polite">
+    <div className={`progress${compact ? ' progress-compact' : ''}`} data-testid={testId} aria-hidden={decorative || undefined}>
+      <div className="progress-text" aria-live={decorative ? undefined : 'polite'}>
         <span className="truncate">{label}</span>
-        {pct !== null && <span className="tabular">{pct}%</span>}
+        {/* The bar's own number, unless the driver's label already carries one. */}
+        {pctText !== null && !labelHasPercent(label) && <span className="tabular">{pctText}</span>}
       </div>
       <div
         className={`progress-track${known ? '' : ' is-indeterminate'}`}
-        role="progressbar"
-        aria-label={label}
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={pct ?? undefined}
+        {...(decorative
+          ? {}
+          : {
+              role: 'progressbar',
+              'aria-label': label,
+              'aria-valuemin': 0,
+              'aria-valuemax': 100,
+              'aria-valuenow': pct ?? undefined,
+              'aria-valuetext': pctText ?? undefined,
+            })}
       >
         <div className="progress-fill" style={known ? { width: `${pct}%` } : undefined} />
       </div>
