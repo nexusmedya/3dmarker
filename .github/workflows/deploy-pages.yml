@@ -46,6 +46,10 @@ jobs:
       - name: Configure Pages
         id: pages
         uses: actions/configure-pages@v5
+        with:
+          # This repository has no Pages site yet; create one with "GitHub
+          # Actions" as its source instead of only reading an existing config.
+          enablement: true
 
       - name: Build (static, project-page base path)
         env:
