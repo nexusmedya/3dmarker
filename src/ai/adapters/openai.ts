@@ -34,7 +34,9 @@ export function openAiSize(setting: unknown, aspect: ImageEditRequest['aspect'])
   if (aspect === 'portrait') return '1024x1536';
   if (aspect === 'landscape') return '1536x1024';
   if (aspect === 'square') return '1024x1024';
-  return 'auto';
+  // No aspect (background removal): leave it to the server default rather than 'auto',
+  // which not every GPT image model documents.
+  return undefined;
 }
 
 export function editPath(kind: OpenAiKind): string {
@@ -55,7 +57,8 @@ export function buildEditForm(
   else images.forEach((b, i) => form.append('image[]', b, fileName(b, `image-${i + 1}`)));
   const gpt = isGptImage(model);
   if (gpt) {
-    form.append('background', req.transparentBackground ? 'transparent' : 'auto');
+    // Only 'transparent' is sent: the server default is 'auto', and the 2.5 models document only opaque / transparent.
+    if (req.transparentBackground) form.append('background', 'transparent');
     form.append('output_format', 'png');
     const quality = cfg.values.quality;
     if (typeof quality === 'string' && quality !== 'auto') form.append('quality', quality);
@@ -98,6 +101,9 @@ export function createOpenAiAdapter(kind: OpenAiKind): ProviderAdapter {
 
   return {
     kind,
+    editImageLimit: () => 16,
+    // GPT image models return real alpha with background=transparent (dall-e does not).
+    supportsAlpha: (cfg) => isGptImage(modelFor(cfg, 'image-edit')),
     editImage: (cfg, req) => edit(cfg, modelFor(cfg, 'image-edit'), req),
     removeBackground: (cfg, image, signal) =>
       edit(cfg, modelFor(cfg, 'background-removal'), {

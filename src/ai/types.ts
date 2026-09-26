@@ -163,6 +163,10 @@ export interface ProviderAdapter {
   kind: ProviderKindId;
   /** Returns a PNG (or other image) blob. */
   editImage?(cfg: ProviderConfig, req: ImageEditRequest): Promise<Blob>;
+  /** How many reference images editImage actually sends (default: all). */
+  editImageLimit?(cfg: ProviderConfig): number;
+  /** The image-edit model takes and returns real transparency (else references are flattened over white). */
+  supportsAlpha?(cfg: ProviderConfig): boolean;
   /** Returns the image with a transparent background (PNG). */
   removeBackground?(cfg: ProviderConfig, image: Blob, signal: AbortSignal): Promise<Blob>;
   /** Returns a binary glTF. */

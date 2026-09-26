@@ -96,6 +96,14 @@ describe('view preparation', () => {
     expect(maskBBox(rect(5, 5, 0, 0, 0, 0))).toBeNull();
   });
 
+  it('keeps a small detached part of a given / alpha mask (only pixel noise is dropped)', () => {
+    const m = rect(200, 200, 40, 40, 120, 180);
+    for (let y = 60; y < 66; y++) for (let x = 150; x < 156; x++) m.data[y * 200 + x] = 1; // a 36 px ball, 0.09 % of the image
+    const v = prepareView({ id: 'front', image: blank(200, 200), mask: m })!;
+    expect(v.bbox).toEqual({ x0: 40, y0: 40, x1: 156, y1: 180 });
+    expect(v.mask.data[62 * 200 + 152]).toBe(1);
+  });
+
   it('keeps a dotted silhouette whole when every component is small', () => {
     const m = rect(200, 200, 0, 0, 0, 0);
     for (let y = 10; y < 190; y += 20) for (let x = 10; x < 190; x += 20) m.data[y * 200 + x] = 1;

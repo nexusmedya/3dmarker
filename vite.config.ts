@@ -63,6 +63,10 @@ export default defineConfig(() => {
     test: {
       environment: 'node' as const,
       include: ['src/**/*.test.ts', 'server/**/*.test.ts'],
+      // Several geometry tests take 1–2 s here while all files run in parallel;
+      // shared CI runners (GitHub Actions) are about 2× slower, which would put
+      // them near vitest's 5 s default. Timing budgets are asserted in the tests.
+      testTimeout: 15_000,
     },
   };
 });

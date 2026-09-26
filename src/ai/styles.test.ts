@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { getStyle, STYLE_CATEGORIES, STYLE_KEEP, STYLES } from './styles';
+import { getStyle, STYLE_CATEGORIES, STYLE_KEEP, STYLE_KEEP_POSE, STYLES } from './styles';
 
 describe('STYLES', () => {
   it('has at least 48 presets with unique ids', () => {
@@ -19,9 +19,11 @@ describe('STYLES', () => {
     }
   });
 
-  it('keeps identity / pose / composition and asks for a reconstruction-friendly render', () => {
+  it('keeps identity and asks for a reconstruction-friendly render; the pose is kept separately', () => {
     expect(STYLE_KEEP).toMatch(/identity/);
-    expect(STYLE_KEEP).toMatch(/pose and composition/);
+    // Keeping the pose is added by buildPrepPrompt only when no re-pose / completion is asked for.
+    expect(STYLE_KEEP).not.toMatch(/pose/);
+    expect(STYLE_KEEP_POSE).toMatch(/pose and composition/);
     expect(STYLE_KEEP).toMatch(/3D reconstruction/);
     for (const s of STYLES) expect(s.prompt.endsWith(STYLE_KEEP)).toBe(true);
   });
@@ -30,5 +32,6 @@ describe('STYLES', () => {
     expect(getStyle('marble')?.category).toBe('material');
     expect(getStyle(null)).toBeNull();
     expect(getStyle('nope')).toBeNull();
+    expect(getStyle('brick-minifig')?.id).toBe('block-toy'); // renamed preset in saved options
   });
 });

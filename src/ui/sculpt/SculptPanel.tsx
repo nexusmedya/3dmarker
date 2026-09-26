@@ -2,8 +2,11 @@
  * Sculpt mode card: on / off toggle, the eight brushes, radius / strength /
  * falloff, invert / X symmetry / lock boundary, undo / redo / reset and the
  * shortcut list. Owns the SculptSession of the model on screen (created
- * lazily on the first toggle, re-created when the model object changes,
- * disposed when disabled or unmounted) and reports edited mesh stats.
+ * lazily on the first toggle, re-created when the model object changes).
+ * Unmounting the panel (leaving the Edit step) or losing the permission to
+ * sculpt only ends sculpt mode: the session, with its undo history and the
+ * pre-sculpt mesh for Reset, is kept for the same model. Reports edited mesh
+ * stats (computed once per session: sculpting never changes the topology).
  */
 import { useCallback, useEffect, useId, useRef, useState, type CSSProperties, type MutableRefObject } from 'react';
 import type { Mesh, Object3D } from 'three';
@@ -146,18 +149,63 @@ export function objectStats(root: Object3D): MeshStats {
 }
 
 const IDLE: SculptState = { active: false, canUndo: false, canRedo: false, strokes: 0 };
-/** Stats are recomputed this long after the last edit. */
+
+/**
+ * The session kept while the panel is unmounted (one at a time): coming back
+ * to the Edit step picks up its history. Disposed when another model shows up.
+ */
+let parked: SculptSession | null = null;
+
+/** Keep `session` for later (deactivated); any other kept session is disposed. */
+function parkSession(session: SculptSession): void {
+  if (parked && parked !== session) parked.dispose();
+  session.setActive(false);
+  parked = session.isDisposed ? null : session;
+}
+
+/** Dispose the kept session unless it belongs to `target` (and still edits its meshes). */
+function dropStaleParked(target: Object3D | null): void {
+  if (parked && (parked.root !== target || !parked.attached)) {
+    parked.dispose();
+    parked = null;
+  }
+}
+
+/** The kept session for `target` (taken out of the slot), or null. */
+function takeParked(target: Object3D | null): SculptSession | null {
+  dropStaleParked(target);
+  const s = parked;
+  parked = null;
+  return s;
+}
+
+/** Mesh stats per session (and the geometries they were computed for). */
+const sessionStats = new WeakMap<SculptSession, { geometries: object[]; stats: MeshStats }>();
+
+/** Stats of the session's model, recomputed only when its geometries were swapped. */
+function statsOf(session: SculptSession): MeshStats {
+  const geometries = session.geometries();
+  const hit = sessionStats.get(session);
+  if (hit && hit.geometries.length === geometries.length && hit.geometries.every((g, i) => g === geometries[i])) return hit.stats;
+  const stats = objectStats(session.root);
+  sessionStats.set(session, { geometries, stats });
+  return stats;
+}
+/** Stats are reported this long after the last edit (one update per burst of undo / redo). */
 const STATS_DELAY_MS = 350;
 
 interface Props {
   coreRef: MutableRefObject<ViewerCore | null>;
   model: BuiltModel | null;
   enabled: boolean;
-  onEdited: (stats: MeshStats) => void;
+  /** `strokes`: the session's stroke count after the edit (0 once undone / reset back to where it started). */
+  onEdited: (stats: MeshStats, strokes?: number) => void;
   onActiveChange: (active: boolean) => void;
+  /** A new session was created: its stroke count starts from the geometry as it is now. */
+  onSessionStart?: () => void;
 }
 
-export function SculptPanel({ coreRef, model, enabled, onEdited, onActiveChange }: Props) {
+export function SculptPanel({ coreRef, model, enabled, onEdited, onActiveChange, onSessionStart }: Props) {
   const { lang, tx, int } = useI18n();
   const percent = (v: number) => (lang === 'tr' ? `%${int(Math.round(v * 100))}` : `${int(Math.round(v * 100))}%`);
   const id = useId();
@@ -171,8 +219,8 @@ export function SculptPanel({ coreRef, model, enabled, onEdited, onActiveChange 
   const unsubRef = useRef<(() => void) | null>(null);
   const statsTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeRef = useRef(false);
-  const cbRef = useRef({ onEdited, onActiveChange });
-  cbRef.current = { onEdited, onActiveChange };
+  const cbRef = useRef({ onEdited, onActiveChange, onSessionStart });
+  cbRef.current = { onEdited, onActiveChange, onSessionStart };
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
 
@@ -195,27 +243,40 @@ export function SculptPanel({ coreRef, model, enabled, onEdited, onActiveChange 
     cbRef.current.onActiveChange(on);
   }, []);
 
-  const disposeSession = useCallback(() => {
-    if (statsTimer.current) clearTimeout(statsTimer.current);
-    statsTimer.current = null;
-    unsubRef.current?.();
-    unsubRef.current = null;
-    sessionRef.current?.dispose();
-    sessionRef.current = null;
-    setState(IDLE);
-    setActiveFlag(false);
-  }, [setActiveFlag]);
+  /** Detach the session from the panel: disposed (`keep` false) or parked for a later mount. */
+  const releaseSession = useCallback(
+    (keep: boolean) => {
+      if (statsTimer.current) clearTimeout(statsTimer.current);
+      statsTimer.current = null;
+      unsubRef.current?.();
+      unsubRef.current = null;
+      const s = sessionRef.current;
+      sessionRef.current = null;
+      if (s) {
+        if (keep) parkSession(s);
+        else s.dispose();
+      }
+      if (mountedRef.current) setState(IDLE);
+      setActiveFlag(false);
+    },
+    [setActiveFlag],
+  );
 
-  // A new model (or losing the permission to sculpt) ends the session; the edits stay in the geometry.
+  // A new model ends the session (the edits stay in the geometry); unmounting
+  // (leaving the step) keeps it, with its undo history, for this model.
   useEffect(() => {
     setNoMeshes(false);
     setError(null);
-    return () => disposeSession();
-  }, [object, disposeSession]);
+    dropStaleParked(object);
+    return () => releaseSession(objectRef.current === object);
+  }, [object, releaseSession]);
 
+  // Losing the permission to sculpt (a job running, the model rigged) only ends sculpt mode.
   useEffect(() => {
-    if (!enabled) disposeSession();
-  }, [enabled, disposeSession]);
+    if (enabled) return;
+    sessionRef.current?.setActive(false);
+    setActiveFlag(false);
+  }, [enabled, setActiveFlag]);
 
   useEffect(() => {
     saveJSON(browserStorage(), STORE_KEY, settings);
@@ -226,17 +287,45 @@ export function SculptPanel({ coreRef, model, enabled, onEdited, onActiveChange 
     statsTimer.current = setTimeout(() => {
       statsTimer.current = null;
       if (sessionRef.current !== session) return;
-      cbRef.current.onEdited(objectStats(session.root));
+      cbRef.current.onEdited(statsOf(session), session.state.strokes);
     }, STATS_DELAY_MS);
   }, []);
+
+  /** Make `s` the panel's session and follow its events. */
+  const attach = useCallback(
+    (s: SculptSession) => {
+      sessionRef.current = s;
+      if (s.settings !== settingsRef.current) s.setSettings(settingsRef.current);
+      unsubRef.current = s.subscribe((e) => {
+        if (e.type === 'settings') setSettings(e.settings);
+        else {
+          setState(e.state);
+          if (e.type === 'edit') scheduleStats(s);
+        }
+      });
+    },
+    [scheduleStats],
+  );
 
   const start = useCallback(async () => {
     const core = coreRef.current;
     const target = objectRef.current;
     if (!core || !target || !enabledRef.current) return;
     setError(null);
+    const usable = (s: SculptSession | null) => !!s && s.root === target && s.attached && s.host === core;
+    if (sessionRef.current && !usable(sessionRef.current)) releaseSession(false);
     let session = sessionRef.current;
-    if (!session || session.root !== target || session.isDisposed) {
+    if (!session) {
+      const kept = takeParked(target);
+      if (kept && usable(kept)) {
+        // Re-meshed while away (discard / mesh options): its history no longer
+        // applies; synced before attaching so that is not reported as an edit.
+        kept.syncGeometry();
+        attach(kept);
+        session = kept;
+      } else kept?.dispose();
+    }
+    if (!session) {
       setPreparing(true);
       let Session: typeof SculptSession;
       try {
@@ -262,20 +351,14 @@ export function SculptPanel({ coreRef, model, enabled, onEdited, onActiveChange 
         setNoMeshes(true);
         return;
       }
-      const s = session;
-      sessionRef.current = s;
-      unsubRef.current = s.subscribe((e) => {
-        if (e.type === 'settings') setSettings(e.settings);
-        else {
-          setState(e.state);
-          if (e.type === 'edit') scheduleStats(s);
-        }
-      });
+      statsOf(session); // once, while "Preparing…" shows: strokes never change the topology
+      attach(session);
+      cbRef.current.onSessionStart?.();
     }
     session.setActive(true);
     setState(session.state);
     setActiveFlag(true);
-  }, [coreRef, scheduleStats, setActiveFlag]);
+  }, [attach, coreRef, releaseSession, setActiveFlag]);
 
   const stop = useCallback(() => {
     sessionRef.current?.setActive(false);

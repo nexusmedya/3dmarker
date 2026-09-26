@@ -7,7 +7,7 @@ import { createRequest, replicateAdapter } from './replicate';
 
 const signal = () => new AbortController().signal;
 const saved = { ...aiTiming };
-beforeEach(() => Object.assign(aiTiming, saved, { pollMs: 1 }));
+beforeEach(() => Object.assign(aiTiming, saved, { pollMs: 1, retryBaseMs: 1, retryMaxMs: 2 }));
 afterEach(() => vi.unstubAllGlobals());
 
 const png = () => new Response(pngBlob(), { headers: { 'content-type': 'image/png' } });
@@ -82,5 +82,31 @@ describe('replicateAdapter', () => {
     await expect(replicateAdapter.removeBackground!(cfg, pngBlob(), ctl.signal)).rejects.toBeInstanceOf(AbortError);
     await new Promise((r) => setTimeout(r, 5));
     expect(net.calls.some((c) => c.url.endsWith('/v1/predictions/p5/cancel'))).toBe(true);
+  });
+});
+
+describe('replicate long jobs', () => {
+  it('creates 3D predictions without blocking (so a cancel can reach them) and survives poll blips', async () => {
+    const net = fakeNet()
+      .on('POST', /predictions$/, json({ id: 'p6', status: 'starting' }))
+      .on('GET', /predictions\/p6$/, json({}, 502), new TypeError('Failed to fetch'), json({ id: 'p6', status: 'succeeded', output: 'https://replicate.delivery/z/m.glb' }))
+      .on('GET', 'https://replicate.delivery/z/m.glb', binary(glbBytes(), 'model/gltf-binary'));
+    vi.stubGlobal('fetch', net.fetch);
+    const cfg = createProviderConfig('replicate', { apiKey: 'r8_key' });
+    const glb = await replicateAdapter.toModel!(cfg, { views: { front: pngBlob() }, signal: signal() });
+    expect(glb.byteLength).toBe(64);
+    expect(net.calls[0].headers.get('prefer')).toBeNull();
+  });
+
+  it('cancels the prediction when polling keeps failing', async () => {
+    const net = fakeNet()
+      .on('POST', /predictions\/p9\/cancel$/, json({}))
+      .on('POST', /predictions$/, json({ id: 'p9', status: 'processing' }))
+      .on('GET', /predictions\/p9$/, json({}, 500));
+    vi.stubGlobal('fetch', net.fetch);
+    const cfg = createProviderConfig('replicate', { apiKey: 'r8_key' });
+    await expect(replicateAdapter.toModel!(cfg, { views: { front: pngBlob() }, signal: signal() })).rejects.toMatchObject({ code: 'server' });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(net.calls.filter((c) => c.url.endsWith('/v1/predictions/p9/cancel'))).toHaveLength(1);
   });
 });

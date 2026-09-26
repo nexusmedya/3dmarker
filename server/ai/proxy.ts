@@ -189,10 +189,13 @@ export const AI_KEY_PATTERN = /^[\x21-\x7e]{1,1024}$/;
 
 // --- output downloads (/api/ai/fetch) -----------------------------------------
 
-/** A download allow-list entry: a host (+ its subdomains, or only them for '*.') optionally limited to a path prefix. */
+/**
+ * A download allow-list entry: a host (+ its subdomains, only them for '*.',
+ * or the exact host for an entry with a path) optionally limited to a path prefix.
+ */
 export interface HostRule {
   host: string;
-  subdomains: 'also' | 'only';
+  subdomains: 'also' | 'only' | 'exact';
   /** '/prefix' (no trailing slash) or '' for any path. */
   pathPrefix: string;
 }
@@ -207,8 +210,10 @@ export const DEFAULT_FETCH_HOSTS = 'replicate.delivery,fal.media,storage.googlea
 
 /**
  * Parse 'a.com, *.b.com, c.com/some/prefix'. 'a.com' matches the host and its
- * subdomains, '*.b.com' only subdomains, a path limits the entry to that
- * prefix (on a segment boundary). Invalid entries are dropped; null when empty.
+ * subdomains, '*.b.com' only subdomains; a path limits the entry to that
+ * prefix (on a segment boundary) and to exactly that host ('*.c.com/prefix'
+ * for its subdomains): on shared hosts such as storage.googleapis.com a
+ * subdomain is someone else's bucket. Invalid entries are dropped; null when empty.
  */
 export function parseHostRules(value: string | undefined): HostRule[] | null {
   if (value === undefined || !value.trim()) return null;
@@ -218,7 +223,8 @@ export function parseHostRules(value: string | undefined): HostRule[] | null {
     if (!entry) continue;
     const m = /^(\*\.)?([a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+)\.?(\/[a-z0-9\-._~!$&'()*+,;=:@%/]*)?$/.exec(entry);
     if (!m || isIP(m[2])) continue;
-    rules.push({ host: m[2], subdomains: m[1] ? 'only' : 'also', pathPrefix: (m[3] ?? '').replace(/\/+$/, '') });
+    const pathPrefix = (m[3] ?? '').replace(/\/+$/, '');
+    rules.push({ host: m[2], subdomains: m[1] ? 'only' : pathPrefix ? 'exact' : 'also', pathPrefix });
   }
   return rules.length ? rules : null;
 }
@@ -247,7 +253,8 @@ export function checkFetchUrl(value: string | URL, rules: HostRule[]): FetchUrlC
   const path = url.pathname;
   const pathEncodedSep = /%2f|%5c/i.test(path);
   const allowed = rules.some((r) => {
-    const hostOk = r.subdomains === 'only' ? host.endsWith(`.${r.host}`) : host === r.host || host.endsWith(`.${r.host}`);
+    const hostOk =
+      r.subdomains === 'only' ? host.endsWith(`.${r.host}`) : r.subdomains === 'exact' ? host === r.host : host === r.host || host.endsWith(`.${r.host}`);
     if (!hostOk) return false;
     if (!r.pathPrefix) return true;
     return !pathEncodedSep && (path === r.pathPrefix || path.startsWith(`${r.pathPrefix}/`));

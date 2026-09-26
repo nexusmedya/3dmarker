@@ -50,6 +50,17 @@ describe('ViewsPanel', () => {
     expect(queryTestId('view-clear-right')).toBeNull();
   });
 
+  it('offers multi-view fusion once a view is given, when the shell asks for it', () => {
+    const onUseFusion = vi.fn();
+    const m = mount(createElement(ViewsPanel, props({ onUseFusion })));
+    expect(queryTestId('views-use-fusion')).toBeNull(); // no extra view yet
+    m.render(createElement(ViewsPanel, props({ onUseFusion, views: { back: slot(image(), 'upload') } })));
+    click(byTestId('views-use-fusion'));
+    expect(onUseFusion).toHaveBeenCalledTimes(1);
+    m.render(createElement(ViewsPanel, props({ views: { back: slot(image(), 'upload') } })));
+    expect(queryTestId('views-use-fusion')).toBeNull(); // the driver uses the views already
+  });
+
   it('uploads through the picker and by dropping a file on a slot', () => {
     const p = props();
     mount(createElement(ViewsPanel, p));

@@ -31,7 +31,7 @@ describe('steps', () => {
     for (const id of STEP_IDS) expect(stepStatus(id, none).done, id).toBe(false);
     expect(stepStatus('image', none).hint).toBe(UI.hintTodo);
     expect(stepStatus('edit', none).hint).toBe(UI.hintNeedsModel);
-    expect(stepStatus('views', none).hint).toEqual({ tr: '0/5 görünüm', en: '0/5 views' });
+    expect(stepStatus('views', none).hint).toEqual({ tr: '0/6 görünüm', en: '0/6 views' });
   });
 
   it('completion hints follow the state', () => {
@@ -41,7 +41,10 @@ describe('steps', () => {
     expect(stepStatus('prep', { ...none, preparedInUse: true })).toMatchObject({ done: true, hint: UI.hintPrepared });
     expect(stepStatus('prep', { ...none, aiBusy: 'prep' })).toMatchObject({ busy: true, hint: UI.hintWorking });
     expect(stepStatus('views', { ...none, aiBusy: 'prep' }).busy).toBe(false);
-    expect(stepStatus('views', { ...none, viewCount: 3 })).toMatchObject({ done: false, hint: { tr: '3/5 görünüm', en: '3/5 views' } });
+    expect(stepStatus('views', { ...none, viewCount: 3 })).toMatchObject({ done: false, hint: { tr: '3/6 görünüm', en: '3/6 views' } });
+    // Same count as the views panel: the front (source image) is one of the six.
+    expect(stepStatus('views', { ...none, hasSource: true, viewCount: 2 }).hint).toEqual({ tr: '3/6 görünüm', en: '3/6 views' });
+    expect(stepStatus('views', { ...none, hasSource: true, viewCount: 5 })).toMatchObject({ done: true, hint: { en: '6/6 views' } });
     expect(stepStatus('views', { ...none, viewCount: 5 }).done).toBe(true);
     expect(stepStatus('3d', { ...none, hasModel: true })).toMatchObject({ done: true, hint: UI.hintModel });
     expect(stepStatus('3d', { ...none, modelBusy: true })).toMatchObject({ busy: true });

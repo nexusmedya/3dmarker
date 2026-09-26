@@ -39,8 +39,9 @@ export type HullMode = 'strict' | 'tolerant';
 
 /**
  * What a normalised depth map is fitted to along the view axis:
- *  - 'object': the object box (d = 1 at the box face, d = 0 at k·box depth), never past the middle of
- *              the ray's hull interval; consistent across rays.
+ *  - 'object': one affine map along the view axis for the whole view, its scale calibrated against the
+ *              hull (at most k·box depth), never past the middle of the ray's hull interval; consistent
+ *              across rays.
  *  - 'ray':    each ray's own hull interval [t0, t1] (surface t = t0 + (1 − d)·k·(t1 − t0)).
  */
 export type DepthFit = 'object' | 'ray';
@@ -103,8 +104,10 @@ export interface FusionContext {
   onProgress: (p: Progress) => void;
   /** Depth refinement hook; null / omitted = silhouettes only. */
   estimateDepth?: DepthEstimator | null;
-  /** Called between stages (default: yieldToPaint). */
+  /** Called between stages, and inside long stages every `sliceMs` (default: yieldToPaint between stages, a macrotask inside). */
   yieldControl?: () => Promise<void>;
+  /** Longest synchronous run inside a stage before yielding (and checking the abort signal), ms. Default 30. */
+  sliceMs?: number;
 }
 
 /** Where each view's depth came from: the model, the silhouette ("balloon" fallback) or nowhere. */

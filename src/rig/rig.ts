@@ -72,9 +72,14 @@ export interface RigHandle {
   readonly skeletonVisible: boolean;
   /** Back to the bind (T-) pose. */
   restPose(): void;
-  /** Move one joint (model frame) and re-bind + re-weight. Children keep their positions. */
-  setJoint(bone: HumanoidBone, pos: Vec3, opts?: { signal?: AbortSignal; onProgress?: (p: Progress) => void }): Promise<void>;
-  setJoints(patch: JointLayout, opts?: { signal?: AbortSignal; onProgress?: (p: Progress) => void }): Promise<void>;
+  /**
+   * Move one joint (model frame) and re-bind + re-weight. Children keep their positions.
+   * Resolves true when this edit was applied, false when a newer edit superseded it (the
+   * newer one includes this patch: edits accumulate until one is applied). Rejects with
+   * AbortError when `signal` aborts.
+   */
+  setJoint(bone: HumanoidBone, pos: Vec3, opts?: { signal?: AbortSignal; onProgress?: (p: Progress) => void }): Promise<boolean>;
+  setJoints(patch: JointLayout, opts?: { signal?: AbortSignal; onProgress?: (p: Progress) => void }): Promise<boolean>;
   /** Restore the original meshes and free the rig. */
   unrig(): void;
   /** Free what the rig holds without touching the (already discarded) model. */
@@ -137,10 +142,15 @@ export async function rigModel(core: RigViewer | null, model: BuiltModel, opts: 
   await yieldToPaint();
   check();
   const data = opts.meshData && opts.meshData.ranges.length === meshes.length ? opts.meshData : collectMeshData(root, meshes);
+  // Yield between the heavy synchronous steps so the page paints and cancel takes effect.
+  await yieldToPaint();
+  check();
   let layout = opts.layout;
   if (!layout || missingBones(layout).length) {
     const auto = autoPlaceJointsDetailed(root, { meshData: data });
     layout = layout ? completeLayout(layout, auto.heuristic) : auto.layout;
+    await yieldToPaint();
+    check();
   }
   const rig = buildSkeleton(layout);
   const prep = prepareSkinning(data.positions, data.index);
@@ -241,6 +251,8 @@ function createHandle(
   let visible = false;
   let disposed = false;
   let seq = 0;
+  /** Everything requested since the last applied edit (partial patches accumulate). */
+  let pending: JointLayout | null = null;
 
   const rebind = () => {
     resetToRest(root);
@@ -254,13 +266,22 @@ function createHandle(
     }
   };
 
-  const setJoints = async (patch: JointLayout, o: { signal?: AbortSignal; onProgress?: (p: Progress) => void } = {}) => {
-    if (disposed) return;
+  const setJoints = async (patch: JointLayout, o: { signal?: AbortSignal; onProgress?: (p: Progress) => void } = {}): Promise<boolean> => {
+    if (disposed) return false;
     const my = ++seq;
-    const next = structuredCloneLayout(layout);
+    // Merge onto the not-yet-applied edits, so superseding one does not drop them.
+    const next = structuredCloneLayout(pending ?? layout);
     for (const [b, p] of Object.entries(patch) as [HumanoidBone, Vec3][]) if (next[b] && p) next[b] = { x: p.x, y: p.y, z: p.z };
-    const w = await weigh(next, o.signal, o.onProgress);
-    if (disposed || my !== seq) return; // superseded by a newer edit
+    pending = next;
+    let w: Awaited<ReturnType<typeof weigh>>;
+    try {
+      w = await weigh(next, o.signal, o.onProgress);
+    } catch (e) {
+      if (my === seq) pending = null; // the latest edit was cancelled: forget the unapplied edits
+      throw e;
+    }
+    if (disposed || my !== seq) return false; // superseded by a newer edit (which includes this patch)
+    pending = null;
     layout = next;
     descriptor = describeRig(layout);
     applyLayout(rig, layout);
@@ -275,6 +296,7 @@ function createHandle(
     }
     helper.updateMatrixWorld(true);
     core?.invalidate();
+    return true;
   };
 
   const releaseHelper = () => {

@@ -7,7 +7,7 @@
 import { act, createElement } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { PerspectiveCamera } from 'three';
+import { AnimationClip, NumberKeyframeTrack, PerspectiveCamera } from 'three';
 import type { Mesh, Object3D } from 'three';
 
 const analyzeHuman = vi.hoisted(() => vi.fn());
@@ -173,6 +173,40 @@ describe('RigPanel', () => {
     expect(old.animations).toBeUndefined();
     expect(onActiveChange).toHaveBeenLastCalledWith(false);
     expect(q('rig-auto')).toBeTruthy();
+  }, 30_000);
+
+  it('plays one-shot clips once (holding the last frame) even with Loop on, and keeps the model\'s own clips across rig / unrig', async () => {
+    analyzeHuman.mockResolvedValue({ width: 8, height: 8, faces: [], hands: [], poses: [], isHuman: false });
+    const core = fakeCore();
+    const coreRef = { current: core as unknown as ViewerCore };
+    const model = newModel();
+    const spin = new AnimationClip('spin', 1, [new NumberKeyframeTrack('.rotation[y]', [0, 1], [0, Math.PI])]);
+    model.animations = [spin];
+    core.setObject(model.object);
+    host = document.createElement('div');
+    document.body.append(host);
+    root = createRoot(host);
+    await act(async () =>
+      root!.render(
+        createElement(LangProvider, { value: 'en' }, createElement(RigPanel, { coreRef, model, frontImage: null, frontMask: null, enabled: true, onModelChanged: vi.fn(), onActiveChange: vi.fn() })),
+      ),
+    );
+    await click('rig-auto');
+    await waitFor(() => !!q('rig-status'));
+    expect(model.animations).toContain(spin); // still exported while rigged
+
+    expect((q('anim-loop') as HTMLInputElement | null)?.checked ?? true).toBe(true);
+    await click('anim-fall-die');
+    let animating = true;
+    for (let i = 0; i < 40 && animating; i++) {
+      await act(async () => {
+        animating = core.tick(0.1) === true;
+      });
+    }
+    expect(animating).toBe(false); // finished instead of looping back to standing
+
+    await click('rig-remove');
+    expect(model.animations).toEqual([spin]);
   }, 30_000);
 
   it('explains why it is unavailable without a model and for skinned GLBs', async () => {

@@ -27,7 +27,7 @@ Stüdyo altı adımdan oluşur (sol paneldeki numaralı sekmeler; klavyeyle ←/
 | **1 Görsel** | Görsel yükleme / yapıştırma / örnekler; arka plan: PNG alfa, düz kenar rengi, yapay zekâ (MODNet) ya da yok |
 | **2 AI hazırlık** (isteğe bağlı) | Kendi sağlayıcınızla görseli **60 stilden** birine çevirme, **T-poz**, **eksik gövdeyi tamamlama** (ör. yalnızca kafa → tam boy), saydam arka plan; önce/sonra karşılaştırma, kabul et / vazgeç / orijinale dön |
 | **3 Görünümler** | Tam 3B için **arka, sol, sağ, üst, alt** görünümler: elle yükleyin ya da yapay zekâya ürettirin ("Eksikleri üret") |
-| **4 3D** | Sürücü seçimi, parametreler, canlı mesh ayarları; "3D Oluştur" her adımdan erişilebilir (Ctrl/⌘ + Enter) |
+| **4 3D** | Sürücü seçimi, parametreler, canlı mesh ayarları; "3D Oluştur" her adımdan erişilebilir (Ctrl/⌘ + Enter; heykel modunda ve metin alanlarında devre dışı). Heykel / rig / derinlik düzenlemesi taşıyan modeli yeniden oluşturmadan önce onay istenir |
 | **5 Düzenle** | Blender tarzı **heykel** fırçaları (8 fırça, simetri, geri al) ve **derinlik haritası editörü** |
 | **6 Rig & Anim** | Otomatik insansı iskelet, eklem düzenleyici, **45 hazır animasyon**, BVH / FBX / GLB içe aktarma, animasyonlu GLB |
 
@@ -147,15 +147,22 @@ seçilebilir (görsel düzenleme, arka plan kaldırma, görselden 3B, çok gör�
   "Anahtarları bu cihazda hatırla" açıkken `localStorage`'a taşınır; ikisine birden asla yazılmaz. Sunucu anahtarları
   ("Sunucu" rozetli kayıtlar) tarayıcıya hiç gelmez. Anahtarlar yalnızca sağlayıcının API'sine ya da kendi sunucumuzun
   vekiline gider; vekil onları loglamaz ve yanıtlarda geri göndermez.
-- **Sunucu vekili** (`/api/ai/proxy/<kind>/…`): CORS desteklemeyen sağlayıcılar (Stability, Replicate, Tripo) ve sunucu
+- **Sunucu vekili** (`/api/ai/proxy/<kind>/…`): CORS desteklemeyen sağlayıcılar (Stability, Replicate) ve sunucu
   anahtarlı kayıtlar bu yoldan gider. Vekil yalnızca o türün sabit adresine iletir (openai → api.openai.com,
   gemini → generativelanguage.googleapis.com, stability → api.stability.ai, replicate → api.replicate.com,
-  fal → fal.run / queue.fal.run, tripo → api.tripo3d.ai). Sunucu yoksa (GitHub Pages) bu kayıtlar
-  "sunucu vekili gerekir" uyarısıyla devre dışı görünür.
+  fal → queue.fal.run) ve **yalnızca uygulamanın adaptörlerinin çağırdığı uç noktaları** (ör. openai `POST v1/images/edits`,
+  `GET v1/models`; replicate tahmin oluştur / sorgula / iptal; fal kuyruk gönder / durum / sonuç / iptal) geçirir: diğer
+  yollar 403, GET/POST/PUT dışındaki yöntemler 405 alır. `AI_PROXY_EXTRA_BASES` adresleri için yalnızca `POST images/edits`
+  ve `GET models`. Tripo3D genel vekilden geçmez; kendi `/api/tripo` rotalarını kullanır. Sunucu yoksa (GitHub Pages) bu
+  kayıtlar "sunucu vekili gerekir" uyarısıyla devre dışı görünür.
 - **Sunucu anahtarları:** `.env`'de `OPENAI_API_KEY`, `GEMINI_API_KEY`, `STABILITY_API_KEY`, `REPLICATE_API_TOKEN`,
   `FAL_KEY`, `TRIPO_API_KEY` — her biri iletişim kutusunda `server-<tür>` kimlikli "yönetilen" bir kayıt olarak görünür.
-- **Arka plan kaldırma (AI çıktıları için):** "Arka planı kaldır" açıkken çıktı zaten saydamsa olduğu gibi kalır; değilse
-  arka plan kaldırma yetenekli sağlayıcı (varsa) ya da tarayıcıdaki MODNet modeli kullanılır.
+- **Arka plan kaldırma:** "Arka planı kaldır" açıkken istem, gerçek saydamlık veren modellere (OpenAI gpt-image) saydam,
+  diğerlerine düz beyaz arka plan ister. Çıktı zaten saydamsa olduğu gibi kalır; değilse düz kenarlı nesneler renk anahtarıyla,
+  insanlar tarayıcıdaki MODNet modeliyle (ya da arka plan varsayılanı olarak seçtiğiniz sağlayıcıyla) kesilir; hepsi
+  başarısız olursa ücretli görsel atılmaz, olduğu gibi uyarıyla tutulur. Arka plan kaldırma varsayılanı **Yerel (tarayıcıda)**
+  modeldir; OpenAI gibi görseli yeniden çizen sağlayıcılar yalnızca açıkça seçilirse kullanılır. Yalnızca "Arka planı kaldır"
+  açıkken **AI ile hazırla** görsel düzenleme sağlayıcısı olmadan da çalışır (yalnızca arka planı kaldırır).
 
 ### Stiller, T-poz, gövde tamamlama
 
@@ -165,15 +172,20 @@ seçilebilir (görsel düzenleme, arka plan kaldırma, görselden 3B, çok gör�
   içermez (testle denetlenir) ve her biri kimliği, pozu ve kompozisyonu korumayı ister.
 - **T-poz** (yalnızca insan/karakter; "otomatik" konu seçiminde insan algılamaya göre) ve **eksik gövdeyi tamamla**
   (ör. yalnızca kafa → tam boy; nesnelerde "eksik parçaları tamamla").
-- Sonuç önce/sonra kaydırıcısıyla gösterilir; **Bu görseli kullan** kaynağı değiştirir (görünümler bu görselden üretilir),
-  **Orijinale dön** her zaman mümkündür.
+- T-poz ve gövde tamamlama istendiğinde stilin "pozu ve kompozisyonu koru" cümlesi çıkarılır ve bu talimatlar stilden önce,
+  öncelikli olarak verilir. Stability'nin düzenleme uç noktaları kompozisyonu korur: T-poz / tamamlama ve yeni görünümler için
+  kullanılamaz (yalnızca stil); Görünümler adımı bu durumda görünüm üretebilen başka bir sağlayıcıyı kullanır.
+- Sonuç önce/sonra kaydırıcısıyla gösterilir; **Bu görseli kullan** kaynağı değiştirir (görünümler bu görselden, aynı stil /
+  ek talimatlar tekrarlanarak üretilir), **Orijinale dön** her zaman mümkündür.
 
 ## Çok görünümlü iş akışı
 
 1. Görseli yükleyin (ve isterseniz 2. adımda stil / T-poz uygulayın).
 2. **3 Görünümler:** her yuva için yükle (⤒), AI ile üret (✎) ya da temizle (×). "Eksikleri üret" boş yuvaları sırayla üretir;
    her yeni görünüm öncekileri referans alır (tutarlılık). Yüklenen görünümlerin maskesi alfa kanalından ya da düz kenar
-   renginden çıkarılır; arka plan modu "AI" ise gerekirse MODNet ile kaldırılır.
+   renginden çıkarılır; arka plan modu "AI" ise gerekirse MODNet ile kaldırılır (başka bir iş sürüyorsa sıraya alınır).
+   AI hazırlığı kabul edildiğinde (ya da orijinale dönüldüğünde) eski ön görselden AI ile üretilen görünümler kaldırılır;
+   yüklenen görünümler kalır. Seçili sürücü görünümleri kullanmıyorsa 3. ve 4. adımda füzyona geçiş önerilir.
 3. **4 3D:** `multiview-fusion` (tarayıcıda), `tripo3d-multiview` ya da `ai-provider-3d` seçin.
    Füzyon: her görünümün siluet kutusu nesne kutusunun ilgili yüzüne hizalanır (farklı ölçek/çerçeve tolere edilir), yumuşak
    görsel gövde voksel ızgarada kesişir, isteğe bağlı olarak her görünümde Depth Anything ile oyulur (model inemezse siluet
@@ -189,7 +201,10 @@ yanaklar, çene; ten rengindeki piksellerde kulaklar (baş 40°'den fazla dönü
 avuç ve gövde kubbe olarak. Yalnızca modelin derinliğinde eksik olan ayrıntı eklenir. Küçük yüzler vücut pozundan kırpılarak
 yeniden aranır; "Yüksek çözünürlüklü kırpma" yüz/el bölgelerinde derinliği ayrıca hesaplar. Ayarlar: yüz gücü (0.8), el gücü (0.7).
 Algılama ana iş parçacığında, derinlik çıkarımıyla paralel çalışır; modeller inemezse (ör. ağ engeli) "Algılama kullanılamıyor"
-gösterilir ve düz derinlikle devam edilir. Sonuç 2. ve 4. adımda (algılanan yüz/el/vücut sayısı) görünür; 2. adımda algılama
+gösterilir ve düz derinlikle devam edilir; yavaş (≥5 s, ör. indirme takılması) bir model yükleme hatası 5 dakika hatırlanır, bu
+sürede sonraki çalıştırmalar beklemeden düz derinliğe geçer (hızlı ağ hataları her seferinde yeniden denenir). Kırpma geçişi
+yalnızca küresel geçişten daha ince çözünürlük verecekse yapılır. Bilinen sınır: varsayılan mesh çözünürlüğü / yumuşatmada
+parmaklar ve kulaklar yumuşayabilir; ayrıntı için "Canlı mesh" çözünürlüğünü artırıp yumuşatmayı azaltın. Sonuç 2. ve 4. adımda (algılanan yüz/el/vücut sayısı) görünür; 2. adımda algılama
 yalnızca hazırlığı çalıştırabilecek bir sağlayıcı varken kendiliğinden başlar (gereksiz ~20 MB indirmeyi önler).
 
 ## Heykel ve derinlik editörü (5. adım)
@@ -218,8 +233,8 @@ yarıçap, güç, düşüş eğrisi, "yalnızca özne içinde", gri / renkli gö
 ## Rig ve animasyon (6. adım)
 
 - **Otomatik iskelet:** 23+ kemikli insansı iskelet (Mixamo adları: `Hips`, `Spine`, `LeftArm`, `LeftForeArm`, `LeftUpLeg`…;
-  el noktaları algılanırsa parmaklar). Eklemler önce MediaPipe vücut pozundan, yoksa T-poz siluetinden, o da olmazsa oranlardan
-  yerleştirilir. Deri ağırlıkları mesafe + iç görünürlük testiyle, köşe başına 4 kemik.
+  el noktaları algılanırsa parmaklar). Eklemler önce MediaPipe vücut pozundan, yoksa kolları aşağıda / T-poz siluetinden, o da
+  olmazsa oranlardan yerleştirilir. Deri ağırlıkları mesafe + iç görünürlük testiyle, köşe başına 4 kemik.
 - **Eklem düzenleyici:** eklemleri görünümde sürükleyin ya da X/Y/Z ile dürtün (ayna seçeneğiyle); her değişiklik ağırlıkları yeniler.
 - **45 hazır animasyon** (bekleme, yürüyüş/koşu, jestler, duygular, dans, aksiyon, pozlar): oynat / duraklat / durdur (T-poza döner),
   zaman çubuğu, hız, döngü, geçiş (cross-fade), arama ve kategori filtresi. Klipler kanonik T-pozda yazılır ve dinlenme yönlerine
@@ -256,6 +271,7 @@ API sunucusu ve Vite proxy'si (`PORT`, `CROSS_ORIGIN_ISOLATION`) yalnızca `.env
 |---|---|---|
 | `PORT` | `8787` | API/üretim sunucusu portu (Vite proxy'si de bunu kullanır) |
 | `HOST` | geliştirmede `127.0.0.1`, üretimde tüm arayüzler | Dinlenecek adres. Geliştirmede ayarlanırsa (ör. `0.0.0.0`) API ve sunucu anahtarları ağa açılır |
+| `ALLOWED_HOSTS` | boş | DNS rebinding'e karşı Host başlığı denetimi her modda açıktır: localhost, IP adresleri ve bu virgüllü adlar geçer (`*.example.com` = alt alan adları). Gerçek bir alan adında sunarken ayarlayın (ör. `app.example.com`), yoksa 403; `*` denetimi kapatır |
 | `STATIC_DIR` | `./dist` | Üretimde sunulan SPA klasörü |
 | `TRIPO_API_KEY` | boş | Sunucu tarafı Tripo3D anahtarı (Tripo sürücüleri + yönetilen "Tripo3D" sağlayıcısı). Boşsa kullanıcılar kendi anahtarını girer |
 | `TRIPO_API_BASE` | `https://api.tripo3d.ai/v2/openapi` | Tripo API adresi |
@@ -267,14 +283,16 @@ API sunucusu ve Vite proxy'si (`PORT`, `CROSS_ORIGIN_ISOLATION`) yalnızca `.env
 | `TRIPO_MULTIVIEW_ORDER` | `front,left,back,right` | Tripo çok görünüm görevinde dosya sırası (ASSUMPTION; gerekirse değiştirin) |
 | `OPENAI_API_KEY`, `GEMINI_API_KEY`, `STABILITY_API_KEY`, `REPLICATE_API_TOKEN`, `FAL_KEY` | boş | Sunucu tarafı AI anahtarları; her biri "yönetilen" bir sağlayıcı olarak görünür, anahtar tarayıcıya gitmez |
 | `OPENAI_IMAGE_MODEL` / `GEMINI_IMAGE_MODEL` | uygulamanın önerisi | Yönetilen OpenAI / Gemini kaydının görsel düzenleme modeli |
-| `AI_PROXY_KINDS` | `openai,gemini,stability,replicate,fal,tripo` | Vekilin hizmet verdiği türler |
+| `AI_PROXY_KINDS` | `openai,gemini,stability,replicate,fal` | Vekilin hizmet verdiği türler (Tripo3D kendi `/api/tripo` rotalarını kullanır) |
 | `AI_PROXY_BYOK` | `1` | `0`: kullanıcı anahtarlarını (`x-ai-key`) iletme, yalnızca sunucu anahtarları |
 | `AI_PROXY_EXTRA_BASES` | boş | `openai-compatible` / `custom-http` için vekilin konuşabileceği tam temel URL'ler (virgülle) |
 | `AI_PROXY_TIMEOUT_SEC` / `AI_PROXY_MAX_BODY_MB` | `180` / `40` | Üst akış yanıt süresi / en büyük istek gövdesi |
-| `AI_PROXY_RATE_LIMIT` / `AI_PROXY_RATE_LIMIT_BYOK` / `AI_PROXY_RATE_WINDOW_SEC` | `60` / `600` / `3600` | IP başına üretim isteği (sunucu / kullanıcı anahtarı) |
-| `AI_PROXY_READ_RATE_LIMIT` / `AI_PROXY_MAX_CONCURRENT` | `300` / `64` | Dakikalık durum sorgusu + indirme; eşzamanlı vekil isteği (IP başına 8) |
-| `AI_FETCH_ALLOWED_HOSTS` / `AI_FETCH_MAX_MB` | `replicate.delivery,fal.media,storage.googleapis.com/falserverless` + Tripo hostları / `200` | `/api/ai/fetch` ile indirilebilecek çıktı hostları; en büyük dosya |
-| `TRUST_PROXY` | kapalı | `1`: tek bir ters proxy arkasında, istemci IP'si son `X-Forwarded-For` |
+| `AI_PROXY_RATE_LIMIT` / `AI_PROXY_RATE_LIMIT_BYOK` / `AI_PROXY_RATE_WINDOW_SEC` | `60` / `600` / `3600` | IP başına üretim isteği (sunucu / kullanıcı anahtarı); IPv6'da /64 başına, sunucu anahtarıyla /48 başına da 4× sınır. Toplam harcamayı sınırlamaz |
+| `AI_PROXY_GLOBAL_RATE_LIMIT` / `AI_PROXY_DAILY_LIMIT` | `10 × AI_PROXY_RATE_LIMIT` / `0` | Tüm istemcilerde, sağlayıcı türü başına sunucu anahtarlı üretim isteği: pencere başına / 24 saatte (0 = sınırsız) |
+| `AI_PROXY_READ_RATE_LIMIT` / `AI_PROXY_MAX_CONCURRENT` | `300` / `64` | Dakikalık durum sorgusu + indirme; eşzamanlı vekil isteği (IP başına en fazla 8 ve diğerlerinin boş bıraktığının yarısı, en az 2; dörtte biri sunucu anahtarlı isteklere ayrılır) |
+| `AI_FETCH_ALLOWED_HOSTS` / `AI_FETCH_MAX_MB` | `replicate.delivery,fal.media,storage.googleapis.com/falserverless` + Tripo hostları / `200` | `/api/ai/fetch` ile indirilebilecek çıktı hostları (`host` = alt alan adları dahil, `host/yol` = yalnızca o host, o yol altında); en büyük dosya |
+| `TRUST_PROXY` | kapalı | `1`: tek bir ters proxy arkasında, istemci IP'si son `X-Forwarded-For` — yalnızca `TRUSTED_PROXIES` adreslerinden gelen bağlantılarda. Sunucuyu `HOST=127.0.0.1`'e bağlayın ya da portu güvenlik duvarıyla kapatın |
+| `TRUSTED_PROXIES` | loopback + özel ağlar | `X-Forwarded-For`'una güvenilen ters proxy IP'leri / CIDR'ları (virgülle) |
 | `CROSS_ORIGIN_ISOLATION` | kapalı | `1`: COOP + `COEP: credentialless` → ONNX Runtime çok iş parçacıklı WASM. Vite dev/preview ve üretim sunucusu uygular |
 | `BASE_PATH` | `/` | Derleme alt yolu (GitHub Pages proje sitesi: `/<repo>/`) |
 | `VITE_MODEL_HOST` | `https://huggingface.co/` | Derinlik modeli dosyaları için ayna (derleme zamanı) |
@@ -292,6 +310,8 @@ npm run build                # tsc + vite build → dist/
 npm start                    # --production: API + dist/ aynı porttan (varsayılan 8787), tüm arayüzlerde
 ```
 
+Gerçek bir alan adında sunarken `ALLOWED_HOSTS=<alan adınız>` ayarlayın (Host denetimi aksi halde 403 döndürür). Anahtarlı
+sağlayıcılar sunucuya ulaşabilen herkese açıktır: önüne kimlik doğrulama koyun ve sağlayıcılarda harcama sınırı belirleyin.
 `/assets/*` bir yıl önbelleklenir, `index.html` `no-cache`; metin/JS/CSS gzip'lenir; uzantısız yollar SPA'ya düşer, `/api/*` asla.
 Not: `npm start` `tsx` kullanır (devDependency); üretim imajında dev bağımlılıkları kurulu olmalı ya da sunucuyu derleyin.
 Derleme `dist/assets` altına ~27 MB'lık ORT wasm ve ~23 MB'lık MediaPipe wasm dosyalarını da bırakır (yalnızca kullanıldıklarında
@@ -410,17 +430,23 @@ tests/e2e/         Playwright uçtan uca testleri (+ png.ts: sahte AI çıktıla
   Tripo3D ya da bir AI image-to-3D modeli kullanın.
 - **Füzyon:** görünümler ortografik kabul edilir (perspektifi hizalama ve tolerans emer); hiçbir görünümün derinliğinin
   görmediği içbükey oyuklar kurtarılamaz; yalnızca siluetle (derinlik modeli inemezse) T-pozdaki kollar gibi ince parçalar yan
-  görünümlerde gövdeyle örtüştüğü için derinlemesine kalınlaşabilir ve yan görünüm renkleri uçlara taşabilir. İş ana iş
-  parçacığında aşamalar hâlinde yapılır (256 vokselde en uzun duraklama ~0.7 s).
+  görünümlerde gövdeyle örtüştüğü için derinlemesine kalınlaşabilir ve (fotometrik tutarlılık adımı olmadığından) bu hayalet
+  hacme yan görünüm renkleri taşabilir. Derinlik ölçeği yan / üst / alt görünüm varsa siluet gövdesine göre kalibre edilir;
+  profil bilgisi vermeyen bir görünüm oymaz. İş ana iş parçacığında dilimler hâlinde yapılır (~30 ms'de bir yol verir, en uzun
+  duraklama ~70 ms; İptal aşama ortasında etkili olur); ayrı bir Worker'a taşınmadı.
 - **AI görünümleri tutarlılığı:** Görüntü modelleri arka/yan görünümleri "hayal eder"; ölçek ve çerçeve farkları füzyonda
   hizalanır ama anatomi/kıyafet tutarsızlıkları mesh'e yansır. Görünümleri elle düzeltmek (yeniden üret / yükle) mümkündür.
 - **İnsan detayı:** İlk kullanımda ~20 MB MediaPipe modeli indirilir (görselde insan olmasa da; parametreden kapatılabilir).
   Çok küçük, bulanık ya da dönük yüzlerde yüz ağı hatalı olabilir; ten rengine yakın arka planlarda kulak kabartması taşabilir.
   Algılama çağrıları ana iş parçacığını kısa süre (CPU'da ~100–300 ms) bloklar.
-- **Heykel:** oturum kurulumu (kaynak + BVH) büyük mesh'lerde ~0.8 s ana iş parçacığını bloklar; dokunmatik ekranda ikinci parmak
-  darbeyi bitirip görünümü döndürür. Derinlik modelinde mesh seçeneklerini değiştirmek heykel düzenlemelerini siler.
-- **Rig:** vücut noktaları olmadan siluet kuralları yalnızca T-pozu tanır (diğer pozlar oransal iskelet alır; eklem düzenleyiciyle
-  düzeltilir). Parmak kemikleri yalnızca el noktaları algılanırsa oluşur. Ağırlıklandırma ana iş parçacığında (zaman dilimli).
+- **Heykel:** oturum kurulumu (kaynak + BVH) büyük mesh'lerde ~0.8 s ana iş parçacığını bloklar. Dokunmatik ekranda ikinci parmak
+  ilk dokunuştan hemen sonra (300 ms / 12 px içinde) gelirse darbe geri alınır ve iki parmak görünüme (yakınlaştır / döndür)
+  verilir; daha sonra gelirse darbe korunur. Düzenle adımından çıkıp dönünce geri al geçmişi korunur. Derinlik modelinde mesh
+  seçeneklerini değiştirmek heykel düzenlemelerini siler.
+- **Rig:** vücut noktaları olmadan siluet kuralları T-pozu ve aşağı sarkan / A-pozlu kolları tanır (diğer pozlar kolları aşağı
+  sarkan oransal iskelet alır; eklem düzenleyiciyle düzeltilir). Parmak kemikleri yalnızca el noktaları algılanırsa oluşur.
+  Ağırlıklandırma ana iş parçacığında (zaman dilimli; 180k köşede `prepareSkinning` ~230 ms bloklar). Yerdeki kliplerde
+  ayaklar zemine oturtulur (uçma / yüzme hariç); tek seferlik klipler (ör. düşme) "Döngü" açıkken de bir kez oynar.
 - **ML derinliği göreli:** Depth Anything / MiDaS ölçeksiz derinlik verir; metrik ölçü beklemeyin. Modeller ilk kullanımda
   Hugging Face'ten indirilir (~50–490 MB); engelliyse `VITE_MODEL_HOST` ile ayna kullanın, erişilemezse anlaşılır hata gösterilir.
 - **WebGPU:** yoksa ya da hata verirse WASM'a düşülür (daha yavaş). `CROSS_ORIGIN_ISOLATION=1` WASM'ı çok iş parçacıklı yapar.
@@ -455,7 +481,7 @@ ayarlardan / ortam değişkenlerinden değiştirilebilir:
 - **MediaPipe** Tasks Vision çalışma zamanı ve face / hand / pose landmarker modelleri Apache-2.0 (Google); modeller Google'ın
   genel deposundan indirilir (`VITE_MEDIAPIPE_MODEL_BASE` ile kendi sunucunuzdan verilebilir).
 - **three.js**, **three-mesh-bvh** MIT; **@huggingface/transformers** Apache-2.0; **Hono** MIT.
-- **Stil istemleri** marka / ticari marka adı içermez (ör. "Brick-toy minifigure", "Vinyl collectible figure"); bir test bunu denetler.
+- **Stil istemleri** marka / ticari marka adı içermez (ör. "Blocky toy figure", "Vinyl collectible figure"; belirli bir oyuncak markasının figür tarifi de yok); bir test bunu denetler.
 - Hazır animasyonlar projede prosedürel olarak yazılmıştır (dışarıdan hareket verisi yok). İçe aktarılan BVH / FBX (ör. Mixamo)
   dosyalarının lisansı kullanıcının sorumluluğundadır.
 - AI sağlayıcılarına gönderilen görseller o sağlayıcının koşullarına tabidir; tarayıcı içi sürücüler görseli hiçbir yere yüklemez.

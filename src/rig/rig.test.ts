@@ -5,6 +5,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { buildGeometryModel, type BuiltModel } from '../app/pipeline';
 import { LocalizedError } from '../core/errors';
+import { AbortError } from '../core/types';
 import { exportObject } from '../core/export/exporters';
 import { buildLibrary } from './animations';
 import { autoPlaceJoints } from './autoJoints';
@@ -165,6 +166,37 @@ describe('rigModel (model.object is the mesh: depth / geometry models)', () => {
     const p = new Vector3();
     for (let i = 0; i < 200; i++) expect(sk.getVertexPosition(i, p).distanceTo(new Vector3().fromBufferAttribute(sk.geometry.getAttribute('position'), i))).toBeLessThan(1e-4);
     rig.unrig();
+  });
+
+  it('overlapping setJoints: a superseded edit is not lost, reports false, and an aborted one rejects', async () => {
+    const model = meshModel();
+    const rig = await rigModel(null, model);
+    const elbow = { ...rig.layout.LeftForeArm! }, knee = { ...rig.layout.RightLeg! };
+    const ac = new AbortController();
+    const first = rig.setJoint('LeftForeArm', { ...elbow, x: elbow.x - 0.1 }, { signal: ac.signal });
+    const firstSettled = first.then((v) => v, (e: unknown) => e);
+    ac.abort();
+    const second = rig.setJoint('RightLeg', { ...knee, x: knee.x + 0.05 });
+    expect(await firstSettled).toBeInstanceOf(AbortError);
+    expect(await second).toBe(true);
+    expect(rig.layout.LeftForeArm!.x).toBeCloseTo(elbow.x - 0.1, 9); // the first patch survived
+    expect(rig.layout.RightLeg!.x).toBeCloseTo(knee.x + 0.05, 9);
+    // Without abort: the older call resolves false, the newer applies both.
+    const a = rig.setJoint('LeftForeArm', elbow), b = rig.setJoint('RightLeg', knee);
+    expect(await a).toBe(false);
+    expect(await b).toBe(true);
+    expect(rig.layout.LeftForeArm!.x).toBeCloseTo(elbow.x, 9);
+    expect(rig.layout.RightLeg!.x).toBeCloseTo(knee.x, 9);
+    rig.unrig();
+  });
+
+  it('rigModel can be cancelled between the synchronous setup steps', async () => {
+    const model = meshModel();
+    const ac = new AbortController();
+    const p = rigModel(null, model, { signal: ac.signal, onProgress: () => {} });
+    setTimeout(() => ac.abort(), 0);
+    await expect(p).rejects.toBeInstanceOf(AbortError);
+    expect(isRigPlaceholder(model.object)).toBe(false);
   });
 });
 

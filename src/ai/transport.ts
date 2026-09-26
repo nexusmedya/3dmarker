@@ -50,6 +50,12 @@ export const aiTiming = {
   maxJobMs: 20 * 60_000,
   /** Downloading an output file. */
   downloadTimeoutMs: 3 * 60_000,
+  /** First back-off delay of a retried idempotent request (doubles per attempt, with jitter). */
+  retryBaseMs: 1000,
+  /** Longest back-off delay between retries. */
+  retryMaxMs: 15_000,
+  /** Attempts of a retried idempotent request (the first one included). */
+  retryAttempts: 4,
 };
 
 export type AiErrorCode =
@@ -82,6 +88,9 @@ export class AiError extends LocalizedError {
     super(i18n);
     this.name = 'AiError';
   }
+
+  /** Seconds the provider asked us to wait (Retry-After, Google RetryInfo, OpenAI "try again in"). */
+  retryAfterSec: number | null = null;
 }
 
 export type Route = 'direct' | 'proxy';
@@ -225,8 +234,25 @@ const POLICY = /moderation|content[_ ]?policy|safety|nsfw|prohibited|violat|inap
 const KEY_INVALID = /api[_ ]?key.*(invalid|not valid|incorrect)|(invalid|incorrect).*api[_ ]?key|API_KEY_INVALID|unauthenticated/i;
 const BILLING = /insufficient[_ ]?quota|billing|credit|payment|balance|exceeded your current quota/i;
 
-/** Error message and code-ish text out of the usual provider error bodies. */
-export function extractErrorDetail(body: unknown): { message: string; codes: string } {
+/** "12s" / "12.5s" (Google Duration JSON) → whole seconds. */
+function durationSec(v: unknown): number | null {
+  const m = typeof v === 'string' ? /^(\d+(?:\.\d+)?)s$/.exec(v.trim()) : null;
+  return m ? Math.max(1, Math.ceil(Number(m[1]))) : null;
+}
+
+/** OpenAI's "Please try again in 12s" / "in 820ms" → whole seconds. */
+function tryAgainSec(message: string): number | null {
+  const m = /try again in (\d+(?:\.\d+)?)\s*(ms|s)\b/i.exec(message);
+  if (!m) return null;
+  const sec = m[2].toLowerCase() === 'ms' ? Number(m[1]) / 1000 : Number(m[1]);
+  return Number.isFinite(sec) ? Math.max(1, Math.ceil(sec)) : null;
+}
+
+/**
+ * Error message and code-ish text out of the usual provider error bodies
+ * (Google details[]: reasons, QuotaFailure quota ids, RetryInfo delay).
+ */
+export function extractErrorDetail(body: unknown): { message: string; codes: string; retryAfterSec?: number } {
   if (typeof body === 'string') {
     const text = body.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
     return { message: text.slice(0, 200), codes: '' };
@@ -236,13 +262,25 @@ export function extractErrorDetail(body: unknown): { message: string; codes: str
   const codes: string[] = [];
   const str = (v: unknown) => (typeof v === 'string' ? v : typeof v === 'number' ? String(v) : '');
   let message = '';
+  let retry: number | null = null;
   const err = o.error;
   if (err && typeof err === 'object') {
     // OpenAI { error: { message, type, code } }, Google { error: { code, message, status, details } }
     const e = err as Record<string, unknown>;
     message = str(e.message);
     codes.push(str(e.type), str(e.code), str(e.status));
-    if (Array.isArray(e.details)) for (const d of e.details) if (d && typeof d === 'object') codes.push(str((d as Record<string, unknown>).reason));
+    if (Array.isArray(e.details)) {
+      for (const d of e.details) {
+        if (!d || typeof d !== 'object') continue;
+        const dd = d as Record<string, unknown>;
+        codes.push(str(dd.reason));
+        retry = durationSec(dd.retryDelay) ?? retry; // google.rpc.RetryInfo
+        if (Array.isArray(dd.violations)) {
+          // google.rpc.QuotaFailure
+          for (const v of dd.violations) if (v && typeof v === 'object') codes.push(str((v as Record<string, unknown>).quotaId));
+        }
+      }
+    }
   } else if (typeof err === 'string') {
     message = err; // our server, Replicate prediction errors
   }
@@ -257,7 +295,10 @@ export function extractErrorDetail(body: unknown): { message: string; codes: str
   if (!message && Array.isArray(o.errors)) message = o.errors.map(str).filter(Boolean).join('; '); // Stability { name, errors }
   if (!message) message = str(o.message) || str(o.title);
   codes.push(str(o.name), str(o.code), str(o.title), str(o.type));
-  return { message: message.replace(/\s+/g, ' ').trim(), codes: codes.filter(Boolean).join(' ') };
+  retry ??= tryAgainSec(message);
+  const out: { message: string; codes: string; retryAfterSec?: number } = { message: message.replace(/\s+/g, ' ').trim(), codes: codes.filter(Boolean).join(' ') };
+  if (retry !== null) out.retryAfterSec = retry;
+  return out;
 }
 
 function scrub(text: string, key?: string): string {
@@ -282,8 +323,21 @@ export interface ErrorContext {
 
 /** Bilingual error for a non-2xx response. */
 export function errorFromStatus(status: number, body: unknown, ctx: ErrorContext): AiError {
+  const e = classifyStatus(status, body, ctx);
+  if (e.code === 'rate-limit' || e.code === 'server' || e.code === 'needs-server') {
+    e.retryAfterSec = ctx.retryAfterSec ?? extractErrorDetail(body).retryAfterSec ?? null;
+  }
+  return e;
+}
+
+/** Per-minute style limits vs. an exhausted quota / missing billing (429 bodies of OpenAI and Google). */
+const RATE_CODE = /rate[_ ]?limit[_ ]?exceeded|RESOURCE_EXHAUSTED/i;
+const QUOTA_CODE = /insufficient[_ ]?quota/i;
+const BILLING_QUOTA_ID = /PerDay|Billing/i;
+
+function classifyStatus(status: number, body: unknown, ctx: ErrorContext): AiError {
   const { name } = ctx;
-  const { message, codes } = extractErrorDetail(body);
+  const { message, codes, retryAfterSec } = extractErrorDetail(body);
   const d = scrub(message, ctx.key);
   const all = `${message} ${codes}`;
   // Our server's routes answer "No <provider> API key: …" when neither it nor the user has one.
@@ -302,13 +356,18 @@ export function errorFromStatus(status: number, body: unknown, ctx: ErrorContext
   if ((status === 400 || status === 403 || status === 422 || status === 451) && POLICY.test(all)) {
     return new AiError(T.contentPolicy(name, d), 'content-policy', status, d);
   }
-  if (status === 402 || ((status === 429 || status === 403 || status === 400) && BILLING.test(all))) {
+  if (status === 429) {
+    // Machine codes first: rate-limit messages often mention billing / "exceeded your current quota" too.
+    const billing = QUOTA_CODE.test(codes) || (RATE_CODE.test(codes) ? BILLING_QUOTA_ID.test(codes) : BILLING.test(all));
+    if (billing) return new AiError(T.billing(name, d), 'billing', status, d);
+    return new AiError(T.rateLimit(name, ctx.retryAfterSec ?? retryAfterSec ?? null), 'rate-limit', status, d);
+  }
+  if (status === 402 || ((status === 403 || status === 400) && BILLING.test(all))) {
     return new AiError(T.billing(name, d), 'billing', status, d);
   }
   if (status === 403) return new AiError(T.forbidden(name, d), 'forbidden', status, d);
   if (status === 404) return new AiError(T.notFound(name, d), 'not-found', status, d);
   if (status === 413) return new AiError(T.tooLarge(name), 'too-large', status, d);
-  if (status === 429) return new AiError(T.rateLimit(name, ctx.retryAfterSec ?? null), 'rate-limit', status, d);
   if (status >= 500) return new AiError(T.server(name, status, d), 'server', status, d);
   if (status >= 400) return new AiError(T.badRequest(name, d), 'bad-request', status, d);
   return new AiError(T.badResponse(name, d || `HTTP ${status}`), 'bad-response', status, d);
@@ -370,26 +429,75 @@ export interface SendInit extends Omit<RequestInit, 'signal' | 'headers'> {
 }
 
 /**
+ * The response with its body re-streamed so that the timeout and the caller's
+ * abort keep applying until the body has been read (or cancelled); a failed
+ * body read rejects with AbortError / AiError 'timeout' / a network AiError.
+ */
+function guardBody(res: Response, link: ReturnType<typeof linkedSignal>, failure: () => Error): Response {
+  if (!res.body || res.status === 204 || res.status === 205) {
+    link.dispose();
+    return res;
+  }
+  const reader = res.body.getReader();
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    link.dispose();
+  };
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const r = await reader.read();
+        if (r.done) {
+          finish();
+          controller.close();
+        } else {
+          controller.enqueue(r.value);
+        }
+      } catch {
+        const err = failure();
+        finish();
+        controller.error(err);
+      }
+    },
+    cancel(reason) {
+      finish();
+      return reader.cancel(reason);
+    },
+  });
+  return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
+}
+
+/**
  * fetch with timeout and error normalisation: resolves with a 2xx Response,
- * throws AbortError on the caller's abort and AiError otherwise.
+ * throws AbortError on the caller's abort and AiError otherwise. The timeout
+ * and the abort also cover reading the returned response's body.
  */
 export async function send(url: string, init: SendInit, ctx: ErrorContext): Promise<Response> {
   const { signal, timeoutMs, headers, ...rest } = init;
   if (signal.aborted) throw new AbortError();
   const ms = timeoutMs ?? aiTiming.requestTimeoutMs;
   const link = linkedSignal(signal, ms);
+  const failure = (): Error => {
+    if (signal.aborted) return new AbortError();
+    if (link.timedOut()) return new AiError(T.timeout(ctx.name, Math.round(ms / 1000)), 'timeout');
+    return networkError(ctx);
+  };
   let res: Response;
   try {
     res = await fetch(url, { ...rest, headers, signal: link.signal });
   } catch {
-    if (signal.aborted) throw new AbortError();
-    if (link.timedOut()) throw new AiError(T.timeout(ctx.name, Math.round(ms / 1000)), 'timeout');
-    throw networkError(ctx);
+    link.dispose();
+    throw failure();
+  }
+  if (res.ok) return guardBody(res, link, failure);
+  let body: unknown;
+  try {
+    body = await readBody(res);
   } finally {
     link.dispose();
   }
-  if (res.ok) return res;
-  const body = await readBody(res);
   if (signal.aborted) throw new AbortError();
   throw errorFromStatus(res.status, body, {
     ...ctx,
@@ -439,13 +547,54 @@ export async function aiFetch(cfg: ProviderConfig, path: string, init: AiFetchIn
   );
 }
 
-/** Parses a JSON response body; AiError 'bad-response' when it is not JSON. */
+/** Parses a JSON response body; AiError 'bad-response' when it is not JSON (timeouts / network errors while reading pass through). */
 export async function readJson<T = unknown>(res: Response, name: string, signal: AbortSignal): Promise<T> {
   try {
     return (await res.json()) as T;
-  } catch {
-    if (signal.aborted) throw new AbortError();
+  } catch (e) {
+    if (signal.aborted || e instanceof AbortError) throw new AbortError();
+    if (e instanceof AiError) throw e;
     throw new AiError(T.badResponse(name, 'invalid JSON'), 'bad-response', res.status);
+  }
+}
+
+/** Worth retrying an idempotent request after this error (network blips, timeouts, 408 / 425 / 429 / 5xx)? */
+export function isTransientError(e: unknown): boolean {
+  if (!(e instanceof AiError)) return false;
+  switch (e.code) {
+    case 'network':
+    case 'timeout':
+    case 'rate-limit':
+      return true;
+    case 'server':
+      return e.status !== 501;
+    case 'needs-server':
+      // Our proxy unreachable for a moment / a gateway error; a 404 means it has no such route.
+      return e.status === 0 || e.status >= 500;
+    default:
+      return e.status === 408 || e.status === 425;
+  }
+}
+
+/**
+ * Runs an idempotent request (fetch + body read) again after transient
+ * failures, with exponential back-off and jitter (honouring Retry-After),
+ * never past `deadline`. Never use it for requests that start paid work.
+ */
+export async function withRetry<T>(fn: () => Promise<T>, opts: { signal: AbortSignal; deadline?: number; attempts?: number }): Promise<T> {
+  const attempts = Math.max(1, opts.attempts ?? aiTiming.retryAttempts);
+  for (let i = 0; ; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (opts.signal.aborted || e instanceof AbortError) throw new AbortError();
+      if (i >= attempts - 1 || !isTransientError(e)) throw e;
+      const backoff = Math.min(aiTiming.retryMaxMs, aiTiming.retryBaseMs * 2 ** i) * (0.75 + Math.random() * 0.5);
+      const hinted = e instanceof AiError && e.retryAfterSec ? Math.min(60, e.retryAfterSec) * 1000 : 0;
+      const delay = Math.max(backoff, hinted);
+      if (opts.deadline !== undefined && Date.now() + delay > opts.deadline) throw e;
+      await sleep(delay, opts.signal);
+    }
   }
 }
 

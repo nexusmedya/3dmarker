@@ -49,11 +49,12 @@ export function buildStability3dForm(cfg: ProviderConfig, image: Blob): FormData
 
 export const stabilityAdapter: ProviderAdapter = {
   kind: 'stability',
+  editImageLimit: () => 1,
   async editImage(cfg, req) {
     const name = providerName(cfg);
     const endpoint = checkEndpoint(cfg, modelFor(cfg, 'image-edit'));
     req.onProgress?.(PROGRESS.generating(name));
-    const [image] = await prepareImages(req.images.slice(0, 1));
+    const [image] = await prepareImages(req.images.slice(0, 1), { keepAlpha: false });
     const res = await aiFetch(cfg, `v2beta/stable-image/${endpoint}`, {
       method: 'POST',
       headers: { Accept: 'image/*' },
@@ -65,7 +66,7 @@ export const stabilityAdapter: ProviderAdapter = {
   async removeBackground(cfg, image, signal) {
     const name = providerName(cfg);
     const endpoint = checkEndpoint(cfg, modelFor(cfg, 'background-removal'));
-    const [png] = await prepareImages([image]);
+    const [png] = await prepareImages([image], { keepAlpha: false });
     const res = await aiFetch(cfg, `v2beta/stable-image/${endpoint}`, {
       method: 'POST',
       headers: { Accept: 'image/*' },

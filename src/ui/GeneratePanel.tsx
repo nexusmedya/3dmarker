@@ -2,7 +2,9 @@
  * Generate / cancel, the progress bar and the error alert. Pinned at the
  * bottom of the studio panel: it generates from step 4's settings whatever
  * step is open (`summary` names the driver, `blockedAction` links to the
- * step that unblocks it).
+ * step that unblocks it). When the model on screen carries edits a new
+ * generation would discard, `discardWarning` says so under the button and
+ * `confirming` swaps the button for an inline "Regenerate anyway" question.
  */
 import type { ReactNode } from 'react';
 import type { I18nText, Progress } from '../core/types';
@@ -25,6 +27,12 @@ interface Props {
   summary?: ReactNode;
   /** A button next to the blocked reason (e.g. "Go to Views"). */
   blockedAction?: { label: string; onClick: () => void } | null;
+  /** What a new generation would throw away (sculpt / rig / depth edits); null = nothing. */
+  discardWarning?: string | null;
+  /** Generate was pressed with `discardWarning` set: ask before going on. */
+  confirming?: boolean;
+  onConfirm?: () => void;
+  onCancelConfirm?: () => void;
 }
 
 export function GeneratePanel({
@@ -40,9 +48,14 @@ export function GeneratePanel({
   onDismiss,
   summary,
   blockedAction,
+  discardWarning,
+  confirming,
+  onConfirm,
+  onCancelConfirm,
 }: Props) {
   const { t, tx } = useI18n();
   const running = status === 'running';
+  const asking = !running && canGenerate && !!confirming && !!discardWarning;
   return (
     <div className="generate-panel">
       {summary}
@@ -54,6 +67,20 @@ export function GeneratePanel({
           <button type="button" className="btn btn-secondary btn-lg" onClick={onCancel} data-testid="cancel">
             <IconX size={16} /> {t('cancel')}
           </button>
+        </div>
+      ) : asking ? (
+        <div className="regen-confirm" role="alertdialog" aria-labelledby="regen-confirm-text" data-testid="generate-confirm-box">
+          <p id="regen-confirm-text" className="small">
+            <IconAlert size={16} /> {discardWarning}
+          </p>
+          <div className="generate-row">
+            <button type="button" className="btn btn-primary grow" onClick={onConfirm} data-testid="generate-confirm" autoFocus>
+              <IconSparkles size={16} /> {t('regenAnyway')}
+            </button>
+            <button type="button" className="btn btn-secondary" onClick={onCancelConfirm} data-testid="generate-confirm-cancel">
+              {t('keepEdits')}
+            </button>
+          </div>
         </div>
       ) : (
         <button
@@ -81,7 +108,12 @@ export function GeneratePanel({
           )}
         </p>
       )}
-      {!running && !blockedReason && <p className="muted small center kbd-hint">{t('shortcutHint')}</p>}
+      {!running && !blockedReason && !asking && discardWarning && (
+        <p className="muted small center generate-warning" data-testid="generate-warning">
+          {discardWarning}
+        </p>
+      )}
+      {!running && !blockedReason && !asking && <p className="muted small center kbd-hint">{t('shortcutHint')}</p>}
       {status === 'cancelled' && !error && (
         <p className="muted small center" role="status">
           {t('cancelled')}

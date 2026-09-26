@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AbortError, type RGBAImage } from '../types';
-import { analyzeHuman, clearHumanCache, faceAgreesWithPose, headBoxFromPose, landmarkBox, resolveHandedness, setDetectorBackend, toPixels } from './analyze';
+import { analyzeHuman, clearHumanCache, LOAD_FAILURE_TTL_MS, SLOW_LOAD_FAILURE_MS, faceAgreesWithPose, headBoxFromPose, landmarkBox, resolveHandedness, setDetectorBackend, toPixels } from './analyze';
 import type { Detector, DetectorBackend, RawDetections, RawLandmark } from './backend';
 import { syntheticFace, syntheticPose } from './testing';
 import { FACE, LEFT_EYE_LOOP, RIGHT_EYE_LOOP } from './topology';
@@ -201,6 +201,62 @@ describe('analyzeHuman', () => {
     const a = await p2;
     expect(a.faces).toHaveLength(1);
     expect(calls.load.filter((k) => k === 'faces')).toHaveLength(1);
+  });
+
+  it('never joins a run that is being cancelled', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const { b, calls } = backend({ faces: () => ({ landmarks: [pts(478)] }), hands: none, pose: none });
+    const gated: DetectorBackend = {
+      ...b,
+      load: async (k, ctx) => {
+        const d = await b.load(k, ctx);
+        return { kind: k, detect: async (im) => { await gate; return d.detect(im); } };
+      },
+    };
+    setDetectorBackend(gated);
+    const image = img();
+    const ac1 = new AbortController();
+    const p1 = analyzeHuman(image, { signal: ac1.signal });
+    await vi.waitFor(() => expect(calls.load).toHaveLength(3)); // run 1 is inside a detect
+    ac1.abort();
+    await expect(p1).rejects.toBeInstanceOf(AbortError);
+    const ac2 = new AbortController();
+    const p2 = analyzeHuman(image, { signal: ac2.signal }); // before run 1 settles
+    release();
+    const a = await p2;
+    expect(ac2.signal.aborted).toBe(false);
+    expect(a.faces).toHaveLength(1);
+    expect(calls.load).toHaveLength(6);
+  });
+
+  it('remembers slow model load failures for a while (stalled download), not fast ones', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const calls: HumanDetector[] = [];
+      const slow: DetectorBackend = {
+        unsupportedReason: () => null,
+        load: async (kind) => {
+          calls.push(kind);
+          vi.setSystemTime(Date.now() + SLOW_LOAD_FAILURE_MS + 1); // e.g. the 30 s stall timeout
+          throw new Error('Download timed out');
+        },
+      };
+      setDetectorBackend(slow);
+      const a1 = await analyzeHuman(img(), { signal: new AbortController().signal, detect: { hands: false, pose: false } });
+      expect(a1.unavailableReason).toContain('timed out');
+      expect(calls).toEqual(['faces']);
+      const t0 = Date.now();
+      const a2 = await analyzeHuman(img(), { signal: new AbortController().signal, detect: { hands: false, pose: false } });
+      expect(a2.unavailableReason).toContain('timed out');
+      expect(calls).toHaveLength(1); // failed at once, no new download
+      expect(Date.now()).toBe(t0);
+      vi.setSystemTime(Date.now() + LOAD_FAILURE_TTL_MS);
+      await analyzeHuman(img(), { signal: new AbortController().signal, detect: { hands: false, pose: false } });
+      expect(calls).toHaveLength(2); // retried after the TTL
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('rejects with AbortError when aborted (before or during)', async () => {

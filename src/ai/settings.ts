@@ -14,13 +14,14 @@ import type { AiCapability, AiSettings, ProviderConfig, ProviderKindId } from '.
 import { AI_CAPABILITIES } from './types';
 import { loadJSON, persistableParams, sanitizeParams, saveJSON, type KeyValueStore } from '../app/persist';
 import { CLIENT_HEADER, CLIENT_HEADER_VALUE } from '../drivers/cloud/api';
-import { configCapabilities, defaultModel, getProviderKind, isProviderKindId, kindNeedsKey } from './kinds';
+import { configCapabilities, defaultModel, getProviderKind, isProviderKindId, kindNeedsKey, migrateOutputPath } from './kinds';
 import { AI_PROVIDERS_PATH, cleanKey, routeFor } from './transport';
 import { isValidTemplate } from './template';
 
 export const AI_SETTINGS_KEY = 'ai-settings';
 export const AI_KEYS_KEY = 'ai-keys';
-const VERSION = 1;
+/** 2: background removal no longer defaults to a generative re-render (see normalizeDefaults). */
+const VERSION = 2;
 
 export const DEFAULT_AI_SETTINGS: AiSettings = { providers: [], defaults: {}, rememberKeys: false };
 
@@ -66,7 +67,7 @@ export function createProviderConfig(kind: ProviderKindId, init: Partial<Provide
     label,
     apiKey: typeof init.apiKey === 'string' ? cleanKey(init.apiKey).slice(0, MAX_KEY) : '',
     ...(init.managed ? { managed: true } : {}),
-    values: sanitizeParams(k.fields, init.values),
+    values: sanitizeParams(k.fields, migrateOutputPath(kind, { ...(init.values ?? {}) })),
     models: sanitizeModels(kind, init.models),
     enabled: typeof init.enabled === 'boolean' ? init.enabled : true,
   };
@@ -78,16 +79,51 @@ export function supports(cfg: ProviderConfig, cap: AiCapability): boolean {
   return cfg.kind === 'custom-http' || !!(cfg.models[cap] ?? '').trim() || !!defaultModel(cfg.kind, cap);
 }
 
-/** Drops defaults that point nowhere and fills missing ones with the first enabled provider offering the capability. */
+/**
+ * Default id meaning "the local in-browser model" (background removal only).
+ * No default for background removal means the same.
+ */
+export const LOCAL_PROVIDER_ID = 'local';
+
+/**
+ * Background removers that re-draw the whole image with a generative edit
+ * model (OpenAI gpt-image): slow, paid and not pixel-exact, so they are used
+ * only when the user picks one explicitly.
+ */
+export function isRerenderBackgroundRemover(cfg: Pick<ProviderConfig, 'kind'>): boolean {
+  return cfg.kind === 'openai' || cfg.kind === 'openai-compatible';
+}
+
+/** May this config be picked for `cap` without the user choosing it? */
+const autoPickable = (p: ProviderConfig, cap: AiCapability) => cap !== 'background-removal' || !isRerenderBackgroundRemover(p);
+
+/**
+ * Drops defaults that point nowhere and fills missing ones with the first
+ * enabled provider offering the capability (for background removal only a
+ * dedicated matting model; otherwise the local model stays in charge).
+ */
 export function normalizeDefaults(s: AiSettings): AiSettings {
   const defaults: Partial<Record<AiCapability, string>> = {};
   for (const cap of AI_CAPABILITIES) {
     const cur = s.defaults[cap];
+    if (cap === 'background-removal' && cur === LOCAL_PROVIDER_ID) {
+      defaults[cap] = cur;
+      continue;
+    }
     const valid = cur && s.providers.some((p) => p.id === cur && supports(p, cap));
-    const pick = valid ? cur : s.providers.find((p) => p.enabled && supports(p, cap))?.id;
+    const pick = valid ? cur : s.providers.find((p) => p.enabled && supports(p, cap) && autoPickable(p, cap))?.id;
     if (pick) defaults[cap] = pick;
   }
   return { ...s, defaults };
+}
+
+/**
+ * Can this image-edit config render NEW views (back / sides) or re-pose /
+ * complete a subject? Stability's edit endpoints (control/structure, style,
+ * sketch) keep the input's composition by design, whatever the model id.
+ */
+export function canRenderViews(cfg: Pick<ProviderConfig, 'kind'>): boolean {
+  return cfg.kind !== 'stability';
 }
 
 interface StoredKeys {
@@ -135,6 +171,10 @@ export function loadAiSettings(local: KeyValueStore | null, session: KeyValueSto
   const defaults: Partial<Record<AiCapability, string>> = {};
   const d = src.defaults && typeof src.defaults === 'object' ? (src.defaults as Record<string, unknown>) : {};
   for (const cap of AI_CAPABILITIES) if (typeof d[cap] === 'string' && ID_PATTERN.test(d[cap] as string)) defaults[cap] = d[cap] as string;
+  // Version 1 filled the background-removal default automatically, often with an OpenAI re-render.
+  const bgDefault = providers.find((p) => p.id === defaults['background-removal']);
+  if (!(typeof src.version === 'number' && src.version >= 2) && bgDefault && isRerenderBackgroundRemover(bgDefault)) delete defaults['background-removal'];
+  if (local) seenWrites.set(local, { rev: typeof src.rev === 'string' ? src.rev : '', rememberKeys, stale: false });
   const s: AiSettings = { providers, defaults, rememberKeys };
   const kept = normalizeDefaults(s).defaults;
   // Defaults naming a server provider stay until mergeServerProviders validates them.
@@ -153,8 +193,45 @@ function clearStore(store: KeyValueStore | null, key: string): void {
   }
 }
 
-/** Persists the settings; managed providers are skipped, keys go to exactly one store. */
-export function saveAiSettings(local: KeyValueStore | null, session: KeyValueStore | null, s: AiSettings): void {
+/**
+ * What this tab last read from / wrote to a local store: the write id and
+ * rememberKeys. Lets a tab notice that another tab turned remembering off
+ * (see saveAiSettings).
+ */
+const seenWrites = new WeakMap<object, { rev: string; rememberKeys: boolean; stale: boolean }>();
+
+const newRev = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+
+/**
+ * Whether keys may go to localStorage: a tab whose rememberKeys=true is
+ * stale (another tab has since saved rememberKeys=false) must not bring the
+ * keys back to the device; it keeps them in sessionStorage until its own
+ * user turns remembering off and on again.
+ */
+function effectiveRemember(local: KeyValueStore | null, wanted: boolean): boolean {
+  const seen = local ? seenWrites.get(local) : undefined;
+  if (!local || !seen) return wanted;
+  if (!wanted) {
+    seen.stale = false;
+    return false;
+  }
+  if (seen.stale) return false;
+  const stored = loadJSON(local, AI_SETTINGS_KEY) as { rev?: unknown; rememberKeys?: unknown } | null;
+  const otherTabWrote = !!stored && typeof stored.rev === 'string' && stored.rev !== seen.rev;
+  if (otherTabWrote && stored.rememberKeys !== true && seen.rememberKeys) {
+    seen.stale = true;
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Persists the settings; managed providers are skipped, keys go to exactly
+ * one store. Returns the settings as saved (rememberKeys may be turned off
+ * when another tab turned it off meanwhile).
+ */
+export function saveAiSettings(local: KeyValueStore | null, session: KeyValueStore | null, settings: AiSettings): AiSettings {
+  const s = { ...settings, rememberKeys: effectiveRemember(local, settings.rememberKeys) };
   const own = s.providers.filter((p) => !p.managed && isProviderKindId(p.kind));
   const keys: Record<string, { apiKey: string; secrets?: Record<string, string> }> = {};
   const providers = own.map((p) => {
@@ -164,12 +241,18 @@ export function saveAiSettings(local: KeyValueStore | null, session: KeyValueSto
     if (p.apiKey || Object.keys(secrets).length) keys[p.id] = { apiKey: p.apiKey, ...(Object.keys(secrets).length ? { secrets } : {}) };
     return { id: p.id, kind: p.kind, label: p.label, values: persistableParams(specs, p.values), models: p.models, enabled: p.enabled };
   });
-  saveJSON(local, AI_SETTINGS_KEY, { version: VERSION, providers, defaults: s.defaults, rememberKeys: s.rememberKeys });
+  const rev = newRev();
+  saveJSON(local, AI_SETTINGS_KEY, { version: VERSION, rev, providers, defaults: s.defaults, rememberKeys: s.rememberKeys });
+  if (local) {
+    const seen = seenWrites.get(local);
+    seenWrites.set(local, { rev, rememberKeys: s.rememberKeys, stale: seen?.stale ?? false });
+  }
   const target = s.rememberKeys ? local : session;
   const other = s.rememberKeys ? session : local;
   if (Object.keys(keys).length) saveJSON(target, AI_KEYS_KEY, keys);
   else clearStore(target, AI_KEYS_KEY);
   if (other !== target) clearStore(other, AI_KEYS_KEY);
+  return s;
 }
 
 const T = {
@@ -215,7 +298,9 @@ export function providerUsable(cfg: ProviderConfig, serverAvailable: boolean): {
 export function resolveProvider(s: AiSettings, cap: AiCapability, preferredId?: string | null, serverAvailable = false): ProviderConfig | null {
   const ok = (p: ProviderConfig) => p.enabled && supports(p, cap) && providerUsable(p, serverAvailable).ok;
   const byId = (id: string | null | undefined) => (id ? s.providers.find((p) => p.id === id && ok(p)) : undefined);
-  return byId(preferredId) ?? byId(s.defaults[cap]) ?? s.providers.find(ok) ?? null;
+  if (cap === 'background-removal' && (preferredId === LOCAL_PROVIDER_ID || (!preferredId && s.defaults[cap] === LOCAL_PROVIDER_ID))) return null;
+  // Falling back never picks a generative re-render for background removal (null = the local model).
+  return byId(preferredId) ?? byId(s.defaults[cap]) ?? s.providers.find((p) => ok(p) && autoPickable(p, cap)) ?? null;
 }
 
 /** Usable configs offering `cap` (for pickers). */

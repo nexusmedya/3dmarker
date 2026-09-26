@@ -16,10 +16,9 @@ import type { I18nText } from '../../core/types';
 import { defaultParams } from '../../core/types';
 import type { AiCapability, AiSettings, ProviderConfig, ProviderKind, ProviderKindId } from '../../ai/types';
 import { AI_CAPABILITIES } from '../../ai/types';
-import { CAPABILITY_LABELS, PROVIDER_KINDS, configCapabilities, getProviderKind, isProviderKindId, kindNeedsKey } from '../../ai/kinds';
-import { providerUsable, supports } from '../../ai/settings';
+import { CAPABILITY_LABELS, PROVIDER_KINDS, configCapabilities, getProviderKind, hasConnectionTest, isProviderKindId, kindNeedsKey } from '../../ai/kinds';
+import { LOCAL_PROVIDER_ID, providerUsable, supports } from '../../ai/settings';
 import { routeFor } from '../../ai/transport';
-import { getAdapter } from '../../ai/adapters';
 import { errorToText } from '../../app/format';
 import { useI18n } from '../i18n';
 import { ParamForm } from '../ParamForm';
@@ -50,6 +49,7 @@ export const PROVIDER_TEXT = {
   defaultsHint: { tr: 'Her iş için önce denenecek sağlayıcı.', en: 'The provider tried first for each task.' },
   noneForCap: { tr: '— sağlayıcı yok —', en: '— no provider —' },
   pick: { tr: '— seçin —', en: '— choose —' },
+  localModel: { tr: 'Yerel (tarayıcıda, ücretsiz)', en: 'Local (in-browser, free)' },
   off: { tr: '(kapalı)', en: '(off)' },
   noServer: {
     tr: 'Sunucu yok (statik demo): yalnızca tarayıcıdan doğrudan çağrılan sağlayıcılar çalışır — {direct}. {proxy} için 3D Marker sunucusu gerekir.',
@@ -231,7 +231,8 @@ function SettingsDialog({ onClose, settings, onChange, serverAvailable }: Props)
     setTests((m) => ({ ...m, [cfg.id]: { sig, state: 'running' } }));
     let result: TestResult;
     try {
-      const adapter = getAdapter(cfg.kind);
+      // The adapters load on demand (they stay out of the main bundle).
+      const adapter = (await import('../../ai/adapters')).getAdapter(cfg.kind);
       if (!adapter.testConnection) throw new Error('unsupported');
       const r = await adapter.testConnection(cfg, ac.signal);
       result = { sig, state: r.ok ? 'ok' : 'error', text: r.message ? { tr: r.message, en: r.message } : undefined };
@@ -454,7 +455,10 @@ function DefaultsSection({ settings, onChange }: { settings: AiSettings; onChang
       <p className="field-hint">{tx(T.defaultsHint)}</p>
       {AI_CAPABILITIES.map((cap) => {
         const options = settings.providers.filter((p) => supports(p, cap));
-        const value = settings.defaults[cap] && options.some((p) => p.id === settings.defaults[cap]) ? settings.defaults[cap]! : '';
+        // Background removal can always stay on the in-browser model.
+        const local = cap === 'background-removal';
+        const cur = settings.defaults[cap];
+        const value = cur && options.some((p) => p.id === cur) ? cur : local ? LOCAL_PROVIDER_ID : '';
         return (
           <div className="field" key={cap}>
             <label className="field-label" htmlFor={`${id}-${cap}`}>
@@ -464,11 +468,12 @@ function DefaultsSection({ settings, onChange }: { settings: AiSettings; onChang
               id={`${id}-${cap}`}
               className="select ai-select-sm"
               value={value}
-              disabled={options.length === 0}
+              disabled={options.length === 0 && !local}
               data-testid={`ai-default-${cap}`}
               onChange={(e) => e.target.value && onChange(setDefaultProvider(settings, cap, e.target.value))}
             >
-              {options.length === 0 && <option value="">{tx(T.noneForCap)}</option>}
+              {local && <option value={LOCAL_PROVIDER_ID}>{tx(T.localModel)}</option>}
+              {options.length === 0 && !local && <option value="">{tx(T.noneForCap)}</option>}
               {options.length > 0 && !value && <option value="">{tx(T.pick)}</option>}
               {options.map((p) => (
                 <option key={p.id} value={p.id}>
@@ -595,7 +600,7 @@ function ProviderEditor({
   const usable = providerUsable(cfg, serverAvailable);
   // Test gating ignores the on/off switch: a disabled entry can still be checked.
   const testable = providerUsable({ ...cfg, enabled: true }, serverAvailable);
-  const adapterTest = !!safeAdapter(cfg.kind)?.testConnection;
+  const adapterTest = hasConnectionTest(cfg.kind);
   const route = routeFor(cfg);
   const modelCaps = caps.filter((c) => (kind.models[c] ?? []).length > 0);
   const defaultFor = defaultsOf(settings, cfg.id);
@@ -802,13 +807,6 @@ function ProviderEditor({
   );
 }
 
-function safeAdapter(kind: ProviderKindId) {
-  try {
-    return getAdapter(kind);
-  } catch {
-    return null;
-  }
-}
 
 function ModelField({
   cfg,

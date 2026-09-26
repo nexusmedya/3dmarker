@@ -5,23 +5,50 @@ import { join } from 'node:path';
 import { serve, type ServerType } from '@hono/node-server';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createApp } from './app';
-import { cacheControlFor, isRebindSafeHost, mountStatic, serverOptions, withHostGuard } from './runtime';
+import { cacheControlFor, isLoopbackBind, isRebindSafeHost, mountStatic, parseAllowedHosts, serverOptions, withHostGuard } from './runtime';
 
 describe('serverOptions', () => {
   it('listens on loopback with a Host guard in development', () => {
-    expect(serverOptions([], {})).toEqual({ port: 8787, hostname: '127.0.0.1', production: false, guardHost: true });
+    expect(serverOptions([], {})).toEqual({ port: 8787, hostname: '127.0.0.1', production: false, guardHost: true, allowedHosts: [] });
     expect(serverOptions([], { NODE_ENV: 'development', PORT: '9000' })).toMatchObject({ port: 9000, hostname: '127.0.0.1' });
   });
 
   it('listens on all interfaces in production (flag or NODE_ENV)', () => {
-    expect(serverOptions(['--production'], {})).toEqual({ port: 8787, hostname: undefined, production: true, guardHost: false });
+    expect(serverOptions(['--production'], {})).toEqual({ port: 8787, hostname: undefined, production: true, guardHost: true, allowedHosts: [] });
     expect(serverOptions([], { NODE_ENV: 'production' })).toMatchObject({ hostname: undefined, production: true });
   });
 
-  it('lets HOST override the bind address (and drops the dev guard)', () => {
-    expect(serverOptions([], { HOST: '0.0.0.0' })).toMatchObject({ hostname: '0.0.0.0', guardHost: false });
+  it('lets HOST override the bind address (the Host guard stays on)', () => {
+    expect(serverOptions([], { HOST: '0.0.0.0' })).toMatchObject({ hostname: '0.0.0.0', guardHost: true });
     expect(serverOptions(['--production'], { HOST: '10.0.0.5' })).toMatchObject({ hostname: '10.0.0.5' });
     expect(serverOptions([], { HOST: '  ' })).toMatchObject({ hostname: '127.0.0.1', guardHost: true });
+  });
+});
+
+describe('ALLOWED_HOSTS', () => {
+  it('keeps the guard on in every mode unless ALLOWED_HOSTS=*', () => {
+    expect(serverOptions(['--production'], { HOST: '0.0.0.0' }).guardHost).toBe(true);
+    expect(serverOptions(['--production'], { ALLOWED_HOSTS: ' * ' }).guardHost).toBe(false);
+    expect(serverOptions([], { ALLOWED_HOSTS: 'App.Example.com:443, *.example.org., bad host, *' })).toMatchObject({
+      guardHost: true,
+      allowedHosts: ['app.example.com', '*.example.org'],
+    });
+    expect(parseAllowedHosts(undefined)).toEqual([]);
+  });
+
+  it('accepts the listed names (and *.suffix subdomains) besides localhost and IPs', () => {
+    const allowed = parseAllowedHosts('app.example.com,*.example.org');
+    for (const ok of ['app.example.com', 'APP.example.com.:443', 'a.example.org', 'x.y.example.org:8787', 'localhost:8787', '192.168.1.5:8787']) {
+      expect(isRebindSafeHost(ok, allowed), ok).toBe(true);
+    }
+    for (const bad of ['evil.example', 'example.org', 'app.example.com.evil.example', 'evilexample.org', 'other.example.com']) {
+      expect(isRebindSafeHost(bad, allowed), bad).toBe(false);
+    }
+  });
+
+  it('isLoopbackBind', () => {
+    for (const h of ['127.0.0.1', '127.1.2.3', '::1', 'localhost']) expect(isLoopbackBind(h), h).toBe(true);
+    for (const h of [undefined, '0.0.0.0', '::', '10.0.0.5']) expect(isLoopbackBind(h), String(h)).toBe(false);
   });
 });
 
@@ -47,6 +74,9 @@ describe('Host guard', () => {
     expect(seen).toBe(0);
     expect((await guarded(req('localhost:8787'))).status).toBe(200);
     expect(seen).toBe(1);
+    const domain = withHostGuard(async () => new Response('ok'), ['app.example.com']);
+    expect((await domain(req('app.example.com'))).status).toBe(200);
+    expect((await domain(req('evil.example'))).status).toBe(403);
   });
 });
 

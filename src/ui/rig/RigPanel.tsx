@@ -18,6 +18,7 @@ import type { BuiltModel } from '../../app/pipeline';
 import { errorToText } from '../../app/format';
 import type { I18nText, Mask, Progress, RGBAImage } from '../../core/types';
 import type { HandResult, PoseResult } from '../../core/human/types';
+import { analyzeHuman } from '../../core/human/analyze';
 import { boneLabel, mirrorBone } from '../../rig/bones';
 import type * as RigEngine from '../../rig/engine';
 import { ANIMATION_CATEGORIES, type AnimationCategory, type HumanoidBone, type JointLayout, type RigClip } from '../../rig/types';
@@ -53,7 +54,8 @@ export const RIG_PANEL_TEXT = {
   weighted: { tr: '{n} köşe ağırlıklandı', en: '{n} vertices weighted' },
   methodPose: { tr: 'vücut noktalarından', en: 'from body landmarks' },
   methodSilhouette: { tr: 'T-pozu silüetinden', en: 'from the T-pose silhouette' },
-  methodProportional: { tr: 'oranlardan (insan algılanmadı)', en: 'from proportions (no person detected)' },
+  methodArmsDown: { tr: 'kollar aşağıda silüetinden — eklemleri kontrol edin', en: 'from the arms-down silhouette — check the joints' },
+  methodProportional: { tr: 'oranlardan (insan algılanmadı) — eklemleri düzenleyin', en: 'from proportions (no person detected) — adjust the joints' },
   showSkeleton: { tr: 'İskeleti göster', en: 'Show skeleton' },
   editJoints: { tr: 'Eklemleri düzenle', en: 'Edit joints' },
   mirror: { tr: 'Simetrik', en: 'Mirror' },
@@ -135,6 +137,12 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
   const playerRef = useRef<RigEngine.AnimationPlayer | null>(null);
   const editorRef = useRef<RigEngine.JointEditor | null>(null);
   const jobRef = useRef<AbortController | null>(null);
+  /** The in-flight joint-edit re-weight (a newer edit aborts it). */
+  const reweighRef = useRef<AbortController | null>(null);
+  /** The model's own clips (e.g. a GLB's node animations) saved while rigged, restored on unrig. */
+  const originalAnimsRef = useRef<{ model: BuiltModel; animations: BuiltModel['animations'] } | null>(null);
+  // Nudges accumulate and commit after a short pause (each commit re-weights).
+  const pending = useRef<{ patch: JointLayout; timer: ReturnType<typeof setTimeout> | null }>({ patch: {}, timer: null });
   const modelRef = useRef(model);
   modelRef.current = model;
   const cbRef = useRef({ onModelChanged, onActiveChange });
@@ -200,6 +208,10 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
   const teardown = useCallback(() => {
     jobRef.current?.abort();
     jobRef.current = null;
+    reweighRef.current?.abort();
+    reweighRef.current = null;
+    if (pending.current.timer) clearTimeout(pending.current.timer);
+    pending.current = { patch: {}, timer: null };
     editorRef.current?.dispose();
     editorRef.current = null;
     playerRef.current?.dispose();
@@ -215,12 +227,19 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
     }
   }, [coreRef]);
 
+  /** Give `m` back the clips it had before rigging (undefined when it had none). */
+  const restoreAnimations = useCallback((m: BuiltModel) => {
+    const saved = originalAnimsRef.current;
+    originalAnimsRef.current = null;
+    m.animations = saved && saved.model === m ? saved.animations : undefined;
+  }, []);
+
   useEffect(() => {
     return () => {
       const m = model;
       const wasRigged = !!handleRef.current;
       teardown();
-      if (m && wasRigged) m.animations = undefined;
+      if (m && wasRigged) restoreAnimations(m);
       setPhase('idle');
       setInfo(null);
       setBuiltins([]);
@@ -236,13 +255,15 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
       setProgress(null);
       setReweighting(null);
     };
-  }, [model, teardown]);
+  }, [model, teardown, restoreAnimations]);
 
   // ---- export selection → model.animations ------------------------------------
 
   useEffect(() => {
     if (phase !== 'rigged' || !model || !handleRef.current) return;
-    model.animations = allClips.filter((c) => exportSel.has(c.info.id)).map((c) => c.clip);
+    // The model's own clips (non-skinned GLB node animations) stay in the export next to the selection.
+    const own = originalAnimsRef.current?.model === model ? originalAnimsRef.current.animations ?? [] : [];
+    model.animations = [...own, ...allClips.filter((c) => exportSel.has(c.info.id)).map((c) => c.clip)];
     cbRef.current.onModelChanged();
   }, [phase, model, allClips, exportSel]);
 
@@ -264,7 +285,6 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
       if (frontImage) {
         setProgress({ label: T.detecting });
         try {
-          const { analyzeHuman } = await import('../../core/human/analyze');
           const a = await analyzeHuman(frontImage, { signal: ac.signal, onProgress: setProgress, detect: { pose: true, hands: true, faces: false } });
           // The main subject: the largest detected body.
           pose = a.poses.reduce<PoseResult | null>((best, p) => (!best || p.box.width * p.box.height > best.box.width * best.box.height ? p : best), null);
@@ -292,6 +312,7 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
         return;
       }
       handleRef.current = handle;
+      if (originalAnimsRef.current?.model !== m) originalAnimsRef.current = { model: m, animations: m.animations };
       playerRef.current = makePlayer(engine, core, m);
       const lib = engine.buildLibrary(handle.descriptor);
       setBuiltins(lib);
@@ -317,8 +338,9 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
 
   const removeRig = () => {
     const m = model;
+    const wasRigged = !!handleRef.current;
     teardown();
-    if (m) m.animations = undefined;
+    if (m && wasRigged) restoreAnimations(m);
     setPhase('idle');
     setInfo(null);
     setBuiltins([]);
@@ -347,15 +369,24 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
   const commitJoints = async (patch: JointLayout) => {
     const h = handleRef.current, engine = engineRef.current;
     if (!h || !engine) return;
+    // A newer edit supersedes the running re-weight (the rig merges its patch into the newer one).
+    reweighRef.current?.abort();
+    const ac = new AbortController();
+    reweighRef.current = ac;
+    const latest = () => reweighRef.current === ac;
     setReweighting({ label: T.reweighting });
     try {
-      await h.setJoints(patch, { onProgress: (p) => setReweighting(p) });
+      const applied = await h.setJoints(patch, { signal: ac.signal, onProgress: (p) => latest() && setReweighting(p) });
+      if (!applied || !latest()) return;
       editorRef.current?.setLayout(h.layout);
       rebuildClips(engine, h.descriptor);
     } catch (e) {
       if (!isAbort(e)) setError(errorToText(e));
     } finally {
-      setReweighting(null);
+      if (latest()) {
+        reweighRef.current = null;
+        setReweighting(null);
+      }
     }
   };
   const commitRef = useRef(commitJoints);
@@ -384,8 +415,6 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
     };
   }, [editing, phase, coreRef]);
 
-  // Nudges accumulate and commit after a short pause (each commit re-weights).
-  const pending = useRef<{ patch: JointLayout; timer: ReturnType<typeof setTimeout> | null }>({ patch: {}, timer: null });
   const nudge = (axis: 'x' | 'y' | 'z', dir: 1 | -1) => {
     const h = handleRef.current;
     if (!h || !selected) return;
@@ -412,6 +441,7 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
   };
   useEffect(() => () => {
     if (pending.current.timer) clearTimeout(pending.current.timer);
+    reweighRef.current?.abort();
   }, []);
 
   // ---- playback -------------------------------------------------------------
@@ -420,7 +450,8 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
     const p = playerRef.current;
     if (!p) return;
     if (editing) setEditing(false);
-    p.play(c.clip, { loop, speed, crossFade: crossFade && p.isPlaying ? 0.3 : 0 });
+    // One-shots (jump, sit-down, fall-die…) hold their last frame; the switch only affects looping clips.
+    p.play(c.clip, { loop: loop && c.info.loop, speed, crossFade: crossFade && p.isPlaying ? 0.3 : 0 });
     setCurrent(c.info.id);
     setPlaying(true);
     setTime(0);
@@ -495,7 +526,7 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
     });
 
   const busy = !enabled || phase === 'working' || !!reweighting;
-  const methodText = info ? (info.method === 'pose' ? T.methodPose : info.method === 'silhouette' ? T.methodSilhouette : T.methodProportional) : null;
+  const methodText = info ? (info.method === 'pose' ? T.methodPose : info.method === 'silhouette' ? T.methodSilhouette : info.method === 'arms-down' ? T.methodArmsDown : T.methodProportional) : null;
 
   const renderItem = (c: RigClip) => (
     <li key={c.info.id} className={`rig-item${current === c.info.id ? ' is-current' : ''}`}>
@@ -667,7 +698,7 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
                   checked={loop}
                   onChange={(v) => {
                     setLoop(v);
-                    playerRef.current?.setLoop(v);
+                    playerRef.current?.setLoop(v && (currentClip?.info.loop ?? true));
                   }}
                   testId="anim-loop"
                 />

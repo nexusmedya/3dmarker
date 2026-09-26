@@ -26,8 +26,31 @@ export function base64ToBytes(b64: string): Uint8Array {
   return out;
 }
 
+type NativeBase64 = Uint8Array & { toBase64?: () => string };
+type NodeBuffer = { from(b: Uint8Array): { toString(enc: 'base64'): string } };
+
+/**
+ * Base64 of a blob without blocking the main thread for long: the native
+ * Uint8Array#toBase64, else FileReader (async, off-thread), else Node's
+ * Buffer, else the portable loop. All give the same standard base64.
+ */
 export async function blobToBase64(blob: Blob): Promise<string> {
-  return bytesToBase64(new Uint8Array(await blob.arrayBuffer()));
+  if (typeof (Uint8Array.prototype as NativeBase64).toBase64 === 'function') {
+    return (new Uint8Array(await blob.arrayBuffer()) as NativeBase64).toBase64!();
+  }
+  if (typeof FileReader !== 'undefined') {
+    const url = await new Promise<string>((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result));
+      r.onerror = () => reject(r.error ?? new Error('FileReader failed'));
+      r.readAsDataURL(blob);
+    });
+    return url.slice(url.indexOf(',') + 1);
+  }
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const buffer = (globalThis as { Buffer?: NodeBuffer }).Buffer;
+  if (buffer) return buffer.from(bytes).toString('base64');
+  return bytesToBase64(bytes);
 }
 
 /** MIME type from the first bytes (PNG, JPEG, WEBP, GIF, GLB), or null. */
@@ -79,21 +102,22 @@ const canUseCanvas = () => typeof createImageBitmap === 'function' && (typeof Of
 
 type Ctx2D = OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D;
 
-function makeCanvas(w: number, h: number): { ctx: Ctx2D; toBlob: () => Promise<Blob> } | null {
+function makeCanvas(w: number, h: number): { ctx: Ctx2D; toBlob: (type?: string, quality?: number) => Promise<Blob> } | null {
   if (typeof OffscreenCanvas !== 'undefined') {
     const canvas = new OffscreenCanvas(w, h);
-    const ctx = canvas.getContext('2d');
-    if (ctx) return { ctx, toBlob: () => canvas.convertToBlob({ type: 'image/png' }) };
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (ctx) return { ctx, toBlob: (type = 'image/png', quality) => canvas.convertToBlob({ type, quality }) };
   }
   if (typeof document === 'undefined') return null;
   const canvas = document.createElement('canvas');
   canvas.width = w;
   canvas.height = h;
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) return null;
   return {
     ctx,
-    toBlob: () => new Promise((resolve, reject) => canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('PNG encoding failed'))), 'image/png')),
+    toBlob: (type = 'image/png', quality) =>
+      new Promise((resolve, reject) => canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Image encoding failed'))), type, quality)),
   };
 }
 
@@ -105,25 +129,71 @@ export async function encodePng(img: RGBAImage): Promise<Blob> {
   return c.toBlob();
 }
 
-/** Pixel size of an image blob, or null where it cannot be decoded (Node, broken file). */
-export async function imageSize(blob: Blob): Promise<{ width: number; height: number } | null> {
-  if (typeof createImageBitmap !== 'function') return null;
-  try {
-    const bmp = await createImageBitmap(blob);
-    const size = { width: bmp.width, height: bmp.height };
-    bmp.close();
-    return size;
-  } catch {
-    return null;
+const sizeCache = new WeakMap<Blob, Promise<{ width: number; height: number } | null>>();
+
+/** Pixel size of an image blob, or null where it cannot be decoded (Node, broken file). Memoised per blob. */
+export function imageSize(blob: Blob): Promise<{ width: number; height: number } | null> {
+  let p = sizeCache.get(blob);
+  if (!p) {
+    p = (async () => {
+      if (typeof createImageBitmap !== 'function') return null;
+      try {
+        const bmp = await createImageBitmap(blob);
+        const size = { width: bmp.width, height: bmp.height };
+        bmp.close();
+        return size;
+      } catch {
+        return null;
+      }
+    })();
+    sizeCache.set(blob, p);
   }
+  return p;
 }
 
+/** JPEG quality of flattened (opaque) uploads. */
+const UPLOAD_JPEG_QUALITY = 0.92;
+
+export interface UploadOptions {
+  /** Longest side (default UPLOAD_MAX_SIDE). */
+  maxSide?: number;
+  /**
+   * true (default): keep transparency, PNG. false: for providers that ignore
+   * alpha — transparent pixels are composited over white (a canvas stores
+   * them as black, which such providers would show) and the image is sent
+   * as a much smaller JPEG.
+   */
+  keepAlpha?: boolean;
+}
+
+/** Blobs are immutable, so prepared uploads are cached per blob and options. */
+const uploadCache = new WeakMap<Blob, Map<string, Promise<Blob>>>();
+
 /**
- * The image as a PNG whose longest side is at most `maxSide` (browser).
- * Without a canvas (Node tests) or when decoding fails the blob is returned
- * as is and the provider decides.
+ * The image ready to upload (browser): longest side at most `maxSide`, PNG
+ * with alpha, or flattened over white as JPEG (see UploadOptions). Without a
+ * canvas (Node tests) or when decoding fails the blob is returned as is and
+ * the provider decides. Idempotent and memoised per blob.
  */
-export async function toUploadPng(blob: Blob, maxSide = UPLOAD_MAX_SIDE): Promise<Blob> {
+export function toUploadImage(blob: Blob, opts: UploadOptions = {}): Promise<Blob> {
+  const maxSide = opts.maxSide ?? UPLOAD_MAX_SIDE;
+  const keepAlpha = opts.keepAlpha ?? true;
+  const key = `${maxSide}:${keepAlpha ? 'a' : 'f'}`;
+  let byOpts = uploadCache.get(blob);
+  if (!byOpts) uploadCache.set(blob, (byOpts = new Map()));
+  let p = byOpts.get(key);
+  if (!p) {
+    p = encodeUpload(blob, maxSide, keepAlpha);
+    byOpts.set(key, p);
+    // A later call with a result blob as input returns it unchanged.
+    p.then((out) => {
+      if (out !== blob && !uploadCache.has(out)) uploadCache.set(out, new Map([[key, Promise.resolve(out)]]));
+    }, () => byOpts!.delete(key));
+  }
+  return p;
+}
+
+async function encodeUpload(blob: Blob, maxSide: number, keepAlpha: boolean): Promise<Blob> {
   if (!canUseCanvas()) return blob;
   let bmp: ImageBitmap;
   try {
@@ -133,18 +203,28 @@ export async function toUploadPng(blob: Blob, maxSide = UPLOAD_MAX_SIDE): Promis
   }
   try {
     const scale = Math.min(1, maxSide / Math.max(bmp.width, bmp.height));
-    if (scale === 1 && blob.type === 'image/png') return blob;
+    if (scale === 1 && keepAlpha && blob.type === 'image/png') return blob;
+    if (scale === 1 && !keepAlpha && blob.type === 'image/jpeg') return blob; // JPEG has no alpha
     const w = Math.max(1, Math.round(bmp.width * scale));
     const h = Math.max(1, Math.round(bmp.height * scale));
     const c = makeCanvas(w, h);
     if (!c) return blob;
+    if (!keepAlpha) {
+      c.ctx.fillStyle = '#ffffff';
+      c.ctx.fillRect(0, 0, w, h);
+    }
     c.ctx.imageSmoothingEnabled = true;
     c.ctx.imageSmoothingQuality = 'high';
     c.ctx.drawImage(bmp, 0, 0, w, h);
-    return await c.toBlob();
+    return await (keepAlpha ? c.toBlob('image/png') : c.toBlob('image/jpeg', UPLOAD_JPEG_QUALITY));
   } finally {
     bmp.close();
   }
+}
+
+/** toUploadImage keeping alpha (PNG). */
+export function toUploadPng(blob: Blob, maxSide = UPLOAD_MAX_SIDE): Promise<Blob> {
+  return toUploadImage(blob, { maxSide, keepAlpha: true });
 }
 
 /** Decodes an image blob into RGBA (browser); null without a canvas or on failure. */

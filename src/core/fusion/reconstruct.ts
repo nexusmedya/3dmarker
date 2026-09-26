@@ -27,10 +27,11 @@ import {
   type PreparedView,
 } from './frame';
 import { applyCarve, carveTargets, silhouetteDepth, type ViewDepth } from './depthCarve';
-import { colorSource, colorVertices } from './color';
-import { marchingCubes, type IsoMesh } from './marchingCubes';
-import { buildAdjacency, fitToFrame, taubinSmooth, vertexNormals } from './meshOps';
-import { buildHull, countSurfaceCells, createGrid, downsample, gaussianBlur3D, type Grid } from './volume';
+import { colorSource, colorVerticesSteps } from './color';
+import { marchingCubesSteps, type IsoMesh } from './marchingCubes';
+import { buildAdjacency, fitToFrame, taubinSmoothSteps, vertexNormals } from './meshOps';
+import { macrotask, runSliced, type Steps } from './steps';
+import { buildHullSteps, countSurfaceCellsSteps, createGrid, dilationRadius, downsampleSteps, gaussianBlur3DSteps, type Grid } from './volume';
 import {
   DEFAULT_FUSION_OPTIONS,
   type DepthSource,
@@ -129,15 +130,31 @@ function isAbort(e: unknown): boolean {
 
 const joinLabel = (a: I18nText, b: I18nText, sep = ' · '): I18nText => ({ tr: `${a.tr}${sep}${b.tr}`, en: `${a.en}${sep}${b.en}` });
 
+/**
+ * Least dilation (world units) of the views whose silhouettes bound the hull
+ * along `axis`: every silhouette-bounded hull entry lies at least that far in
+ * front of the true one (0 in strict mode).
+ */
+function hullSlack(views: PreparedView[], size: readonly [number, number, number], axis: number, o: FusionOptions): number {
+  let slack = Infinity;
+  for (const u of views) {
+    const p = viewProjection(u, size);
+    const pxPerWorld = p.ua === axis ? Math.abs(p.su) : p.va === axis ? Math.abs(p.sv) : 0;
+    if (!(pxPerWorld > 0)) continue;
+    slack = Math.min(slack, dilationRadius(u, o) / pxPerWorld);
+  }
+  return Number.isFinite(slack) ? slack : 0;
+}
+
 /** Surface extraction under the triangle cap: the voxel step grows until the mesh fits. */
-function extractCapped(field: Float32Array, grid: Grid, maxTriangles: number): { mesh: IsoMesh; field: Float32Array; grid: Grid; step: number } {
+function* extractCapped(field: Float32Array, grid: Grid, maxTriangles: number): Steps<{ mesh: IsoMesh; field: Float32Array; grid: Grid; step: number }> {
   // ≈ 2 triangles per surface cell; a coarser step divides the count by step².
-  const cells = countSurfaceCells(field, grid.dims);
+  const cells = yield* countSurfaceCellsSteps(field, grid.dims);
   let step = 1;
   while (step < 16 && (2 * cells) / (step * step) > maxTriangles) step++;
   for (;;) {
-    const d = downsample(field, grid, step);
-    const mesh = marchingCubes(d.field, d.grid.dims, 0.5, d.grid.origin, d.grid.spacing);
+    const d = yield* downsampleSteps(field, grid, step);
+    const mesh = yield* marchingCubesSteps(d.field, d.grid.dims, 0.5, d.grid.origin, d.grid.spacing);
     if (mesh.indices.length / 3 <= maxTriangles || step >= 16) return { mesh, field: d.field, grid: d.grid, step };
     step++;
   }
@@ -160,6 +177,15 @@ export async function reconstructFromViews(
     await pause();
     throwIfAborted(signal);
   };
+  // Long stages run in slices: the event loop (Cancel / Esc) gets a turn at least every sliceMs.
+  const tick = ctx.yieldControl ?? macrotask;
+  const between = async () => {
+    throwIfAborted(signal);
+    await tick();
+    throwIfAborted(signal);
+  };
+  const sliceMs = Math.max(0, ctx.sliceMs ?? 30);
+  const sliced = <T>(steps: Steps<T>) => runSliced(steps, sliceMs, between);
 
   // 1. Normalisation.
   await stage(FUSION_TEXT.prepare, 0.02);
@@ -171,6 +197,7 @@ export async function reconstructFromViews(
   for (const input of inputs) {
     if (seen.has(input.id)) continue;
     seen.add(input.id);
+    await between();
     const v = prepareView(input);
     if (v) views.push(v);
   }
@@ -182,7 +209,7 @@ export async function reconstructFromViews(
 
   // 2. Visual hull.
   await stage(FUSION_TEXT.hull, 0.06);
-  const field = buildHull(views, box, grid, o);
+  const field = await sliced(buildHullSteps(views, box, grid, o));
 
   // 3. Depth refinement.
   const depthFrom: Partial<Record<ViewId, DepthSource>> = {};
@@ -234,40 +261,54 @@ export async function reconstructFromViews(
 
   if (depths.size > 0 && o.depthStrength > 0) {
     await stage(FUSION_TEXT.carve, 0.62);
+    // Model depth has no scale: measure it against a hull that constrains depth. The silhouette
+    // balloon (and any depth of a front/back-only set) keeps the assumed near-half range.
+    const hullHasDepth = constrainsDepth(views);
     // Every target is computed from the uncarved hull before any carving (order-independent, no copy).
-    const plans = views
-      .filter((v) => depths.has(v.id))
-      .map((v) => {
-        const proj = viewProjection(v, box.size);
-        const targets = carveTargets(field, grid, proj, v.mask, depths.get(v.id)!, {
-          strength: o.depthStrength,
-          fit: o.depthFit,
-          halfExtent: box.size[proj.wa] / 2,
-        });
-        return { proj, targets };
+    const plans: { proj: ReturnType<typeof viewProjection>; targets: Float32Array }[] = [];
+    for (const v of views) {
+      if (!depths.has(v.id)) continue;
+      const proj = viewProjection(v, box.size);
+      const targets = carveTargets(field, grid, proj, v.mask, depths.get(v.id)!, {
+        strength: o.depthStrength,
+        fit: o.depthFit,
+        halfExtent: box.size[proj.wa] / 2,
+        calibrate: hullHasDepth && depthFrom[v.id] === 'model',
+        hullSlack: hullSlack(views, box.size, proj.wa, o),
       });
-    for (const { proj, targets } of plans) applyCarve(field, grid, proj, targets);
+      plans.push({ proj, targets });
+      await between();
+    }
+    for (const { proj, targets } of plans) {
+      applyCarve(field, grid, proj, targets);
+      await between();
+    }
   }
 
   // 4. Surface.
   await stage(FUSION_TEXT.smoothVolume, 0.68);
-  gaussianBlur3D(field, grid.dims, o.smoothness);
+  await sliced(gaussianBlur3DSteps(field, grid.dims, o.smoothness));
   await stage(FUSION_TEXT.surface, 0.74);
-  const ext = extractCapped(field, grid, o.maxTriangles);
+  const ext = await sliced(extractCapped(field, grid, o.maxTriangles));
   const { positions, indices } = ext.mesh;
   if (indices.length === 0) throw new LocalizedError(FUSION_TEXT.empty);
   await stage(FUSION_TEXT.smoothMesh, 0.84);
   const adj = buildAdjacency(positions.length / 3, indices);
-  taubinSmooth(positions, adj, o.smoothIterations);
+  await between();
+  await sliced(taubinSmoothSteps(positions, adj, o.smoothIterations));
   const normals = vertexNormals(positions, indices);
 
   // 5. Colour.
   await stage(FUSION_TEXT.color, 0.9);
-  const sources = views.map((v) => colorSource(v, viewProjection(v, box.size), ext.field, ext.grid));
-  const colors = colorVertices(positions, normals, adj, sources, ext.grid, {
+  const sources = [];
+  for (const v of views) {
+    sources.push(colorSource(v, viewProjection(v, box.size), ext.field, ext.grid));
+    await between();
+  }
+  const colors = await sliced(colorVerticesSteps(positions, normals, adj, sources, ext.grid, {
     sharpness: o.colorSharpness,
     tolerance: 2.5 * ext.grid.spacing,
-  });
+  }));
 
   // 6. Shared frame.
   await stage(FUSION_TEXT.finish, 0.97);

@@ -37,15 +37,30 @@ function templateFields(caps: AiCapability[]): ParamSpec[] {
     'image-to-3d': t('Girdi şablonu — görselden 3B', 'Input template — image to 3D'),
     'multiview-to-3d': t('Girdi şablonu — çok görünümden 3B', 'Input template — multi-view to 3D'),
   };
-  const fields: ParamSpec[] = caps.map((cap) => ({
-    kind: 'text' as const,
-    key: templateKey(cap),
-    label: labels[cap],
-    hint: TEMPLATE_HINT,
-    default: '',
-    placeholder: '{"prompt": "{{prompt}}", "image": "{{image}}"}',
-  }));
-  fields.push({ kind: 'text', key: 'outputPath', label: t('Çıktı yolu', 'Output path'), hint: OUTPUT_PATH_HINT, default: '', placeholder: 'images.0.url' });
+  const outputLabels: Record<AiCapability, I18nText> = {
+    'image-edit': t('Çıktı yolu — görsel düzenleme', 'Output path — image edit'),
+    'background-removal': t('Çıktı yolu — arka plan kaldırma', 'Output path — background removal'),
+    'image-to-3d': t('Çıktı yolu — görselden 3B', 'Output path — image to 3D'),
+    'multiview-to-3d': t('Çıktı yolu — çok görünümden 3B', 'Output path — multi-view to 3D'),
+  };
+  const fields: ParamSpec[] = caps.flatMap((cap): ParamSpec[] => [
+    {
+      kind: 'text' as const,
+      key: templateKey(cap),
+      label: labels[cap],
+      hint: TEMPLATE_HINT,
+      default: '',
+      placeholder: '{"prompt": "{{prompt}}", "image": "{{image}}"}',
+    },
+    {
+      kind: 'text' as const,
+      key: outputPathKey(cap),
+      label: outputLabels[cap],
+      hint: OUTPUT_PATH_HINT,
+      default: '',
+      placeholder: cap === 'image-to-3d' || cap === 'multiview-to-3d' ? 'model_glb.url' : 'images.0.url',
+    },
+  ]);
   if (caps.includes('multiview-to-3d')) {
     fields.push({
       kind: 'boolean',
@@ -59,6 +74,44 @@ function templateFields(caps: AiCapability[]): ParamSpec[] {
     });
   }
   return fields;
+}
+
+/** Field key holding the output path of a capability (generic kinds); one per capability so they never clash. */
+export function outputPathKey(cap: AiCapability): string {
+  switch (cap) {
+    case 'image-edit':
+      return 'editOutputPath';
+    case 'background-removal':
+      return 'bgOutputPath';
+    case 'image-to-3d':
+      return 'modelOutputPath';
+    case 'multiview-to-3d':
+      return 'multiviewOutputPath';
+  }
+}
+
+/**
+ * Moves the old single 'outputPath' value of a generic-kind config to the
+ * per-capability fields it was meant for: the capabilities with a custom
+ * template, else the 3D ones for a model-looking path, else the image ones.
+ * Fields that already hold a path are left alone.
+ */
+export function migrateOutputPath(kind: ProviderKindId, values: Record<string, unknown>): Record<string, unknown> {
+  const legacy = typeof values.outputPath === 'string' ? values.outputPath.trim() : '';
+  if (!legacy || (kind !== 'fal' && kind !== 'replicate')) return values;
+  const out: Record<string, unknown> = { ...values };
+  delete out.outputPath;
+  const caps = BY_ID.get(kind)?.capabilities ?? [];
+  const custom = caps.filter((c) => typeof values[templateKey(c)] === 'string' && (values[templateKey(c)] as string).trim());
+  const model = /glb|mesh|model|gltf/i.test(legacy);
+  const targets = custom.length
+    ? custom
+    : caps.filter((c) => (c === 'image-to-3d' || c === 'multiview-to-3d') === model);
+  for (const cap of targets) {
+    const key = outputPathKey(cap);
+    if (typeof out[key] !== 'string' || !(out[key] as string).trim()) out[key] = legacy;
+  }
+  return out;
 }
 
 /** Field key holding the request template of a capability (generic kinds). */
@@ -467,6 +520,14 @@ export function configCapabilities(cfg: Pick<ProviderConfig, 'kind' | 'values'>)
 /** Kinds whose requests need an API key unless the server manages it. */
 export function kindNeedsKey(id: ProviderKindId): boolean {
   return id !== 'openai-compatible' && id !== 'custom-http';
+}
+
+/**
+ * Kinds whose adapter has a connection test (every adapter but custom-http's;
+ * adapters/index.test.ts keeps this in step with the adapters, which load on demand).
+ */
+export function hasConnectionTest(kind: ProviderKindId): boolean {
+  return isProviderKindId(kind) && kind !== 'custom-http';
 }
 
 /** The kind's first suggested model for a capability ('' when none). */

@@ -67,7 +67,7 @@ describe('validateProxyPath', () => {
 describe('buildTargetUrl', () => {
   it('always stays on the kind base', () => {
     expect(buildTargetUrl(PROXY_KINDS.openai, 'v1/images/edits', '')?.toString()).toBe('https://api.openai.com/v1/images/edits');
-    expect(buildTargetUrl(PROXY_KINDS.tripo, 'v2/openapi/task', 'a=1')?.toString()).toBe('https://api.tripo3d.ai/v2/openapi/task?a=1');
+    expect(buildTargetUrl(PROXY_KINDS.replicate, 'v1/predictions/abc', 'a=1')?.toString()).toBe('https://api.replicate.com/v1/predictions/abc?a=1');
     expect(buildTargetUrl(PROXY_KINDS.openai, '@evil.com/x', '')?.host).toBe('api.openai.com');
   });
 
@@ -125,7 +125,7 @@ describe('request headers', () => {
     expect(buildUpstreamHeaders(PROXY_KINDS.gemini, new Headers(), 'AIzaK', null).get('x-goog-api-key')).toBe('AIzaK');
     expect(buildUpstreamHeaders(PROXY_KINDS.gemini, new Headers(), 'AIzaK', null).has('authorization')).toBe(false);
     expect(buildUpstreamHeaders(PROXY_KINDS.fal, new Headers(), 'id:secret', null).get('authorization')).toBe('Key id:secret');
-    for (const k of ['openai', 'stability', 'replicate', 'tripo'] as const) {
+    for (const k of ['openai', 'stability', 'replicate'] as const) {
       expect(buildUpstreamHeaders(PROXY_KINDS[k], new Headers(), 'k1', null).get('authorization'), k).toBe('Bearer k1');
     }
     expect(buildUpstreamHeaders(PROXY_KINDS.openai, new Headers(), null, null).has('authorization')).toBe(false);
@@ -195,10 +195,11 @@ describe('download allow-list', () => {
   const ok = (u: string) => checkFetchUrl(u, rules).ok;
 
   it('parses host rules', () => {
-    expect(parseHostRules(' A.com, *.b.org ,,c.net/some/prefix/ , 1.2.3.4, bad host, localhost')).toEqual([
+    expect(parseHostRules(' A.com, *.b.org ,,c.net/some/prefix/ , *.d.net/p, 1.2.3.4, bad host, localhost')).toEqual([
       { host: 'a.com', subdomains: 'also', pathPrefix: '' },
       { host: 'b.org', subdomains: 'only', pathPrefix: '' },
-      { host: 'c.net', subdomains: 'also', pathPrefix: '/some/prefix' },
+      { host: 'c.net', subdomains: 'exact', pathPrefix: '/some/prefix' },
+      { host: 'd.net', subdomains: 'only', pathPrefix: '/p' },
     ]);
     expect(parseHostRules('')).toBeNull();
     expect(parseHostRules('1.2.3.4')).toBeNull();
@@ -233,6 +234,9 @@ describe('download allow-list', () => {
       'https://storage.googleapis.com/falserverless-evil/x',
       'https://storage.googleapis.com/falserverless%2F..%2Fother/x',
       'https://storage.googleapis.com/falserverless/../other/x',
+      // A path-limited entry is that exact host: any GCS bucket is served at <bucket>.storage.googleapis.com.
+      'https://attacker-bucket.storage.googleapis.com/falserverless/x',
+      'https://x.storage.googleapis.com/falserverless/big.bin',
       'http://v3.fal.media/x.png',
       'https://v3.fal.media:8443/x.png',
       'https://user:pw@v3.fal.media/x.png',

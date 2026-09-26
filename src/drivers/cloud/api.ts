@@ -124,7 +124,10 @@ export const AI_PROXY_MAX_BODY_BYTES = 40 * 1024 * 1024;
 /** Largest file AI_FETCH_PATH downloads. */
 export const AI_FETCH_MAX_BYTES = 200 * 1024 * 1024;
 
-/** Fixed upstream per proxied kind (the proxy never talks to any other host for them). */
+/**
+ * Fixed upstream per proxied kind (the proxy never talks to any other host for
+ * them). Tripo3D is not proxied here: it has its own routes (TRIPO_TASKS_PATH…).
+ */
 export const AI_PROXY_BASES = {
   openai: 'https://api.openai.com',
   gemini: 'https://generativelanguage.googleapis.com',
@@ -132,7 +135,6 @@ export const AI_PROXY_BASES = {
   replicate: 'https://api.replicate.com',
   /** Paths starting with `queue/` go to https://queue.fal.run (prefix removed). */
   fal: 'https://fal.run',
-  tripo: 'https://api.tripo3d.ai',
 } as const satisfies Partial<Record<ProviderKindId, string>>;
 
 export type ProxiedKind = keyof typeof AI_PROXY_BASES;

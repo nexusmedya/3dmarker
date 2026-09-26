@@ -108,10 +108,13 @@ const FLY: Pose = merge(
   sym(curl(1, ['Thumb', 'Index', 'Middle', 'Ring', 'Pinky'])),
   { LeftLeg: [25, 0, 0], LeftFoot: [30, 0, 0], RightFoot: [30, 0, 0], RightUpLeg: [0, 0, -3] },
 );
-const fly = clip('fly', 'Fly (superhero)', 'Uçuş (süper kahraman)', 'pose', 3, true, [
-  key(0, FLY, [0, 0.35, 0]),
-  key(0.5, merge(FLY, { Hips: [82, 0, 2], LeftLeg: [30, 0, 0] }), [0, 0.42, 0]),
-]);
+const fly: ClipDef = {
+  ...clip('fly', 'Fly (superhero)', 'Uçuş (süper kahraman)', 'pose', 3, true, [
+    key(0, FLY, [0, 0.35, 0]),
+    key(0.5, merge(FLY, { Hips: [82, 0, 2], LeftLeg: [30, 0, 0] }), [0, 0.42, 0]),
+  ]),
+  grounded: false,
+};
 
 const sitDown = clip('sit-down', 'Sit down', 'Otur', 'action', 1.6, false, [
   key(0, RELAX),
@@ -220,12 +223,12 @@ const zombieWalk = clip('zombie-walk', 'Zombie walk', 'Zombi yürüyüşü', 'lo
   key(0.25, merge(ZOMBIE_BASE, { Hips: [0, 0, 5], RightUpLeg: [-8, 0, 0], RightLeg: [25, 0, 0], RightFoot: [5, 0, 0] }), [0.02, 0, 0]),
 ]));
 
-const swim = clip('swim', 'Swim in place', 'Yerinde yüzme', 'locomotion', 1.6, true, [
+const swim: ClipDef = { ...clip('swim', 'Swim in place', 'Yerinde yüzme', 'locomotion', 1.6, true, [
   key(0, merge(sym({ LeftArm: [0, -85, 5], LeftForeArm: [0, 0, 0], LeftUpLeg: [-5, 0, 4], LeftLeg: [5, 0, 0], LeftFoot: [30, 0, 0] }), HANDS_OPEN, { Hips: [20, 0, 0], Head: [-20, 0, 0] }), [0, 0.03, 0]),
   key(0.3, merge(sym({ LeftArm: [0, -20, 0], LeftForeArm: [0, -20, 0], LeftUpLeg: [-20, 0, 12], LeftLeg: [40, 0, 0], LeftFoot: [10, 0, 0] }), HANDS_OPEN, { Hips: [20, 0, 0], Head: [-22, 0, 0] }), [0, 0, 0]),
   key(0.55, merge(sym({ LeftArm: [0, -30, -40], LeftForeArm: [0, -120, 0], LeftUpLeg: [-50, 0, 30], LeftLeg: [95, 0, 0], LeftFoot: [-20, 0, 0] }), HANDS_OPEN, { Hips: [20, 0, 0], Head: [-25, 0, 0] }), [0, -0.03, 0]),
   key(0.8, merge(sym({ LeftArm: [0, -80, -10], LeftForeArm: [0, -30, 0], LeftUpLeg: [-10, 0, 25], LeftLeg: [10, 0, 0], LeftFoot: [30, 0, 0] }), HANDS_OPEN, { Hips: [20, 0, 0], Head: [-20, 0, 0] }), [0, 0.02, 0]),
-]);
+]), grounded: false };
 
 // ---------------------------------------------------------------------------
 // Action

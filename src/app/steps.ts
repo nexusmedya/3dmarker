@@ -69,7 +69,8 @@ export function stepStatus(step: StepId, f: StepFacts): StepStatus {
     case 'views':
       return {
         done: f.viewCount >= 5,
-        hint: f.aiBusy === 'views' ? UI.hintWorking : fill(UI.hintViews, { n: f.viewCount }),
+        // Counted like the views panel: the front (source image) is one of the six.
+        hint: f.aiBusy === 'views' ? UI.hintWorking : fill(UI.hintViews, { n: f.viewCount + (f.hasSource ? 1 : 0) }),
         busy: f.aiBusy === 'views',
       };
     case '3d':

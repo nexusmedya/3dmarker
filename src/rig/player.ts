@@ -49,7 +49,10 @@ export class AnimationPlayer {
     private readonly root: Object3D,
   ) {
     this.mixer = new AnimationMixer(root);
-    this.mixer.addEventListener('finished', () => {
+    this.mixer.addEventListener('finished', (e) => {
+      // A previous one-shot reaching its end while it fades out must not stop the clip that replaced it.
+      // (Clamped, it keeps holding its last frame until the fade disables it.)
+      if (e.action !== this.action) return;
       this.playing = false;
       this.emit();
       this.onFinished?.();

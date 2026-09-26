@@ -102,6 +102,25 @@ describe('DepthMapEditor', () => {
     expect(onClose).toHaveBeenCalled();
   });
 
+  it('pressing the Fit button on the stage does not paint', () => {
+    mount();
+    const stage = q('[data-testid="depth-stage"]')!;
+    stage.getBoundingClientRect = () => ({ left: 0, top: 0, width: 500, height: 400, right: 500, bottom: 400, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect;
+    const fit = q('[data-testid="depth-fit"]')!;
+    expect(stage.contains(fit)).toBe(true);
+    const fire = (type: string) =>
+      fit.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, pointerId: 1, isPrimary: true, button: 0, clientX: 20, clientY: 10 }));
+    let prevented = false;
+    act(() => {
+      fire('pointerdown');
+      prevented = fire('pointerup') === false;
+      fit.click();
+    });
+    expect(prevented).toBe(false);
+    expect(q('[data-testid="depth-edits"]')!.dataset.edits).toBe('0');
+    expect((q('[data-testid="depth-undo"]') as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it('Escape and Cancel close without applying', () => {
     const { onApply, onClose } = mount();
     act(() => {

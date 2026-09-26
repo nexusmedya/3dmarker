@@ -12,7 +12,7 @@ import type { AiCapability, ProviderAdapter, ProviderConfig } from '../types';
 import { base64ToBlob, dataUriToBlob } from '../encode';
 import { AiError, cleanKey, downloadOutput, providerName, readJson, send } from '../transport';
 import { findOutputUrl, getPath, parseTemplate, renderString, renderTemplate } from '../template';
-import { asGlb, asImage, buildTemplateVars, fileName, prepareImages, PROGRESS, toModelPlan, unsupported } from './common';
+import { asGlb, asImage, buildTemplateVars, fileName, prepareImages, PROGRESS, templateTakesSeveralImages, toModelPlan, unsupported } from './common';
 
 export interface CustomRequestData {
   prompt?: string;
@@ -120,13 +120,14 @@ async function call(cfg: ProviderConfig, cap: AiCapability, data: CustomRequestD
 
 export const customHttpAdapter: ProviderAdapter = {
   kind: 'custom-http',
+  editImageLimit: (cfg) => (templateTakesSeveralImages(str(cfg.values.body)) ? Infinity : 1),
   async editImage(cfg, req) {
     req.onProgress?.(PROGRESS.generating(providerName(cfg)));
-    const images = await prepareImages(req.images);
+    const images = await prepareImages(req.images, { keepAlpha: false });
     return asImage(await call(cfg, 'image-edit', { prompt: req.prompt, images }, req.signal, 'image'), providerName(cfg));
   },
   async removeBackground(cfg, image, signal) {
-    const images = await prepareImages([image]);
+    const images = await prepareImages([image], { keepAlpha: false });
     return asImage(await call(cfg, 'background-removal', { images }, signal, 'image'), providerName(cfg));
   },
   async toModel(cfg, req) {

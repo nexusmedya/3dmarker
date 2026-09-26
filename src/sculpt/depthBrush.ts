@@ -301,37 +301,45 @@ export class DepthEditState {
     return rect;
   }
 
-  /** Mean over a (2k+1)² window of each pixel in the rect (separable sums; masked-out pixels ignored). */
+  /**
+   * Mean over a (2k+1)² window of each pixel in the rect (masked-out pixels
+   * ignored; NaN where the window has none). Running column sums slide down
+   * the rows and prefix sums across them give each window in O(1): the cost
+   * is O(area), independent of k.
+   */
   private boxAverage(x0: number, y0: number, x1: number, y1: number, k: number): Float32Array {
     const { width: w, height: h, data } = this;
     const mask = this.maskOnly ? this.mask : null;
     const ex0 = Math.max(0, x0 - k), ex1 = Math.min(w, x1 + k);
     const ew = ex1 - ex0;
     const rw = x1 - x0, rh = y1 - y0;
-    // Vertical sums for every column of the extended rect, per output row.
     const out = new Float32Array(rw * rh);
+    // Vertical sums over rows [y-k, y+k] for every column of the extended rect.
     const colSum = new Float64Array(ew), colCnt = new Float64Array(ew);
+    const prefSum = new Float64Array(ew + 1), prefCnt = new Float64Array(ew + 1);
+    const addRow = (yy: number, sign: 1 | -1) => {
+      const row = yy * w + ex0;
+      for (let c = 0; c < ew; c++) {
+        const i = row + c;
+        if (mask && !mask[i]) continue;
+        colSum[c] += sign * data[i];
+        colCnt[c] += sign;
+      }
+    };
+    for (let yy = Math.max(0, y0 - k), end = Math.min(h - 1, y0 + k); yy <= end; yy++) addRow(yy, 1);
     for (let y = y0; y < y1; y++) {
-      colSum.fill(0);
-      colCnt.fill(0);
-      const yy0 = Math.max(0, y - k), yy1 = Math.min(h - 1, y + k);
-      for (let yy = yy0; yy <= yy1; yy++) {
-        const row = yy * w;
-        for (let c = 0; c < ew; c++) {
-          const i = row + ex0 + c;
-          if (mask && !mask[i]) continue;
-          colSum[c] += data[i];
-          colCnt[c]++;
-        }
+      if (y > y0) {
+        if (y + k <= h - 1) addRow(y + k, 1);
+        if (y - k - 1 >= 0) addRow(y - k - 1, -1);
+      }
+      for (let c = 0; c < ew; c++) {
+        prefSum[c + 1] = prefSum[c] + colSum[c];
+        prefCnt[c + 1] = prefCnt[c] + colCnt[c];
       }
       for (let x = x0; x < x1; x++) {
-        let sum = 0, cnt = 0;
-        const c0 = Math.max(0, x - k) - ex0, c1 = Math.min(w - 1, x + k) - ex0;
-        for (let c = c0; c <= c1; c++) {
-          sum += colSum[c];
-          cnt += colCnt[c];
-        }
-        out[(y - y0) * rw + (x - x0)] = cnt > 0 ? sum / cnt : Number.NaN;
+        const c0 = Math.max(0, x - k) - ex0, c1 = Math.min(w - 1, x + k) - ex0 + 1;
+        const cnt = prefCnt[c1] - prefCnt[c0];
+        out[(y - y0) * rw + (x - x0)] = cnt > 0.5 ? (prefSum[c1] - prefSum[c0]) / cnt : Number.NaN;
       }
     }
     return out;

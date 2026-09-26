@@ -3,6 +3,7 @@
  * Taubin λ/μ smoothing (shrink-free Laplacian smoothing), area-weighted
  * vertex normals and rescaling into the shared frame. Typed arrays only.
  */
+import { drain, type Steps } from './steps';
 
 export interface Adjacency {
   /** Neighbours of v are neighbors[offsets[v] .. offsets[v + 1]). */
@@ -36,6 +37,11 @@ export function buildAdjacency(vertexCount: number, indices: Uint32Array): Adjac
 
 /** Taubin smoothing in place: per iteration x += λ·L(x), then x += μ·L(x) with the uniform Laplacian. */
 export function taubinSmooth(positions: Float32Array, adj: Adjacency, iterations: number, lambda = 0.5, mu = -0.53): void {
+  drain(taubinSmoothSteps(positions, adj, iterations, lambda, mu));
+}
+
+/** taubinSmooth as cooperative steps (a yield per pass). */
+export function* taubinSmoothSteps(positions: Float32Array, adj: Adjacency, iterations: number, lambda = 0.5, mu = -0.53): Steps {
   const n = positions.length / 3;
   const tmp = new Float32Array(positions.length);
   const { offsets, neighbors } = adj;
@@ -60,7 +66,9 @@ export function taubinSmooth(positions: Float32Array, adj: Adjacency, iterations
   };
   for (let it = 0; it < iterations; it++) {
     pass(positions, tmp, lambda);
+    yield;
     pass(tmp, positions, mu);
+    yield;
   }
 }
 

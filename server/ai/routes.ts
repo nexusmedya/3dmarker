@@ -6,7 +6,9 @@
  *   GET  /api/ai/fetch?url=<https URL>  a provider output file from an allow-listed host
  *
  * Proxy: the host always comes from PROXY_KINDS (or, for 'openai-compatible'
- * / 'custom-http', an exact AI_PROXY_EXTRA_BASES entry named by x-ai-base).
+ * / 'custom-http', an exact AI_PROXY_EXTRA_BASES entry named by x-ai-base),
+ * and only the endpoints the client's adapters call are forwarded (the kind's
+ * `allow` list / EXTRA_BASE_ROUTES; anything else is 403 before any budget).
  * Key: the user's own (x-ai-key, relayed unless AI_PROXY_BYOK=0) wins, else
  * the server's, else 401. Only content-type / accept and a few per-kind
  * headers go upstream; only content headers, request ids, rate-limit info
@@ -15,8 +17,12 @@
  * are buffered and scrubbed of keys. Upstream redirects are refused.
  *
  * Both proxy and fetch need CLIENT_HEADER (no cross-site use of the server's
- * keys) and are rate limited per client IP; our own errors are `{ error }`
- * JSON with AI_PROXY_ERROR_HEADER set.
+ * keys; not authentication) and are rate limited per client IP. Server-key
+ * generations also count against the client's IPv6 /48 and a per-kind
+ * budget over all clients (per window and per day), so rotating addresses
+ * cannot spend without bound. Part of the in-progress cap is kept for
+ * server-key requests. Our own errors are `{ error }` JSON with
+ * AI_PROXY_ERROR_HEADER set.
  */
 import type { Context, Env, Hono, MiddlewareHandler } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
@@ -35,7 +41,7 @@ import {
   type ProxiedKind,
 } from '../../src/drivers/cloud/api';
 import type { ProviderKindId } from '../../src/ai/types';
-import { FixedWindowRateLimiter, InFlight } from '../rateLimit';
+import { FixedWindowRateLimiter, InFlight, ipv6PrefixKey } from '../rateLimit';
 import { countingBody, timedRelay, type RelayErrorKind } from '../relay';
 import {
   AI_KEY_PATTERN,
@@ -52,11 +58,13 @@ import {
   validateProxyPath,
 } from './proxy';
 import {
+  EXTRA_BASE_ROUTES,
   EXTRA_KINDS,
   PROXY_KINDS,
   allServerKeys,
   byokEnabled,
   enabledProxyKinds,
+  isAllowedRoute,
   isExtraKind,
   isProxiedKind,
   managedProviders,
@@ -84,6 +92,15 @@ export interface AiRoutesDeps {
 
 /** Proxied requests one client may have in progress (image edits take a minute; views are generated in parallel). */
 export const MAX_PROXY_PER_CLIENT = 8;
+/** …but never more than half the slots other clients leave free (at least 2), so a few clients cannot hold every slot. */
+export const MIN_PROXY_PER_CLIENT = 2;
+/** Share of AI_PROXY_MAX_CONCURRENT only server-key requests may use (users' own keys cost them nothing to hold). */
+export const SERVER_KEY_RESERVED_SHARE = 0.25;
+/** An IPv6 /48 gets this many times the per-client server-key budget. */
+export const IPV6_PREFIX_FACTOR = 4;
+/** Default AI_PROXY_GLOBAL_RATE_LIMIT, as a multiple of AI_PROXY_RATE_LIMIT. */
+export const GLOBAL_LIMIT_FACTOR = 10;
+const DAY_MS = 86_400_000;
 /** Output downloads one client may have in progress. */
 export const MAX_FETCH_PER_CLIENT = 4;
 const BUSY_RETRY_SEC = 5;
@@ -95,8 +112,9 @@ const FETCH_HEADERS_MS = 60_000;
 const FETCH_IDLE_MS = 60_000;
 const MAX_REDIRECTS = 3;
 
-const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
-const PROXY_METHODS = new Set(['GET', 'HEAD', ...WRITE_METHODS]);
+// The adapters only need these (fal cancels with PUT); DELETE / PATCH / HEAD are never forwarded.
+const WRITE_METHODS = new Set(['POST', 'PUT']);
+const PROXY_METHODS = new Set(['GET', ...WRITE_METHODS]);
 
 const intEnv = (v: string | undefined, def: number): number => {
   if (v === undefined || !v.trim()) return def;
@@ -145,9 +163,15 @@ export function registerAiRoutes<E extends Env>(app: Hono<E>, deps: AiRoutesDeps
     user: intEnv(env.AI_PROXY_RATE_LIMIT_BYOK, 600),
   };
   const writeLimiter = new FixedWindowRateLimiter(intEnv(env.AI_PROXY_RATE_WINDOW_SEC, 3600) * 1000, deps.now);
+  /** Server-key generations per kind over all clients: per window, and per day. */
+  const globalLimit = intEnv(env.AI_PROXY_GLOBAL_RATE_LIMIT, writeLimits.server * GLOBAL_LIMIT_FACTOR);
+  const dailyLimit = intEnv(env.AI_PROXY_DAILY_LIMIT, 0);
+  const dailyLimiter = new FixedWindowRateLimiter(DAY_MS, deps.now);
   const readLimit = intEnv(env.AI_PROXY_READ_RATE_LIMIT, 300);
   const readLimiter = new FixedWindowRateLimiter(60_000, deps.now);
   const maxConcurrent = intEnv(env.AI_PROXY_MAX_CONCURRENT, 64);
+  /** In-progress slots requests without a server key may use. */
+  const maxConcurrentNonServer = maxConcurrent - Math.floor(maxConcurrent * SERVER_KEY_RESERVED_SHARE);
   const inFlight = new InFlight();
   const downloads = new InFlight();
   const fetchRules =
@@ -169,8 +193,10 @@ export function registerAiRoutes<E extends Env>(app: Hono<E>, deps: AiRoutesDeps
     } satisfies AiProvidersResponse),
   );
 
-  /** Resolve kind + validated upstream URL, or throw a RouteError. */
-  const resolveTarget = (c: Context, kind: string): Target => {
+  const notAllowed = (name: string) => new RouteError(403, `Endpoint not allowed: this server only forwards the ${name} API calls 3D Marker makes`);
+
+  /** Resolve kind + validated, allow-listed upstream URL, or throw a RouteError. */
+  const resolveTarget = (c: Context, kind: string, method: string): Target => {
     const { path, query } = rawPathAndQuery(c.req.url);
     const prefix = `${AI_PROXY_PATH}/${kind}/`;
     if (!path.startsWith(prefix)) throw new RouteError(400, 'Invalid API path');
@@ -178,6 +204,7 @@ export function registerAiRoutes<E extends Env>(app: Hono<E>, deps: AiRoutesDeps
     if (!rest) throw new RouteError(400, 'Invalid API path');
     if (isProxiedKind(kind) && kinds.has(kind)) {
       const spec = PROXY_KINDS[kind];
+      if (!isAllowedRoute(spec.allow, method, rest.replace(/\/$/, ''))) throw notAllowed(spec.name);
       const url = buildTargetUrl(spec, rest, query);
       if (!url) throw new RouteError(400, 'Invalid API path');
       return { kind, name: spec.name, spec, url };
@@ -187,6 +214,7 @@ export function registerAiRoutes<E extends Env>(app: Hono<E>, deps: AiRoutesDeps
       if (!base || !extraBases.includes(base)) {
         throw new RouteError(403, `This server only proxies ${kind} providers at the base URLs listed in AI_PROXY_EXTRA_BASES`);
       }
+      if (!isAllowedRoute(EXTRA_BASE_ROUTES, method, rest.replace(/\/$/, ''))) throw notAllowed(new URL(base).host);
       const url = joinBase(base, rest, query);
       if (!url) throw new RouteError(400, 'Invalid API path');
       const scheme = c.req.header(AI_AUTH_HEADER)?.trim().toLowerCase();
@@ -226,6 +254,50 @@ export function registerAiRoutes<E extends Env>(app: Hono<E>, deps: AiRoutesDeps
         : // The client went away: @hono/node-server logs this code as "The user aborted a request." instead of an error.
           Object.assign(new RouteError(502, 'Request aborted'), { code: 'ERR_STREAM_PREMATURE_CLOSE' });
 
+  /**
+   * Per-client cap (at most half of the slots other clients leave free, so it
+   * shrinks as they fill up) and global cap, part of which only server-key
+   * requests may use.
+   */
+  const proxyBusy = (ip: string, source: KeySource): boolean => {
+    const mine = inFlight.count(ip);
+    if (maxConcurrent <= 0) return mine >= MAX_PROXY_PER_CLIENT;
+    const freeForMe = maxConcurrent - (inFlight.total - mine);
+    const perClient = Math.min(MAX_PROXY_PER_CLIENT, Math.max(MIN_PROXY_PER_CLIENT, Math.floor(freeForMe / 2)));
+    const cap = source === 'server' ? maxConcurrent : maxConcurrentNonServer;
+    return mine >= perClient || inFlight.total >= cap;
+  };
+
+  /**
+   * Server-key generation budgets: the client (IPv6 /64), its IPv6 /48, and
+   * the kind over all clients per window and per day. All are checked before
+   * any is counted, so a refusal never uses up another budget.
+   */
+  const hitServerBudgets = (ip: string, kind: string): { error: string; retryAfterSec: number } | null => {
+    const prefix = ipv6PrefixKey(ip);
+    const checks = [
+      { limiter: writeLimiter, key: `ai-server:${ip}`, limit: writeLimits.server, global: false },
+      ...(prefix ? [{ limiter: writeLimiter, key: `ai-server:${prefix}`, limit: writeLimits.server * IPV6_PREFIX_FACTOR, global: false }] : []),
+      { limiter: writeLimiter, key: `ai-server-global:${kind}`, limit: globalLimit, global: true },
+      { limiter: dailyLimiter, key: `ai-server-day:${kind}`, limit: dailyLimit, global: true },
+    ];
+    for (const ch of checks) {
+      const rate = ch.limiter.peek(ch.key, ch.limit);
+      if (rate.allowed) continue;
+      const wait = `try again in ${Math.ceil(rate.retryAfterSec / 60)} min`;
+      return ch.global
+        ? { error: `The server's ${kind} budget is used up; ${wait} or use your own API key`, retryAfterSec: rate.retryAfterSec }
+        : { error: `Too many generation requests; ${wait}`, retryAfterSec: rate.retryAfterSec };
+    }
+    for (const ch of checks) {
+      const rate = ch.limiter.hit(ch.key, ch.limit);
+      if (ch.global && rate.remaining === 0) {
+        log.warn(`AI proxy: the ${ch.limiter === dailyLimiter ? 'daily' : 'per-window'} server-key budget for ${kind} is used up (${ch.limiter === dailyLimiter ? 'AI_PROXY_DAILY_LIMIT' : 'AI_PROXY_GLOBAL_RATE_LIMIT'}=${ch.limit})`);
+      }
+    }
+    return null;
+  };
+
   app.all(`${AI_PROXY_PATH}/:kind/*`, sameOriginOnly, async (c) => {
     const method = c.req.method.toUpperCase();
     if (!PROXY_METHODS.has(method)) return fail(c, 405, 'Method not allowed');
@@ -234,7 +306,7 @@ export function registerAiRoutes<E extends Env>(app: Hono<E>, deps: AiRoutesDeps
     let target: Target;
     let auth: { key: string | null; source: KeySource };
     try {
-      target = resolveTarget(c, kind);
+      target = resolveTarget(c, kind, method);
       auth = resolveKey(c, target);
     } catch (e) {
       if (e instanceof RouteError) return fail(c, e.status, e.message);
@@ -247,14 +319,17 @@ export function registerAiRoutes<E extends Env>(app: Hono<E>, deps: AiRoutesDeps
     if (declared !== undefined && Number(declared) > maxBody) return fail(c, 413, tooLargeBody);
 
     // Checked before the budgets, so a "busy" answer does not use one up.
-    if (inFlight.count(ip) >= MAX_PROXY_PER_CLIENT || (maxConcurrent > 0 && inFlight.total >= maxConcurrent)) {
+    if (proxyBusy(ip, auth.source)) {
       return fail(c, 429, 'Too many AI requests in progress; try again in a few seconds', BUSY_RETRY_SEC);
     }
     // Budgets: generations per window (server key / own key), reads per minute.
     if (WRITE_METHODS.has(method)) {
-      const limit = auth.source === 'server' ? writeLimits.server : writeLimits.user;
-      const rate = writeLimiter.hit(`ai-${auth.source}:${ip}`, limit);
-      if (!rate.allowed) return fail(c, 429, `Too many generation requests; try again in ${Math.ceil(rate.retryAfterSec / 60)} min`, rate.retryAfterSec);
+      const refused = auth.source === 'server' ? hitServerBudgets(ip, kind) : null;
+      if (refused) return fail(c, 429, refused.error, refused.retryAfterSec);
+      if (auth.source !== 'server') {
+        const rate = writeLimiter.hit(`ai-${auth.source}:${ip}`, writeLimits.user);
+        if (!rate.allowed) return fail(c, 429, `Too many generation requests; try again in ${Math.ceil(rate.retryAfterSec / 60)} min`, rate.retryAfterSec);
+      }
     } else {
       const rate = readLimiter.hit(`ai-read:${ip}`, readLimit);
       if (!rate.allowed) return fail(c, 429, 'Too many requests; try again shortly', rate.retryAfterSec);

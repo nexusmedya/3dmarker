@@ -67,11 +67,21 @@ describe('AiPrepPanel', () => {
     const m = mount(createElement(AiPrepPanel, props({ hasSource: false })));
     expect(run().disabled).toBe(true);
     expect(byTestId('ai-prep-blocked').textContent).toBe('Upload an image first.');
-    m.render(createElement(AiPrepPanel, props({}, { styleId: null })));
+    m.render(createElement(AiPrepPanel, props({}, { styleId: null, removeBackground: false })));
     expect(run().disabled).toBe(true);
     expect(byTestId('ai-prep-blocked').textContent).toContain('Pick a style');
-    m.render(createElement(AiPrepPanel, props({}, { styleId: null, extraPrompt: 'smiling' })));
+    m.render(createElement(AiPrepPanel, props({}, { styleId: null, removeBackground: false, extraPrompt: 'smiling' })));
     expect(run().disabled).toBe(false);
+  });
+
+  it('removes the background alone without an image-edit provider', () => {
+    const m = mount(createElement(AiPrepPanel, props({ providers: [] }, { styleId: null, removeBackground: true })));
+    expect(run().disabled).toBe(false);
+    expect(queryTestId('ai-prep-blocked')).toBeNull();
+    // Anything beyond background removal still needs a provider.
+    m.render(createElement(AiPrepPanel, props({ providers: [] }, { styleId: 'marble', removeBackground: true })));
+    expect(run().disabled).toBe(true);
+    expect(byTestId('ai-prep-blocked').textContent).toBe('Add an AI provider first.');
   });
 
   it('runs, selects the provider and opens the settings', () => {
@@ -167,5 +177,13 @@ describe('AiPrepPanel', () => {
     click(Array.from(document.querySelectorAll('.seg-btn')).find((b) => b.textContent?.includes('Side by side'))!);
     expect(queryTestId('ai-prep-compare-range')).toBeNull();
     expect(document.querySelectorAll('.ai-compare-fig')).toHaveLength(2);
+    expect(queryTestId('ai-prep-views-dropped')).toBeNull(); // no AI views to lose
+  });
+
+  it('says that accepting removes the AI views made from the current image', () => {
+    const prepared = { image: image(8, 8), name: 'cat-ai.png' };
+    mount(createElement(AiPrepPanel, props({ prepared, original: image(4, 6), aiViewCount: 3 })));
+    expect(byTestId('ai-prep-views-dropped').textContent).toContain('previous image (3) are removed');
+    expect(byTestId('ai-prep-result').textContent).not.toContain('the other views are made from this image');
   });
 });

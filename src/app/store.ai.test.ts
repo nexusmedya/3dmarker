@@ -17,6 +17,7 @@ import {
   createInitialState,
   extraViewSet,
   generateBlock,
+  hasUnsavedModelEdits,
   presentViews,
   reducer,
   remeshPaused,
@@ -174,14 +175,14 @@ describe('prep options', () => {
 });
 
 describe('steps', () => {
-  it('the active step is persisted; an unknown one falls back to the first', () => {
+  it('a reload starts at the image step (no image survives it, later steps would open empty)', () => {
     const store = new MemoryStore();
-    let s = reducer(init(store), { type: 'setStep', step: 'views' });
-    expect(s.step).toBe('views');
-    expect(reducer(s, { type: 'setStep', step: 'views' })).toBe(s);
+    let s = reducer(init(store), { type: 'setStep', step: 'rig' });
+    expect(s.step).toBe('rig');
+    expect(reducer(s, { type: 'setStep', step: 'rig' })).toBe(s);
     saveState(store, s, drivers);
-    expect(init(store).step).toBe('views');
-    store.setItem('3dmarker:settings', JSON.stringify({ step: 'nope' }));
+    expect(init(store).step).toBe('image');
+    store.setItem('3dmarker:settings', JSON.stringify({ step: 'views' })); // stored by an older version
     expect(init(store).step).toBe('image');
   });
 });
@@ -214,10 +215,12 @@ describe('AI job, prepared image and views', () => {
     expect(reducer(s, { type: 'aiJobProgress', progress: { label: { tr: 'y', en: 'y' } } })).toBe(s);
   });
 
-  it('accept makes the prepared image the source (views kept, original remembered); revert restores it', () => {
+  it('accept makes the prepared image the source (uploaded views kept, original remembered); revert restores it', () => {
     const original = src('cat.png');
     let s = loaded(init(), original);
     s = reducer(s, { type: 'viewSet', view: 'back', entry: view('back.png') });
+    // Made by AI from the old front: it no longer matches the prepared one.
+    s = reducer(s, { type: 'viewSet', view: 'left', entry: view('cat-left.png', 'ai') });
     s = reducer(s, { type: 'aiJobStart', kind: 'prep' });
     const prepared = src('cat-ai.png');
     s = reducer(s, { type: 'prepReady', prepared });
@@ -232,6 +235,13 @@ describe('AI job, prepared image and views', () => {
     expect(s.prepared).toBeNull();
     expect(s.mask).toBe(m);
     expect(presentViews(s.views)).toEqual(['back']);
+
+    // AI views made for the prepared front are dropped again when reverting to the original.
+    s = reducer(s, { type: 'viewSet', view: 'right', entry: view('cat-ai-right.png', 'ai') });
+    const reverted = reducer(s, { type: 'revertOriginal', mask: null, maskNote: null });
+    expect(reverted.source).toBe(original);
+    expect(presentViews(reverted.views)).toEqual(['back']);
+    s = reducer(s, { type: 'viewClear', view: 'right' });
 
     // A second preparation keeps the first original.
     const second = src('cat-ai-2.png');
@@ -333,7 +343,48 @@ describe('model edit flags', () => {
     const next = { vertices: 10, triangles: 12, watertight: true };
     s = reducer(s, { type: 'depthEdited', stats: next, depthPreview: preview });
     expect(s.result).toMatchObject({ stats: next, depthPreview: preview, driverId: 'plain' });
-    expect(s).toMatchObject({ sculpted: false, depthEditorOpen: false });
+    expect(s).toMatchObject({ sculpted: false, depthEditorOpen: false, depthEdited: true });
+    expect(hasUnsavedModelEdits(s)).toBe(true);
+    s = reducer(reducer(s, { type: 'jobStart' }), { type: 'jobDone', result, source: s.source!, bgMode: 'auto', inputMask: null });
+    expect(s.depthEdited).toBe(false);
+    expect(hasUnsavedModelEdits(s)).toBe(false);
+  });
+
+  it('undoing / resetting a session back to 0 strokes leaves the model unsculpted, unless it started sculpted', () => {
+    let s: AppState = { ...loaded(), result };
+    s = reducer(reducer(s, { type: 'sculptSessionStart' }), { type: 'setSculptActive', active: true });
+    s = reducer(s, { type: 'sculptEdited', stats, strokes: 1 });
+    expect(s.sculpted).toBe(true);
+    s = reducer(s, { type: 'sculptEdited', stats, strokes: 0 }); // Reset
+    expect(s.sculpted).toBe(false);
+    expect(remeshPaused(reducer(s, { type: 'setSculptActive', active: false }))).toBe(false);
+    s = reducer(s, { type: 'sculptEdited', stats, strokes: 2 }); // redo
+    expect(s.sculpted).toBe(true);
+
+    // A new session on the sculpted geometry: its 0 strokes still carry the earlier edits.
+    s = reducer(s, { type: 'sculptSessionStart' });
+    s = reducer(s, { type: 'sculptEdited', stats, strokes: 1 });
+    s = reducer(s, { type: 'sculptEdited', stats, strokes: 0 });
+    expect(s.sculpted).toBe(true);
+    // Discarding (fresh geometry) starts over.
+    s = reducer(s, { type: 'sculptDiscarded', stats });
+    s = reducer(reducer(s, { type: 'sculptSessionStart' }), { type: 'sculptEdited', stats, strokes: 0 });
+    expect(s.sculpted).toBe(false);
+    // Without a stroke count an edit always counts.
+    expect(reducer(s, { type: 'sculptEdited', stats }).sculpted).toBe(true);
+  });
+
+  it('the regenerate confirmation is asked for edited models and closed by a new job', () => {
+    let s: AppState = { ...loaded(), result };
+    expect(hasUnsavedModelEdits(s)).toBe(false);
+    expect(hasUnsavedModelEdits(reducer(s, { type: 'setRigged', rigged: true }))).toBe(true);
+    s = reducer(s, { type: 'sculptEdited', stats });
+    expect(hasUnsavedModelEdits(s)).toBe(true);
+    s = reducer(s, { type: 'setRegenConfirm', open: true });
+    expect(s.regenConfirm).toBe(true);
+    expect(reducer(s, { type: 'setRegenConfirm', open: true })).toBe(s);
+    expect(reducer(s, { type: 'setRegenConfirm', open: false }).regenConfirm).toBe(false);
+    expect(reducer(s, { type: 'jobStart' }).regenConfirm).toBe(false);
   });
 });
 

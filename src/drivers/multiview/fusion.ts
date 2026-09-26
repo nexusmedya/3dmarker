@@ -103,8 +103,8 @@ export const FUSION_PARAMS: ParamSpec[] = [
     key: 'depthFit',
     label: { tr: 'Derinlik ölçeği', en: 'Depth scale' },
     hint: {
-      tr: 'Nesne: derinlik tüm nesne kutusuna göre ölçeklenir (tutarlı). Işın: her ışın kendi kabuk aralığına göre ölçeklenir (daha agresif)',
-      en: 'Object: depth is scaled to the whole object box (consistent). Ray: each ray is scaled to its own hull interval (more aggressive)',
+      tr: 'Nesne: her görünümün derinlik ölçeği görsel kabuktan ölçülür, tüm nesne için tek ölçek (tutarlı). Işın: her ışın kendi kabuk aralığına göre ölçeklenir (daha agresif)',
+      en: 'Object: each view\'s depth scale is measured against the visual hull, one scale for the whole object (consistent). Ray: each ray is scaled to its own hull interval (more aggressive)',
     },
     default: DEFAULT_FUSION_OPTIONS.depthFit,
     options: [

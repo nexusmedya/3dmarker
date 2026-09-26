@@ -39,6 +39,12 @@ export interface ClipDef {
   /** Seconds. */
   duration: number;
   keys: KeyDef[];
+  /**
+   * Feet stay on the floor (default true): the clip builder raises the Hips
+   * wherever a foot would sink below its rest height (airborne keys keep
+   * their authored height). False for clips off the ground (fly, swim).
+   */
+  grounded?: boolean;
 }
 
 export function eulerOrder(bone: HumanoidBone): 'YZX' | 'YXZ' {

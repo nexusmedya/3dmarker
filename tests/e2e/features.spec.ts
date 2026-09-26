@@ -291,7 +291,12 @@ test.describe('AI preparation and views (mocked OpenAI)', () => {
     await page.getByTestId('views-generate-missing').click();
     await expect(page.getByTestId('views-count')).toContainText('6/6', { timeout: 60_000 });
     expect(api.edits.slice(1).map((c) => c.view)).toEqual(['back', 'left', 'right', 'top', 'bottom']);
-    for (const c of api.edits.slice(1)) expect(c.prompt, c.view).toMatch(/same symmetric T-pose/);
+    // The accepted front already is in T-pose: views keep the reference's pose instead of re-posing it.
+    for (const c of api.edits.slice(1)) {
+      expect(c.prompt, c.view).toMatch(/Keep exactly the same pose as the reference/);
+      expect(c.prompt, c.view).not.toMatch(/Re-pose the subject/);
+      expect(c.prompt, c.view).toMatch(/Output exactly one image of this single view/);
+    }
     // Later views are generated with the earlier ones as references.
     expect(api.edits[api.edits.length - 1].images).toBeGreaterThan(api.edits[1].images);
     for (const v of ['back', 'left', 'right', 'top', 'bottom']) await expect(page.getByTestId(`view-${v}`)).toHaveAttribute('data-filled', 'true');
@@ -444,7 +449,7 @@ test.describe('rig and animation', () => {
     await expect(page.getByTestId('rig-status')).toBeVisible({ timeout: 90_000 });
     expect(Number(await page.getByTestId('rig-status').getAttribute('data-bones'))).toBeGreaterThanOrEqual(15);
     // MediaPipe is unreachable: the joints come from the T-pose silhouette.
-    await expect(page.getByTestId('rig-status')).toHaveAttribute('data-method', /silhouette|proportional/);
+    await expect(page.getByTestId('rig-status')).toHaveAttribute('data-method', /silhouette|arms-down|proportional/);
     await page.getByTestId('rig-skeleton').check({ force: true });
     await page.getByTestId('viewer').screenshot({ path: `${SHOTS}/tpose-skeleton.png` });
     const rest = await posedState(page);
@@ -485,9 +490,11 @@ test.describe('rig and animation', () => {
     await page.getByTestId('anim-import').setInputFiles({ name: 'flap.bvh', mimeType: 'text/plain', buffer: Buffer.from(flapBvh()) });
     await expect(page.getByTestId('anim-import-flap')).toBeVisible({ timeout: 15_000 });
     await expect(page.getByTestId('anim-now')).toContainText('flap');
-    await page.waitForTimeout(300);
-    const flapping = await posedState(page);
-    expect(maxDiff(flapping.bones, rest.bones)).toBeGreaterThan(0.02);
+    // The flap passes through the rest pose (0° at 0 s and 0.8 s of its 1.2 s loop): on a slow runner a single
+    // sample can land there, so sample until a flapping pose shows up.
+    await expect
+      .poll(async () => maxDiff((await posedState(page)).bones, rest.bones), { timeout: 10_000, intervals: [150] })
+      .toBeGreaterThan(0.02);
 
     const [dl] = await Promise.all([page.waitForEvent('download'), page.getByTestId('export-glb').click()]);
     expect(dl.suggestedFilename()).toBe('sample-tpose-multiview-fusion-rigged.glb');

@@ -3,11 +3,11 @@ import { createProviderConfig } from '../settings';
 import { aiTiming } from '../transport';
 import { binary, fakeNet, glbBytes, json, pngBlob } from '../testing';
 import { falAdapter, falAppPath } from './fal';
-import { buildGenericInput } from './generic';
+import { buildGenericInput, genericEditImageLimit, outputUrl } from './generic';
 
 const signal = () => new AbortController().signal;
 const saved = { ...aiTiming };
-beforeEach(() => Object.assign(aiTiming, saved, { pollMs: 1 }));
+beforeEach(() => Object.assign(aiTiming, saved, { pollMs: 1, retryBaseMs: 1, retryMaxMs: 2 }));
 afterEach(() => vi.unstubAllGlobals());
 
 describe('falAppPath', () => {
@@ -80,5 +80,58 @@ describe('falAdapter', () => {
     );
     const cfg = createProviderConfig('fal', { apiKey: 'k:s' });
     await expect(falAdapter.removeBackground!(cfg, pngBlob(), signal())).rejects.toMatchObject({ code: 'bad-request', detail: 'body.image_url: Could not download the image' });
+  });
+});
+
+describe('fal aspect, output paths and reference counts', () => {
+  it('passes the wanted aspect to the models that take one, and drops it otherwise', async () => {
+    const cfg = createProviderConfig('fal', { apiKey: 'k' });
+    const nano = (await buildGenericInput(cfg, 'image-edit', 'fal-ai/nano-banana/edit', { prompt: 'p', images: [pngBlob()], aspect: 'square' })) as Record<string, unknown>;
+    expect(nano.aspect_ratio).toBe('1:1');
+    const qwen = (await buildGenericInput(cfg, 'image-edit', 'fal-ai/qwen-image-edit', { prompt: 'p', images: [pngBlob()], aspect: 'portrait' })) as Record<string, unknown>;
+    expect(qwen.image_size).toBe('portrait_4_3');
+    const none = (await buildGenericInput(cfg, 'image-edit', 'fal-ai/nano-banana/edit', { prompt: 'p', images: [pngBlob()] })) as Record<string, unknown>;
+    expect('aspect_ratio' in none).toBe(false);
+  });
+
+  it('keeps one output path per capability', () => {
+    const cfg = createProviderConfig('fal', { apiKey: 'k', values: { modelOutputPath: 'model_glb.url' } });
+    // The 3D path must not break image edits of the same entry.
+    expect(outputUrl(cfg, 'image-edit', { images: [{ url: 'https://x/a.png' }] }, 'image')).toBe('https://x/a.png');
+    expect(outputUrl(cfg, 'image-to-3d', { model_glb: { url: 'https://x/m.glb' }, model_mesh: { url: 'https://x/other.glb' } }, 'model')).toBe('https://x/m.glb');
+  });
+
+  it('knows which edit templates carry more than one image', () => {
+    expect(genericEditImageLimit(createProviderConfig('fal', { apiKey: 'k', models: { 'image-edit': 'fal-ai/nano-banana/edit' } }))).toBe(Infinity);
+    expect(genericEditImageLimit(createProviderConfig('fal', { apiKey: 'k', models: { 'image-edit': 'fal-ai/flux-pro/kontext' } }))).toBe(1);
+    expect(genericEditImageLimit(createProviderConfig('fal', { apiKey: 'k', values: { editTemplate: '{"a":"{{image}}","b":"{{image2}}"}' } }))).toBe(Infinity);
+  });
+});
+
+describe('fal polling resilience', () => {
+  const cfg = () => createProviderConfig('fal', { apiKey: 'k:s', models: { 'image-to-3d': 'fal-ai/trellis' } });
+
+  it('retries transient status / result failures instead of losing the paid job', async () => {
+    const net = fakeNet()
+      .on('POST', 'https://queue.fal.run/fal-ai/trellis', json({ request_id: 'r7' }))
+      .on('GET', /requests\/r7\/status$/, json({}, 502), json({ error: 'busy' }, 429, { 'retry-after': '0' }), new TypeError('Failed to fetch'), json({ status: 'COMPLETED' }))
+      .on('GET', /requests\/r7$/, json({}, 503), json({ model_mesh: { url: 'https://v3.fal.media/m.glb' } }))
+      .on('GET', 'https://v3.fal.media/m.glb', binary(glbBytes(), 'model/gltf-binary'));
+    vi.stubGlobal('fetch', net.fetch);
+    const glb = await falAdapter.toModel!(cfg(), { views: { front: pngBlob() }, signal: signal() });
+    expect(glb.byteLength).toBe(64);
+    expect(net.calls.some((c) => c.method === 'PUT')).toBe(false);
+  });
+
+  it('cancels the job when polling keeps failing', async () => {
+    const net = fakeNet()
+      .on('PUT', /requests\/r8\/cancel$/, json({}))
+      .on('POST', 'https://queue.fal.run/fal-ai/trellis', json({ request_id: 'r8' }))
+      .on('GET', /requests\/r8\/status$/, json({}, 500));
+    vi.stubGlobal('fetch', net.fetch);
+    await expect(falAdapter.toModel!(cfg(), { views: { front: pngBlob() }, signal: signal() })).rejects.toMatchObject({ code: 'server' });
+    expect(net.calls.filter((c) => c.url.endsWith('/status'))).toHaveLength(aiTiming.retryAttempts);
+    await new Promise((r) => setTimeout(r, 5));
+    expect(net.calls.filter((c) => c.method === 'PUT')).toHaveLength(1);
   });
 });

@@ -12,7 +12,7 @@ describe('openAiSize', () => {
     expect(openAiSize('match', 'portrait')).toBe('1024x1536');
     expect(openAiSize('match', 'landscape')).toBe('1536x1024');
     expect(openAiSize('match', 'square')).toBe('1024x1024');
-    expect(openAiSize('match', undefined)).toBe('auto');
+    expect(openAiSize('match', undefined)).toBeUndefined();
     expect(openAiSize('auto', 'portrait')).toBe('auto');
     expect(openAiSize('1536x1024', 'portrait')).toBe('1536x1024');
   });
@@ -38,10 +38,10 @@ describe('buildEditForm', () => {
     const form = buildEditForm(cfg, 'gpt-image-1-mini', { prompt: 'p', transparentBackground: false }, [pngBlob(), pngBlob(), pngBlob()]);
     expect(form.getAll('image[]')).toHaveLength(3);
     expect(form.get('image')).toBeNull();
-    expect(form.get('background')).toBe('auto');
+    expect(form.get('background')).toBeNull(); // only 'transparent' is ever sent (2.5 models document no 'auto')
     expect(form.get('quality')).toBeNull();
     expect(form.get('input_fidelity')).toBeNull(); // not for the mini
-    expect(form.get('size')).toBe('auto');
+    expect(form.get('size')).toBeNull(); // no aspect wanted: the server default
   });
 
   it('keeps unknown (compatible) models to the common fields', () => {

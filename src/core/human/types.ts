@@ -88,6 +88,12 @@ export interface HumanDetailOptions {
   bodyStrength?: number;
   /** Upper bound on `refineCrop` calls, largest regions first (default 6). */
   maxCrops?: number;
+  /**
+   * `refineCrop`'s model input side over the global pass's (default 1). A crop
+   * is only refined when it raises the resolution over the global pass, so a
+   * global pass at a larger side than the crops needs fewer, tighter crops.
+   */
+  cropSideRatio?: number;
   signal: AbortSignal;
   onProgress?: (p: Progress) => void;
 }

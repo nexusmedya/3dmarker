@@ -7,13 +7,14 @@
  *
  * Providers the browser may call directly work on the static build too; the
  * rest go through our server's proxy (the adapters handle routing and turn
- * failures into bilingual errors). The AI modules are loaded on first use.
+ * failures into bilingual errors). The adapters are loaded on first use.
  */
 import type { AiCapability, AiSettings, ProviderAdapter, ProviderConfig, ProviderKindId } from '../../ai/types';
 import type { Availability, Driver, DriverInput, DriverResult, I18nText, ParamSpec, ViewId } from '../../core/types';
 import { AbortError, VIEW_IDS, throwIfAborted } from '../../core/types';
 import { LocalizedError } from '../../core/errors';
 import { isGlb } from './tripo';
+import { currentAiSettings, resolveProvider } from '../../ai/settings';
 
 /** What the driver needs from src/ai (injectable for tests). */
 export interface AiModelDeps {
@@ -23,8 +24,9 @@ export interface AiModelDeps {
 }
 
 async function loadDeps(): Promise<AiModelDeps> {
-  const [settings, adapters] = await Promise.all([import('../../ai/settings'), import('../../ai/adapters')]);
-  return { currentAiSettings: settings.currentAiSettings, resolveProvider: settings.resolveProvider, getAdapter: adapters.getAdapter };
+  // The settings are in the main bundle already (the studio owns them); the adapters load on demand.
+  const adapters = await import('../../ai/adapters');
+  return { currentAiSettings, resolveProvider, getAdapter: adapters.getAdapter };
 }
 
 export interface AiModelDriverOptions {

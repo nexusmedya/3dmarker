@@ -11,7 +11,7 @@
  */
 import type { ViewId } from '../core/types';
 import type { PrepOptions, SubjectKind } from './types';
-import { getStyle } from './styles';
+import { getStyle, STYLE_KEEP_POSE } from './styles';
 
 export const T_POSE_PROMPT =
   'Re-pose the subject into a symmetric T-pose, arms straight out horizontally at shoulder height, palms down, legs straight and slightly apart, facing the camera, full body head to toe visible, orthographic-like neutral camera.';
@@ -22,8 +22,24 @@ export const COMPLETE_BODY_PROMPT =
 export const COMPLETE_OBJECT_PROMPT =
   'If the subject is cropped or partly hidden, complete the missing parts plausibly so the whole subject is visible.';
 
-export const REMOVE_BACKGROUND_PROMPT =
-  'Isolate the subject on a plain transparent background (pure white if transparency is not possible), with no shadows, no floor, no scenery and no props.';
+/** Background instruction for models that really output alpha (OpenAI GPT image with background=transparent). */
+export const ALPHA_BACKGROUND_PROMPT =
+  'Isolate the subject on a transparent background, with no shadows, no floor, no scenery and no props.';
+
+/**
+ * Background instruction for every other model: asked for "transparent",
+ * they tend to paint a fake checkerboard; a flat white background is keyed
+ * out reliably afterwards.
+ */
+export const WHITE_BACKGROUND_PROMPT =
+  'Isolate the subject on a plain, uniform, solid pure white (#FFFFFF) background with no checkerboard or transparency pattern, no gradient, no shadows, no floor, no scenery and no props.';
+
+/** Put first when the pose or framing changes, so a style's "keep the pose" never wins. */
+export const POSE_PRIORITY_PROMPT = 'The new pose and full-body framing take priority over the original pose and crop.';
+
+/** Multi-image requests otherwise often come back as turnaround sheets or collages. */
+export const SINGLE_VIEW_PROMPT =
+  'Output exactly one image of this single view with one figure only: not a turnaround, character sheet, collage or multiple poses.';
 
 export const PLAIN_BACKGROUND_PROMPT = 'Keep the background simple and uncluttered.';
 
@@ -36,6 +52,9 @@ export const HUMAN_DETAIL_PROMPT =
 export const KEEP_LOOK_PROMPT = 'Keep the original look: the same art style, colours, materials and details.';
 
 export const COMPLETE_VIEW_PROMPT = 'Complete unseen areas plausibly and consistently with the visible ones';
+
+/** Pose instruction of every view: the reference carries the pose (whatever the prep options say now). */
+export const SAME_POSE_PROMPT = 'Keep exactly the same pose as the reference; do not re-pose the subject.';
 
 const SUBJECT: Record<SubjectKind, string> = {
   auto: '',
@@ -56,6 +75,15 @@ export const VIEW_DESCRIPTIONS: Record<OtherView, string> = {
 };
 
 const VIEW_NAMES: Record<ViewId, string> = { front: 'front', back: 'back', left: 'left side', right: 'right side', top: 'top', bottom: 'bottom' };
+
+/** Face / hand detail per view: only what that view can actually show. */
+export const HUMAN_VIEW_DETAIL: Record<OtherView, string> = {
+  back: 'The face is NOT visible from behind: show the back of the head, the hair, the nape of the neck, the backs of the ears and the backs of the hands, with clearly defined fingers.',
+  left: 'Show the face in exact profile, with a clearly defined nose, lips, eye and one ear, and anatomically correct hands and fingers.',
+  right: 'Show the face in exact profile, with a clearly defined nose, lips, eye and one ear, and anatomically correct hands and fingers.',
+  top: 'Show the top of the head, the hair, the shoulders and the tops of the hands; the face is mostly hidden.',
+  bottom: 'Show the soles of the feet, the underside of the chin and the palms where visible.',
+};
 
 const UNSEEN_EXAMPLES: Record<OtherView, string> = {
   back: 'the back of the head and hair, the back of the clothing and any straps or seams',
@@ -79,6 +107,16 @@ function extra(text: string): string {
 
 const join = (parts: string[]) => parts.filter(Boolean).join(' ');
 
+/** Prompt context: whether the model returns real alpha (see ALPHA_BACKGROUND_PROMPT). */
+export interface PromptOutput {
+  alphaOutput?: boolean;
+}
+
+function background(o: PrepOptions, out: PromptOutput): string {
+  if (!o.removeBackground) return PLAIN_BACKGROUND_PROMPT;
+  return out.alphaOutput ? ALPHA_BACKGROUND_PROMPT : WHITE_BACKGROUND_PROMPT;
+}
+
 /** Whether the options ask for an AI edit of the front image at all (background removal alone runs locally). */
 export function prepNeeded(o: PrepOptions): boolean {
   return (
@@ -89,18 +127,26 @@ export function prepNeeded(o: PrepOptions): boolean {
   );
 }
 
-/** Instruction for editing the front image. */
-export function buildPrepPrompt(o: PrepOptions, ctx: { isHuman: boolean }): string {
+/**
+ * Instruction for editing the front image. A re-pose (T-pose) or body
+ * completion comes first with explicit priority; the style's "keep the pose
+ * and composition" is only added when neither is asked for.
+ */
+export function buildPrepPrompt(o: PrepOptions, ctx: { isHuman: boolean } & PromptOutput): string {
   const humanoid = isHumanoid(o, ctx);
   const style = getStyle(o.styleId);
+  const repose = o.tPose && humanoid;
+  const reframe = o.completeBody;
   return join([
     'Edit the reference image to prepare the subject for 3D reconstruction.',
     SUBJECT[o.subject],
+    reframe ? (humanoid ? COMPLETE_BODY_PROMPT : COMPLETE_OBJECT_PROMPT) : '',
+    repose ? T_POSE_PROMPT : '',
+    repose || reframe ? POSE_PRIORITY_PROMPT : '',
     style ? style.prompt : KEEP_LOOK_PROMPT,
-    o.completeBody ? (humanoid ? COMPLETE_BODY_PROMPT : COMPLETE_OBJECT_PROMPT) : '',
-    o.tPose && humanoid ? T_POSE_PROMPT : '',
+    style && !repose && !reframe ? STYLE_KEEP_POSE : '',
     humanoid ? HUMAN_DETAIL_PROMPT : '',
-    o.removeBackground ? REMOVE_BACKGROUND_PROMPT : PLAIN_BACKGROUND_PROMPT,
+    background(o, ctx),
     READINESS_PROMPT,
     extra(o.extraPrompt),
   ]);
@@ -109,9 +155,16 @@ export function buildPrepPrompt(o: PrepOptions, ctx: { isHuman: boolean }): stri
 /**
  * Instruction for rendering one of the other views. `refViews` lists the
  * reference images in the order they are attached (the first one is the
- * front view).
+ * front view). The pose always comes from the reference; the extra
+ * instructions only when `frontPrep` (the options that produced the current
+ * front image) carried them — the live prep toggles may never have been
+ * applied to it.
  */
-export function buildViewPrompt(view: OtherView, o: PrepOptions, ctx: { isHuman: boolean; refViews: ViewId[] }): string {
+export function buildViewPrompt(
+  view: OtherView,
+  o: PrepOptions,
+  ctx: { isHuman: boolean; refViews: ViewId[]; frontPrep?: Pick<PrepOptions, 'extraPrompt'> | null } & PromptOutput,
+): string {
   const humanoid = isHumanoid(o, ctx);
   const refs = ctx.refViews.length ? ctx.refViews : (['front'] as ViewId[]);
   const refText =
@@ -126,11 +179,13 @@ export function buildViewPrompt(view: OtherView, o: PrepOptions, ctx: { isHuman:
     sideOrBack
       ? 'Use an orthographic-like, neutral camera without perspective distortion and with the SAME scale, framing and height as the front view: the subject has the same size in the frame, with its top and bottom at the same image heights.'
       : 'Use an orthographic-like, neutral camera without perspective distortion and with the SAME scale as the front view.',
-    `Keep exactly the same subject, identity, art style, colours, materials, pose and lighting as the reference${o.tPose && humanoid ? ', in the same symmetric T-pose' : ''}.`,
+    'Keep exactly the same subject, identity, art style, colours, materials and lighting as the reference.',
+    SAME_POSE_PROMPT,
     `${COMPLETE_VIEW_PROMPT}, such as ${UNSEEN_EXAMPLES[view]}.`,
-    humanoid ? HUMAN_DETAIL_PROMPT : '',
-    o.removeBackground ? REMOVE_BACKGROUND_PROMPT : PLAIN_BACKGROUND_PROMPT,
+    humanoid ? HUMAN_VIEW_DETAIL[view] : '',
+    SINGLE_VIEW_PROMPT,
+    background(o, ctx),
     READINESS_PROMPT,
-    extra(o.extraPrompt),
+    extra(ctx.frontPrep?.extraPrompt ?? ''),
   ]);
 }

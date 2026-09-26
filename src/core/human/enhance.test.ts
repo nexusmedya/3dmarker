@@ -191,6 +191,19 @@ describe('enhanceHumanDepth', () => {
     expect(planCrops(many, { maxCrops: 6, faces: false, hands: true }).every((j) => j.kind === 'hand')).toBe(true);
   });
 
+  it('only plans crops that beat the global pass at its inference side', () => {
+    const S = 1024;
+    // A 400 px face box → a 680 px crop: gain sqrt(1024² / 680²) ≈ 1.506 at equal sides.
+    const a = fakeAnalysis(S, S, { faces: [syntheticFace(512, 512, 200, 200)] });
+    const [job] = planCrops(a, { maxCrops: 6, faces: true, hands: true });
+    expect(job.box.width).toBeGreaterThan(600);
+    expect(planCrops(a, { maxCrops: 6, faces: true, hands: true, sideRatio: 518 / 518 })).toHaveLength(1);
+    // Global pass at 840, crops at 518: the crop would be coarser than the global depth.
+    expect(planCrops(a, { maxCrops: 6, faces: true, hands: true, sideRatio: 518 / 840 })).toHaveLength(0);
+    const small = fakeAnalysis(S, S, { faces: [syntheticFace(512, 512, 60, 75)] });
+    expect(planCrops(small, { maxCrops: 6, faces: true, hands: true, sideRatio: 518 / 840 })).toHaveLength(1);
+  });
+
   it('aborts', async () => {
     const ac = new AbortController();
     ac.abort();

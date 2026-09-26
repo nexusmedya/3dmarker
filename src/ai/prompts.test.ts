@@ -1,19 +1,24 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_PREP_OPTIONS, type PrepOptions } from './types';
-import { STYLES } from './styles';
+import { getStyle, STYLE_KEEP_POSE, STYLES } from './styles';
 import {
+  ALPHA_BACKGROUND_PROMPT,
   buildPrepPrompt,
   buildViewPrompt,
   COMPLETE_BODY_PROMPT,
   COMPLETE_OBJECT_PROMPT,
   HUMAN_DETAIL_PROMPT,
+  HUMAN_VIEW_DETAIL,
   isHumanoid,
   KEEP_LOOK_PROMPT,
   PLAIN_BACKGROUND_PROMPT,
+  POSE_PRIORITY_PROMPT,
   prepNeeded,
   READINESS_PROMPT,
-  REMOVE_BACKGROUND_PROMPT,
+  SAME_POSE_PROMPT,
+  SINGLE_VIEW_PROMPT,
   T_POSE_PROMPT,
+  WHITE_BACKGROUND_PROMPT,
 } from './prompts';
 
 /** Brand / trademark words that must never reach a prompt or a style name. */
@@ -70,11 +75,28 @@ describe('buildPrepPrompt', () => {
     const p = buildPrepPrompt(opts({ styleId: 'vinyl-figure', removeBackground: true, extraPrompt: '  red   cap ' }), { isHuman: false });
     expect(p).toContain(style.prompt);
     expect(p).not.toContain(KEEP_LOOK_PROMPT);
-    expect(p).toContain(REMOVE_BACKGROUND_PROMPT);
-    expect(p).toContain('transparent background');
+    // Without real alpha output the model is asked for flat white, never "transparent" (fake checkerboards).
+    expect(p).toContain(WHITE_BACKGROUND_PROMPT);
+    expect(p).not.toContain('transparent background');
+    expect(buildPrepPrompt(opts({ removeBackground: true }), { isHuman: false, alphaOutput: true })).toContain(ALPHA_BACKGROUND_PROMPT);
     expect(p).toContain(READINESS_PROMPT);
     expect(p.endsWith('Additional instructions: red cap')).toBe(true);
     expect(buildPrepPrompt(opts({ removeBackground: false }), { isHuman: false })).toContain(PLAIN_BACKGROUND_PROMPT);
+  });
+
+  it('lets a T-pose / body completion override the style’s pose and framing', () => {
+    const style = getStyle('vinyl-figure')!;
+    const reposed = buildPrepPrompt(opts({ styleId: 'vinyl-figure', tPose: true, subject: 'human' }), { isHuman: true });
+    expect(reposed).not.toContain('pose and composition');
+    expect(reposed).toContain(POSE_PRIORITY_PROMPT);
+    expect(reposed.indexOf(T_POSE_PROMPT)).toBeLessThan(reposed.indexOf(style.prompt));
+    const completed = buildPrepPrompt(opts({ styleId: 'vinyl-figure', completeBody: true }), { isHuman: true });
+    expect(completed).not.toContain('pose and composition');
+    expect(completed.indexOf(COMPLETE_BODY_PROMPT)).toBeLessThan(completed.indexOf(style.prompt));
+    const restyled = buildPrepPrompt(opts({ styleId: 'vinyl-figure' }), { isHuman: true });
+    expect(restyled).toContain(STYLE_KEEP_POSE);
+    expect(restyled).toContain('pose and composition');
+    expect(restyled).not.toContain(POSE_PRIORITY_PROMPT);
   });
 
   it('is deterministic', () => {
@@ -99,10 +121,36 @@ describe('buildViewPrompt', () => {
     const p = buildViewPrompt('back', opts({ tPose: true }), ctx);
     expect(p).toContain('SAME scale, framing and height as the front view');
     expect(p).toContain('same subject, identity, art style');
-    expect(p).toContain('in the same symmetric T-pose');
     expect(p).toContain('Complete unseen areas plausibly');
     expect(p).toContain('back of the head');
     expect(buildViewPrompt('top', opts(), ctx)).toContain('SAME scale as the front view');
+  });
+
+  it('takes the pose from the reference, not from the live prep toggles', () => {
+    // T-pose on, but the front may never have been prepared: the view must not claim a T-pose.
+    const p = buildViewPrompt('left', opts({ tPose: true, subject: 'human', extraPrompt: 'add a hat' }), ctx);
+    expect(p).not.toContain('T-pose');
+    expect(p).toContain(SAME_POSE_PROMPT);
+    expect(p).not.toContain('add a hat');
+    // Extra instructions come along only when they produced the current front.
+    const applied = buildViewPrompt('left', opts({ extraPrompt: 'add a hat' }), { ...ctx, frontPrep: opts({ extraPrompt: 'add a hat' }) });
+    expect(applied).toContain('Additional instructions: add a hat');
+    expect(buildViewPrompt('left', opts({ extraPrompt: 'add a hat' }), { ...ctx, frontPrep: null })).not.toContain('add a hat');
+  });
+
+  it('asks only for the detail each view can show, as one single image', () => {
+    const back = buildViewPrompt('back', opts(), ctx);
+    expect(back).not.toContain(HUMAN_DETAIL_PROMPT);
+    expect(back).toContain('NOT visible');
+    expect(back).not.toMatch(/nose|lips/);
+    expect(buildViewPrompt('left', opts(), ctx)).toContain(HUMAN_VIEW_DETAIL.left);
+    expect(buildViewPrompt('top', opts(), ctx)).not.toMatch(/lips/);
+    expect(buildViewPrompt('back', opts(), { isHuman: false, refViews: ['front'] })).not.toContain('NOT visible');
+    for (const v of ['back', 'left', 'right', 'top', 'bottom'] as const) {
+      expect(buildViewPrompt(v, opts(), ctx)).toContain(SINGLE_VIEW_PROMPT);
+      expect(buildViewPrompt(v, opts(), ctx)).toContain(WHITE_BACKGROUND_PROMPT);
+      expect(buildViewPrompt(v, opts(), { ...ctx, alphaOutput: true })).toContain(ALPHA_BACKGROUND_PROMPT);
+    }
   });
 
   it('names the reference images in order', () => {
@@ -121,5 +169,9 @@ describe('no trademarks', () => {
       expect(buildPrepPrompt(opts({ styleId: s.id, tPose: true, completeBody: true }), { isHuman: true })).not.toMatch(TRADEMARKS);
     }
     for (const v of ['back', 'left', 'right', 'top', 'bottom'] as const) expect(buildViewPrompt(v, opts(), { isHuman: true, refViews: ['front'] })).not.toMatch(TRADEMARKS);
+  });
+
+  it('nor descriptions of protected toy shapes', () => {
+    for (const s of STYLES) expect(`${s.id} ${s.name.en} ${s.prompt}`).not.toMatch(/minifig|interlocking[- ]brick|c-shaped hands/i);
   });
 });

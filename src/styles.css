@@ -1098,6 +1098,27 @@ select {
 
 .kbd-hint { color: var(--text-subtle); }
 
+.generate-warning { color: var(--warn); }
+
+.regen-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+}
+
+.regen-confirm p {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+}
+
+.regen-confirm p svg { flex: none; margin-top: 2px; color: var(--warn); }
+
 .progress {
   display: flex;
   flex-direction: column;

@@ -100,8 +100,31 @@ interface Stroke {
   /** Grab: plane the pointer drags on (through the start point, facing the camera). */
   grabPlane: Plane | null;
   pointerId: number | null;
+  /** DOM strokes: the pointer that drives it (touch strokes can be cancelled by a second finger). */
+  pointer: StrokePointer | null;
   dabs: number;
 }
+
+interface StrokePointer {
+  type: string;
+  /** performance.now() at pointerdown. */
+  t0: number;
+  x0: number;
+  y0: number;
+  /** Latest client position. */
+  x: number;
+  y: number;
+  /** Largest distance from the start (px). */
+  travel: number;
+}
+
+/**
+ * A second finger landing this soon after the first one, or before the first
+ * one moved this far, is a pinch / two-finger orbit, not a stroke: the dab is
+ * reverted instead of committed.
+ */
+const TOUCH_CANCEL_MS = 300;
+const TOUCH_CANCEL_PX = 12;
 
 /** Hard cap on dabs per pointer sample (a jump across the model with a tiny brush). */
 const MAX_DABS_PER_SAMPLE = 256;
@@ -162,6 +185,8 @@ export class SculptSession {
   private lastCursor: { point: Vector3; normal: Vector3 } | null = null;
   private savedCursorStyle: string | null = null;
   private listenEl: EventTarget | null = null;
+  /** Re-dispatching a pointerdown for the viewer (ignored by our own listener). */
+  private replaying = false;
 
   constructor(
     private readonly core: SculptHost,
@@ -249,7 +274,7 @@ export class SculptSession {
   syncGeometry(): boolean {
     const stale = this.targets.some((t) => t.mesh.geometry !== t.data.geometry);
     if (!stale) return false;
-    if (this.stroke) this.endStroke();
+    this.endActiveStroke();
     this.build();
     this.history.clear();
     this.count = 0;
@@ -388,6 +413,7 @@ export class SculptSession {
       grab: null,
       grabPlane: null,
       pointerId: null,
+      pointer: null,
       dabs: 0,
     };
     this.stroke = stroke;
@@ -489,6 +515,34 @@ export class SculptSession {
     return true;
   }
 
+  /**
+   * Abandon the stroke: its changes are reverted and nothing is recorded for
+   * undo. Returns true when the geometry had changed.
+   */
+  cancelStroke(): boolean {
+    const st = this.stroke;
+    if (!st) return false;
+    this.stroke = null;
+    let changed = false;
+    for (const d of this.datas) {
+      const delta = d.endStroke();
+      if (!delta) continue;
+      d.applyDelta(delta, 'old');
+      changed = true;
+    }
+    this.updateTransforms();
+    if (changed) this.core.refresh?.();
+    this.core.invalidate();
+    return changed;
+  }
+
+  /** End a live stroke; a DOM stroke also releases its pointer and gives orbiting back. */
+  private endActiveStroke(): void {
+    if (!this.stroke) return;
+    if (this.stroke.pointerId != null) this.finishPointerStroke();
+    else this.endStroke();
+  }
+
   /** A complete one-dab stroke at a world point (headless helper). Returns the vertices moved. */
   applyStrokeAt(point: Vector3, normal: Vector3, mods: StrokeModifiers = {}): number {
     if (!this.beginStroke(point, normal, mods)) return 0;
@@ -585,7 +639,7 @@ export class SculptSession {
   // ------------------------------------------------------------ history
 
   undo(): boolean {
-    if (this.stroke) this.endStroke();
+    this.endActiveStroke();
     const rec = this.history.undo();
     if (!rec) return false;
     this.count = rec.countBefore;
@@ -594,7 +648,7 @@ export class SculptSession {
   }
 
   redo(): boolean {
-    if (this.stroke) this.endStroke();
+    this.endActiveStroke();
     const rec = this.history.redo();
     if (!rec) return false;
     this.count = rec.countAfter;
@@ -604,7 +658,7 @@ export class SculptSession {
 
   /** Back to the geometry at session start (undoable). Returns false when already there. */
   reset(): boolean {
-    if (this.stroke) this.endStroke();
+    this.endActiveStroke();
     const deltas = [];
     for (const d of this.datas) {
       const delta = d.diffToOriginal();
@@ -675,10 +729,19 @@ export class SculptSession {
   }
 
   private readonly onPointerDown = (e: PointerEvent) => {
-    if (!this.active) return;
-    if (this.stroke) {
-      // A second finger / pointer: finish the stroke and let the viewer handle the gesture.
-      if (e.pointerId !== this.stroke.pointerId) this.finishPointerStroke();
+    if (!this.active || this.replaying) return;
+    const st = this.stroke;
+    if (st) {
+      if (e.pointerId === st.pointerId) return;
+      // A second finger / pointer: let the viewer handle the gesture. A
+      // touch stroke that has barely started was the first finger of a
+      // pinch: revert it and hand that finger to the viewer as well.
+      const p = st.pointer;
+      const id = st.pointerId;
+      if (p && id !== null && p.type === 'touch' && e.pointerType === 'touch' && (now() - p.t0 < TOUCH_CANCEL_MS || p.travel < TOUCH_CANCEL_PX)) {
+        this.finishPointerStroke(true);
+        this.replayPointerDown(id, p);
+      } else this.finishPointerStroke();
       return;
     }
     if (e.button !== 0 || !e.isPrimary) return;
@@ -694,11 +757,14 @@ export class SculptSession {
     }
     this.core.setOrbitEnabled(false);
     this.cancelHover();
-    if (!this.beginStroke(hit.point, hit.normal, { invert: e.ctrlKey || e.metaKey, smooth: e.shiftKey, pressure: pressureOf(e), backFacing: hit.backFacing })) {
+    // A pen touching down with no pressure reading starts light (the next sample sets it).
+    const pressure = pressureOf(e) ?? MIN_PRESSURE;
+    if (!this.beginStroke(hit.point, hit.normal, { invert: e.ctrlKey || e.metaKey, smooth: e.shiftKey, pressure, backFacing: hit.backFacing })) {
       this.core.setOrbitEnabled(true);
       return;
     }
     this.stroke!.pointerId = e.pointerId;
+    this.stroke!.pointer = { type: e.pointerType, t0: now(), x0: e.clientX, y0: e.clientY, x: e.clientX, y: e.clientY, travel: 0 };
     this.showCursor(hit.point, hit.normal);
   };
 
@@ -710,6 +776,12 @@ export class SculptSession {
       return;
     }
     if (e.pointerId !== st.pointerId) return;
+    const p = st.pointer;
+    if (p) {
+      p.x = e.clientX;
+      p.y = e.clientY;
+      p.travel = Math.max(p.travel, Math.hypot(e.clientX - p.x0, e.clientY - p.y0));
+    }
     const samples = typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : [];
     const list = samples.length > 0 ? samples.slice(-8) : [e];
     const rect = this.core.canvas.getBoundingClientRect();
@@ -758,9 +830,11 @@ export class SculptSession {
     if (this.stroke) this.finishPointerStroke();
   };
 
-  private finishPointerStroke(): void {
+  /** End (or with `cancel`, revert) the pointer's stroke, release the pointer and give orbiting back. */
+  private finishPointerStroke(cancel = false): void {
     const id = this.stroke?.pointerId;
-    this.endStroke();
+    if (cancel) this.cancelStroke();
+    else this.endStroke();
     if (id !== null && id !== undefined) {
       try {
         if (this.core.canvas.hasPointerCapture?.(id)) this.core.canvas.releasePointerCapture(id);
@@ -769,6 +843,32 @@ export class SculptSession {
       }
     }
     this.core.setOrbitEnabled(true);
+  }
+
+  /**
+   * Re-send the first finger's pointerdown to the canvas (the viewer's
+   * controls never saw it), so a pinch / two-finger orbit gets both fingers.
+   */
+  private replayPointerDown(pointerId: number, p: StrokePointer): void {
+    if (typeof PointerEvent !== 'function') return;
+    const ev = new PointerEvent('pointerdown', {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      pointerId,
+      pointerType: p.type,
+      isPrimary: true,
+      button: 0,
+      buttons: 1,
+      clientX: p.x,
+      clientY: p.y,
+    });
+    this.replaying = true;
+    try {
+      this.core.canvas.dispatchEvent(ev);
+    } finally {
+      this.replaying = false;
+    }
   }
 
   private readonly onKeyDown = (e: KeyboardEvent) => {
@@ -872,16 +972,42 @@ export class SculptSession {
     this.listeners.clear();
   }
 
+  /** The viewer the session is bound to. */
+  get host(): SculptHost {
+    return this.core;
+  }
+
+  /** False once an edited mesh left the model (e.g. swapped for a rigged one): the session must be rebuilt. */
+  get attached(): boolean {
+    if (this.disposed) return false;
+    return this.targets.every((t) => {
+      for (let o: Object3D | null = t.mesh; o; o = o.parent) if (o === this.root) return true;
+      return false;
+    });
+  }
+
   get isDisposed(): boolean {
     return this.disposed;
   }
 }
 
+const MIN_PRESSURE = 0.05;
+
 function clampPressure(p: number | undefined): number {
-  return typeof p === 'number' && Number.isFinite(p) ? Math.min(1, Math.max(0.05, p)) : 1;
+  return typeof p === 'number' && Number.isFinite(p) ? Math.min(1, Math.max(MIN_PRESSURE, p)) : 1;
 }
 
-/** Pen pressure when the device reports it; mice (0.5 while pressed) and most touch screens count as full. */
-export function pressureOf(e: Pick<PointerEvent, 'pointerType' | 'pressure'>): number {
-  return e.pointerType === 'pen' && e.pressure > 0 ? e.pressure : 1;
+function now(): number {
+  return typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
+/**
+ * Pen pressure when the device reports it; mice (0.5 while pressed) and most
+ * touch screens count as full. A pen sample reporting 0 (a driver quirk at
+ * contact start / end or a very light touch) gives undefined: keep the
+ * stroke's current pressure rather than jumping to full strength.
+ */
+export function pressureOf(e: Pick<PointerEvent, 'pointerType' | 'pressure'>): number | undefined {
+  if (e.pointerType !== 'pen') return 1;
+  return e.pressure > 0 ? e.pressure : undefined;
 }

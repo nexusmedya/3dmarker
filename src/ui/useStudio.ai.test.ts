@@ -133,6 +133,25 @@ describe('AI settings', () => {
     expect(studio.state.aiSettingsOpen).toBe(false);
   });
 
+  it('reloads the settings another tab saved, without writing them back', async () => {
+    await mount();
+    await act(async () => studio.actions.setAiSettings(withKey(true)));
+    const other = { ...withKey(true), providers: [createProviderConfig('gemini', { id: 'g', label: 'G', apiKey: 'g-key' })] };
+    // Another tab's write (a second module instance would do the same through saveAiSettings).
+    const raw = JSON.parse(localStorage.getItem('3dmarker:ai-settings')!);
+    localStorage.setItem('3dmarker:ai-settings', JSON.stringify({ ...raw, rev: 'other-tab', providers: [{ id: 'g', kind: 'gemini', label: 'G', values: {}, models: {}, enabled: true }] }));
+    localStorage.setItem('3dmarker:ai-keys', JSON.stringify({ g: { apiKey: 'g-key' } }));
+    const before = localStorage.getItem('3dmarker:ai-settings');
+    await act(async () => void window.dispatchEvent(new StorageEvent('storage', { key: '3dmarker:ai-settings' })));
+    expect(studio.state.aiSettings.providers.map((p) => [p.id, p.apiKey])).toEqual([[other.providers[0].id, 'g-key']]);
+    expect(currentAiSettings().settings).toBe(studio.state.aiSettings);
+    expect(localStorage.getItem('3dmarker:ai-settings')).toBe(before); // not echoed back
+    // Unrelated keys are ignored.
+    const cur = studio.state.aiSettings;
+    await act(async () => void window.dispatchEvent(new StorageEvent('storage', { key: '3dmarker:settings' })));
+    expect(studio.state.aiSettings).toBe(cur);
+  });
+
   it('merges the server’s managed providers when there is a server', async () => {
     const fetchMock = vi.fn(async () =>
       Response.json({ providers: [{ id: 'server-gemini', kind: 'gemini', label: 'Gemini (server)' }], proxyKinds: ['gemini'], byok: true }),
@@ -192,9 +211,11 @@ describe('AI preparation', () => {
   it('reports a missing provider or nothing to do instead of calling the API; errors land in the prep panel', async () => {
     await mount();
     await load('a.png');
+    await act(async () => studio.actions.setPrep({ styleId: STYLES[1].id }));
     await act(async () => studio.actions.runPrep());
     expect(studio.state.prepError?.en).toMatch(/No AI provider/);
     await act(async () => studio.actions.setAiSettings(withKey()));
+    await act(async () => studio.actions.setPrep({ styleId: null, removeBackground: false }));
     await act(async () => studio.actions.runPrep());
     expect(studio.state.prepError?.en).toMatch(/Pick a style/);
     expect(mocks.prepareFrontImage).not.toHaveBeenCalled();
@@ -207,6 +228,79 @@ describe('AI preparation', () => {
     expect(studio.state.prepError).toEqual({ tr: 'kota doldu', en: 'quota exceeded' });
     expect(studio.state.aiJob).toBeNull();
     logged.mockRestore();
+  });
+
+  it('removes the background alone without an image-edit provider', async () => {
+    mocks.prepareFrontImage.mockResolvedValue(new Blob(['cut'], { type: 'image/png' }));
+    await mount();
+    await load('cat.png');
+    await act(async () => studio.actions.setPrep({ styleId: null, tPose: false, completeBody: false, extraPrompt: '', removeBackground: true, subject: 'object' }));
+    await act(async () => studio.actions.runPrep());
+    expect(mocks.prepareFrontImage).toHaveBeenCalledOnce();
+    const [, prep, cfg, ctx] = mocks.prepareFrontImage.mock.calls[0];
+    expect(prep).toMatchObject({ removeBackground: true, styleId: null });
+    expect(cfg).toBeNull();
+    expect(ctx.bgProvider).toBeNull(); // no provider: the local model
+    expect(studio.state.prepError).toBeNull();
+    expect(studio.state.prepared?.name).toBe('cat-ai.png');
+  });
+
+  it('repeats the accepted prep options for the views, and forgets them on revert or a new image', async () => {
+    mocks.prepareFrontImage.mockResolvedValue(new Blob(['prepared'], { type: 'image/png' }));
+    mocks.generateViewImage.mockImplementation(async (view: string) => new Blob([`ai-${view}`], { type: 'image/png' }));
+    await mount();
+    await act(async () => {
+      studio.actions.setAiSettings(withKey());
+      studio.actions.setPrep({ styleId: STYLES[0].id, subject: 'object', extraPrompt: 'red scarf' });
+    });
+    await load('cat.png');
+    await act(async () => studio.actions.generateView('back'));
+    expect(mocks.generateViewImage.mock.calls[0][4].frontPrep).toBeNull(); // original front
+
+    await act(async () => studio.actions.runPrep());
+    // Options changed after the run are not what produced the prepared image.
+    await act(async () => studio.actions.setPrep({ extraPrompt: 'blue hat' }));
+    await act(async () => studio.actions.acceptPrepared());
+    await act(async () => studio.actions.generateView('back'));
+    expect(mocks.generateViewImage.mock.calls[1][4].frontPrep).toMatchObject({ styleId: STYLES[0].id, extraPrompt: 'red scarf' });
+
+    await act(async () => studio.actions.revertOriginal());
+    await act(async () => studio.actions.generateView('back'));
+    expect(mocks.generateViewImage.mock.calls[2][4].frontPrep).toBeNull();
+
+    await act(async () => studio.actions.runPrep());
+    await act(async () => studio.actions.acceptPrepared());
+    expect(studio.state.frontPrep).not.toBeNull();
+    await load('other.png');
+    expect(studio.state.frontPrep).toBeNull();
+  });
+
+  it('renders views with a provider that can (not Stability) and says why when none can', async () => {
+    mocks.generateViewImage.mockImplementation(async (view: string) => new Blob([`ai-${view}`], { type: 'image/png' }));
+    const stab = createProviderConfig('stability', { id: 'stab', apiKey: 'sk-stab' });
+    // Stability goes through the server proxy.
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ providers: [], proxyKinds: ['stability', 'openai'], byok: true })));
+    await mount();
+    await vi.waitFor(() => expect(studio.state.serverAvailable).toBe(true));
+    await act(async () => {
+      studio.actions.setAiSettings({ providers: [stab], defaults: {}, rememberKeys: false });
+      studio.actions.setPrep({ subject: 'object' });
+    });
+    await load('toy.png');
+    expect(studio.editProvider?.id).toBe('stab');
+    expect(studio.viewProvider).toBeNull();
+    await act(async () => studio.actions.generateView('back'));
+    expect(mocks.generateViewImage).not.toHaveBeenCalled();
+    expect(studio.state.viewsError?.en).toMatch(/cannot render new views/);
+
+    const oa = createProviderConfig('openai', { id: 'oa', apiKey: 'sk-oa' });
+    await act(async () => {
+      studio.actions.setAiSettings({ providers: [stab, oa], defaults: { 'image-edit': 'stab' }, rememberKeys: false });
+      studio.actions.setAiProvider('stab');
+    });
+    expect(studio.viewProvider?.id).toBe('oa');
+    await act(async () => studio.actions.generateView('back'));
+    expect(mocks.generateViewImage.mock.calls[0][3].id).toBe('oa');
   });
 
   it('Escape cancels a running AI job', async () => {

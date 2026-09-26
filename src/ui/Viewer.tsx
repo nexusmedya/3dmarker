@@ -18,10 +18,12 @@ interface Props {
   depthPreview: RGBAImage | null;
   running: boolean;
   progress: Progress | null;
+  /** An image is loaded: the empty state points to the remaining steps instead of the upload. */
+  hasSource?: boolean;
   children?: ReactNode;
 }
 
-export function Viewer({ model, geometryVersion, view, onView, coreRef, depthPreview, running, progress, children }: Props) {
+export function Viewer({ model, geometryVersion, view, onView, coreRef, depthPreview, running, progress, hasSource, children }: Props) {
   const { t } = useI18n();
   const hostRef = useRef<HTMLDivElement>(null);
   const [webglError, setWebglError] = useState(false);
@@ -110,7 +112,7 @@ export function Viewer({ model, geometryVersion, view, onView, coreRef, depthPre
               <IconCube size={30} />
             </div>
             <strong>{t('viewerEmptyTitle')}</strong>
-            <p>{t('viewerEmptyBody')}</p>
+            <p data-testid="viewer-empty-body">{t(hasSource ? 'viewerReadyBody' : 'viewerEmptyBody')}</p>
           </div>
         </div>
       )}

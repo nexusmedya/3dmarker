@@ -4,7 +4,9 @@ import {
   MAX_DOWNLOADS_PER_CLIENT,
   MAX_UPLOADS_PER_CLIENT,
   createApp,
+  isTrustedPeer,
   parseForwardedHop,
+  parseTrustedProxies,
   parseTaskFields,
   rateKeyForIp,
   toTaskState,
@@ -308,6 +310,48 @@ describe('POST /api/tripo/tasks', () => {
     expect((await request('/api/tripo/tasks', from('10.0.0.1'))).status).toBe(200);
     expect((await request('/api/tripo/tasks', from('10.0.0.1'))).status).toBe(429);
     expect((await request('/api/tripo/tasks', from('10.0.0.2'))).status).toBe(200);
+  });
+
+  it('believes X-Forwarded-For only on connections from a trusted proxy', async () => {
+    const { app, logs } = setup({ env: { TRIPO_API_KEY: SERVER_KEY, TRIPO_RATE_LIMIT: '1', TRUST_PROXY: '1' } });
+    // app.request's third argument stands in for @hono/node-server's bindings (the socket).
+    const from = (peer: string, xff: string) =>
+      app.request('/api/tripo/tasks', post(imageForm(), { [CLIENT_HEADER]: CLIENT_HEADER_VALUE, 'x-forwarded-for': xff }), {
+        incoming: { socket: { remoteAddress: peer, remotePort: 5000, remoteFamily: peer.includes(':') ? 'IPv6' : 'IPv4' } },
+      });
+    // A direct connection (the app port left open) cannot pick its own bucket.
+    expect((await from('203.0.113.9', '10.0.0.1')).status).toBe(200);
+    expect((await from('203.0.113.9', '10.0.0.2')).status).toBe(429);
+    expect((await from('203.0.113.9', '10.0.0.3')).status).toBe(429);
+    expect(logs.filter((l) => l.includes('outside TRUSTED_PROXIES'))).toHaveLength(1);
+    // The proxy on loopback / a private network: per forwarded client.
+    expect((await from('127.0.0.1', '198.51.100.1')).status).toBe(200);
+    expect((await from('::ffff:127.0.0.1', '198.51.100.1')).status).toBe(429);
+    expect((await from('172.18.0.2', '198.51.100.2')).status).toBe(200);
+
+    const custom = setup({ env: { TRIPO_API_KEY: SERVER_KEY, TRIPO_RATE_LIMIT: '1', TRUST_PROXY: '1', TRUSTED_PROXIES: '203.0.113.0/24' } });
+    const via = (peer: string, xff: string) =>
+      custom.app.request('/api/tripo/tasks', post(imageForm(), { [CLIENT_HEADER]: CLIENT_HEADER_VALUE, 'x-forwarded-for': xff }), {
+        incoming: { socket: { remoteAddress: peer, remotePort: 5000, remoteFamily: 'IPv4' } },
+      });
+    expect((await via('203.0.113.9', '10.0.0.1')).status).toBe(200);
+    expect((await via('203.0.113.9', '10.0.0.2')).status).toBe(200);
+    expect((await via('127.0.0.1', '10.0.0.3')).status).toBe(200); // loopback is not in the custom list: keyed by 127.0.0.1
+    expect((await via('127.0.0.1', '10.0.0.4')).status).toBe(429);
+  });
+
+  it('parseTrustedProxies / isTrustedPeer', () => {
+    const def = parseTrustedProxies(undefined);
+    for (const ip of ['127.0.0.1', '127.9.9.9', '::1', '::ffff:10.1.2.3', '10.1.2.3', '172.16.0.1', '172.31.255.255', '192.168.1.1', 'fd00::1']) {
+      expect(isTrustedPeer(ip, def), ip).toBe(true);
+    }
+    for (const ip of ['203.0.113.9', '172.32.0.1', '2001:db8::1', '::ffff:8.8.8.8', 'unknown', '']) expect(isTrustedPeer(ip, def), ip).toBe(false);
+    const custom = parseTrustedProxies(' 198.51.100.7 , 2001:db8::/32, bad, 1.2.3.4/99 ');
+    expect(isTrustedPeer('198.51.100.7', custom)).toBe(true);
+    expect(isTrustedPeer('198.51.100.8', custom)).toBe(false);
+    expect(isTrustedPeer('2001:db8:1::5', custom)).toBe(true);
+    expect(isTrustedPeer('127.0.0.1', custom)).toBe(false);
+    expect(isTrustedPeer('127.0.0.1', parseTrustedProxies('nonsense'))).toBe(false); // an unusable list trusts nobody
   });
 
   it('ignores the port some proxies append to the forwarded client IP', async () => {

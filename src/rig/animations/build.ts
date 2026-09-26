@@ -9,10 +9,18 @@
  * `<Bone>.quaternion` for the bones that move (constant tracks collapsed to
  * two keys) + a `Hips.position` track (rest + offset × hip height). Tracks
  * bind by name from the model root, so one clip drives every skinned mesh.
+ *
+ * Grounded clips (the default; not fly / swim) get a floor pass: per frame,
+ * forward kinematics of the rig's own legs (Hips rotation included) gives the
+ * Hips height at which the lowest foot / toe joint sits at its rest height;
+ * the authored Hips height is raised to at least that (no sinking between
+ * keys or through pitched hips), and a clip that never touches the floor
+ * (e.g. a run whose authored bounce is too high) is lowered as a whole until
+ * it does, keeping its airborne phases.
  */
 import { AnimationClip, Euler, Quaternion, QuaternionKeyframeTrack, Vector3, VectorKeyframeTrack } from 'three';
 import type { KeyframeTrack } from 'three';
-import { END_BONES, parentOf } from '../bones';
+import { END_BONES, parentOf, SIDES } from '../bones';
 import { computeAlignment, makeContinuous, solveFrame } from '../retarget';
 import type { RigDescriptor } from '../skeleton';
 import type { AnimationInfo, HumanoidBone, RigClip } from '../types';
@@ -72,6 +80,9 @@ export function buildClip(def: ClipDef, rig: RigDescriptor, align = canonicalAli
   const e = [0, 0, 0], h = [0, 0, 0];
   const euler = new Euler(), q = new Quaternion();
   const rest = rig.layout.Hips!;
+  const grounded = def.grounded !== false;
+  /** Per frame: the Hips height that puts the lowest foot joint exactly at its rest height. */
+  const floorY = new Float64Array(frames);
   for (let f = 0; f < frames; f++) {
     const u = f / (frames - 1);
     times[f] = u * def.duration;
@@ -92,6 +103,15 @@ export function buildClip(def: ClipDef, rig: RigDescriptor, align = canonicalAli
     hipsPos[f * 3] = rest.x + h[0] * rig.hipHeight;
     hipsPos[f * 3 + 1] = rest.y + h[1] * rig.hipHeight;
     hipsPos[f * 3 + 2] = rest.z + h[2] * rig.hipHeight;
+    if (grounded) floorY[f] = floorHipsY(rig, local);
+  }
+  if (grounded) {
+    let clearance = Infinity;
+    for (let f = 0; f < frames; f++) {
+      hipsPos[f * 3 + 1] = Math.max(hipsPos[f * 3 + 1], floorY[f]);
+      clearance = Math.min(clearance, hipsPos[f * 3 + 1] - floorY[f]);
+    }
+    if (clearance > 1e-9 && Number.isFinite(clearance)) for (let f = 0; f < frames; f++) hipsPos[f * 3 + 1] -= clearance;
   }
 
   const out: KeyframeTrack[] = [];
@@ -107,6 +127,37 @@ export function buildClip(def: ClipDef, rig: RigDescriptor, align = canonicalAli
   clip.userData = { ...clip.userData, info };
   return { clip, info };
 }
+
+const FOOT_CHAINS = SIDES.map((s) => [`${s}UpLeg`, `${s}Leg`, `${s}Foot`, `${s}ToeBase`] as const);
+
+/**
+ * Hips Y (rig frame) at which the lowest of the foot / toe joints, posed by
+ * the local rotations `local`, is exactly at its rest height.
+ */
+function floorHipsY(rig: RigDescriptor, local: Map<HumanoidBone, Quaternion>): number {
+  const L = rig.layout;
+  const hips = L.Hips!;
+  const hipsQ = local.get('Hips') ?? new Quaternion();
+  let need = -Infinity;
+  const w = new Quaternion(), off = new Vector3(), pos = new Vector3();
+  for (const chain of FOOT_CHAINS) {
+    // Joint positions relative to the Hips joint; the chain hangs off Hips directly.
+    w.copy(hipsQ);
+    pos.set(0, 0, 0);
+    let prev: HumanoidBone = 'Hips';
+    for (const b of chain) {
+      const p = L[b], pp = L[prev];
+      if (!p || !pp || parentOf(b) !== prev) break;
+      pos.add(off.set(p.x - pp.x, p.y - pp.y, p.z - pp.z).applyQuaternion(w));
+      if (b.endsWith('Foot') || b.endsWith('ToeBase')) need = Math.max(need, p.y - pos.y);
+      w.multiply(local.get(b) ?? IDENTITY);
+      prev = b;
+    }
+  }
+  return Number.isFinite(need) ? need : hips.y;
+}
+
+const IDENTITY = new Quaternion();
 
 function isConstant(values: Float32Array, stride: number): boolean {
   for (let i = stride; i < values.length; i++) if (Math.abs(values[i] - values[i % stride]) > 1e-6) return false;

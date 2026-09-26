@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AbortError, defaultParams, type DriverInput, type Progress } from '../../core/types';
 import type { HumanAnalysis } from '../../core/human/types';
+import { planCrops } from '../../core/human/enhance';
 import { fakeAnalysis, syntheticFace, syntheticHand } from '../../core/human/testing';
 import type { DepthJob, DepthPayload } from '../../workers/mlProtocol';
 import type { MlRequestOptions } from './workerClient';
@@ -151,5 +152,47 @@ describe('human detail in the ML depth drivers', () => {
     expect(labels.indexOf('Post-processing…')).toBeLessThan(labels.lastIndexOf('Loading human detection models…'));
     resolve(fakeAnalysis(W, H));
     await run;
+  });
+
+  it('keeps the sharp nose tip of the crop pass (no percentile clamping before the fit)', async () => {
+    mockedAnalyze.mockResolvedValue(withFace());
+    const [job] = planCrops(withFace(), { maxCrops: 6, faces: true, hands: true });
+    const nose = face.landmarks[1];
+    const sigma = 5; // image px: the nose peak covers well under 1% of the crop… but more than its top 1%
+    const ramp = (gx: number) => gx / W;
+    // Global pass: a ramp and no nose. Crop pass: the same ramp plus a tall, sharp nose.
+    mockedRequest.mockImplementation((j) => {
+      const { width: iw, height: ih } = j.image;
+      const data = new Float32Array(iw * ih);
+      const crop = mockedRequest.mock.calls.length > 1;
+      for (let v = 0; v < ih; v++) {
+        for (let u = 0; u < iw; u++) {
+          const gx = crop ? job.box.x + ((u + 0.5) / iw) * job.box.width : ((u + 0.5) / iw) * W;
+          const gy = crop ? job.box.y + ((v + 0.5) / ih) * job.box.height : ((v + 0.5) / ih) * H;
+          const peak = crop ? 3 * Math.exp(-((gx - nose.x) ** 2 + (gy - nose.y) ** 2) / (2 * sigma * sigma)) : 0;
+          data[v * iw + u] = ramp(gx) + peak;
+        }
+      }
+      return Promise.resolve({ kind: 'depth', data, dims: [1, ih, iw], device: 'webgpu', dtype: 'fp16' } as DepthPayload);
+    });
+    const res = await driver.run(input({ params: { ...defaultParams(driver.params), faceStrength: 0.0001 } }));
+    if (res.kind !== 'depth') throw new Error('expected depth');
+    expect(mockedRequest).toHaveBeenCalledTimes(2);
+    const at = (x: number, y: number) => res.depth.data[Math.round(y) * W + Math.round(x)];
+    const tip = at(nose.x, nose.y);
+    const near = (at(nose.x - 4, nose.y) + at(nose.x + 4, nose.y)) / 2; // g ≈ 0.73 of the tip
+    const cheek = (at(nose.x - 15, nose.y) + at(nose.x + 15, nose.y)) / 2;
+    // A percentile-clamped crop turns the top of the nose into a plateau.
+    expect(tip - near).toBeGreaterThan(0.2 * (tip - cheek));
+    expect(tip - cheek).toBeGreaterThan(0.1);
+  });
+
+  it('skips a crop pass that would be coarser than a high-detail global pass', async () => {
+    mockedAnalyze.mockResolvedValue(fakeAnalysis(W, H, { faces: [syntheticFace(200, 150, 50, 60)] }));
+    await driver.run(input({ params: defaultParams(driver.params) }));
+    expect(mockedRequest).toHaveBeenCalledTimes(2); // global 518 + crop 518
+    mockedRequest.mockClear();
+    await driver.run(input({ params: { ...defaultParams(driver.params), detail: 840 } }));
+    expect(mockedRequest).toHaveBeenCalledTimes(1); // global 840 only
   });
 });

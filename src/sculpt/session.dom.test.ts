@@ -4,9 +4,9 @@
  * mesh and then keep the viewer's own pointerdown listener (OrbitControls)
  * from seeing the event; drags in empty space reach it untouched.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Mesh, MeshBasicMaterial } from 'three';
-import { SculptSession } from './session';
+import { SculptSession, pressureOf } from './session';
 import { fakeHost, gridGeometry } from './testing';
 
 function setup() {
@@ -98,5 +98,97 @@ describe('SculptSession pointer input', () => {
     input.remove();
     dialog.remove();
     host.remove();
+  });
+
+  it.each([
+    ['undo', { key: 'z', ctrlKey: true }],
+    ['redo (Shift)', { key: 'z', ctrlKey: true, shiftKey: true }],
+    ['redo (Y)', { key: 'y', metaKey: true }],
+  ] as const)('%s during a drag ends the stroke and gives orbiting back', (_name, key) => {
+    const { session, core, fire, orbitDowns, host } = setup();
+    session.setActive(true);
+    fire('pointerdown', 50, 50);
+    fire('pointermove', 55, 50);
+    expect(core.orbit.at(-1)).toBe(false);
+    window.dispatchEvent(new KeyboardEvent('keydown', { ...key, bubbles: true, cancelable: true }));
+    expect(session.stroking).toBe(false);
+    expect(core.orbit.at(-1)).toBe(true);
+    fire('pointerup', 55, 50);
+    expect(core.orbit.at(-1)).toBe(true);
+    // Empty-space drags orbit again.
+    fire('pointerdown', 2, 2);
+    expect(orbitDowns).toHaveLength(1);
+    fire('pointerup', 2, 2);
+    session.dispose();
+    host.remove();
+  });
+
+  it('reset during a drag gives orbiting back', () => {
+    const { session, core, fire, host } = setup();
+    session.setActive(true);
+    fire('pointerdown', 50, 50);
+    expect(session.reset()).toBe(true);
+    expect(core.orbit.at(-1)).toBe(true);
+    session.dispose();
+    host.remove();
+  });
+
+  it('a second finger right after the first reverts the dab and hands both fingers to the viewer', () => {
+    const { session, core, fire, orbitDowns, geometry, host } = setup();
+    session.setActive(true);
+    const z0 = (geometry.getAttribute('position').array as Float32Array).slice();
+    fire('pointerdown', 50, 50, { pointerId: 11, pointerType: 'touch' });
+    expect(session.stroking).toBe(true);
+    expect(orbitDowns).toHaveLength(0);
+    fire('pointerdown', 60, 50, { pointerId: 12, pointerType: 'touch', isPrimary: false });
+    expect(session.stroking).toBe(false);
+    expect(session.state.strokes).toBe(0);
+    expect(session.state.canUndo).toBe(false);
+    expect(geometry.getAttribute('position').array).toEqual(z0);
+    expect(core.orbit.at(-1)).toBe(true);
+    expect(orbitDowns.map((e) => e.pointerId)).toEqual([11, 12]);
+    expect(orbitDowns[0].pointerType).toBe('touch');
+    expect(orbitDowns[0].clientX).toBe(50);
+    session.dispose();
+    host.remove();
+  });
+
+  it('a second finger after a real touch stroke keeps the stroke', () => {
+    const { session, fire, orbitDowns, host } = setup();
+    session.setActive(true);
+    const t0 = performance.now();
+    const spy = vi.spyOn(performance, 'now').mockReturnValue(t0);
+    fire('pointerdown', 50, 50, { pointerId: 11, pointerType: 'touch' });
+    spy.mockReturnValue(t0 + 1000);
+    fire('pointermove', 70, 50, { pointerId: 11, pointerType: 'touch' });
+    fire('pointerdown', 20, 50, { pointerId: 12, pointerType: 'touch', isPrimary: false });
+    spy.mockRestore();
+    expect(session.state.strokes).toBe(1);
+    expect(orbitDowns.map((e) => e.pointerId)).toEqual([12]);
+    session.dispose();
+    host.remove();
+  });
+
+  it('pen samples without pressure keep the stroke light', () => {
+    expect(pressureOf({ pointerType: 'pen', pressure: 0 })).toBeUndefined();
+    expect(pressureOf({ pointerType: 'pen', pressure: 0.3 })).toBe(0.3);
+    expect(pressureOf({ pointerType: 'mouse', pressure: 0.5 })).toBe(1);
+    expect(pressureOf({ pointerType: 'touch', pressure: 0 })).toBe(1);
+
+    const light = setup();
+    light.session.setActive(true);
+    light.fire('pointerdown', 50, 50, { pointerType: 'pen', pressure: 0 });
+    light.fire('pointerup', 50, 50, { pointerType: 'pen', pressure: 0 });
+    const full = setup();
+    full.session.setActive(true);
+    full.fire('pointerdown', 50, 50, { pointerType: 'pen', pressure: 1 });
+    full.fire('pointerup', 50, 50, { pointerType: 'pen', pressure: 0 });
+    const maxZ = (g: typeof light.geometry) => Math.max(...(g.getAttribute('position').array as Float32Array).filter((_, i) => i % 3 === 2));
+    expect(maxZ(light.geometry)).toBeGreaterThan(0);
+    expect(maxZ(light.geometry)).toBeLessThan(maxZ(full.geometry) * 0.2);
+    for (const x of [light, full]) {
+      x.session.dispose();
+      x.host.remove();
+    }
   });
 });

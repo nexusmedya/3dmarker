@@ -18,8 +18,13 @@ import type { HumanAnalysis } from '../core/human/types';
 import { DEFAULT_DRIVER_ID, DRIVERS, getDriver } from '../drivers';
 import type { AiSettings, PrepOptions, ProviderConfig } from '../ai/types';
 import {
+  AI_KEYS_KEY,
+  AI_SETTINGS_KEY,
   browserSessionStorage,
+  canRenderViews,
   fetchServerProviders,
+  loadAiSettings,
+  mergeServerProviders,
   providerUsable,
   resolveProvider,
   saveAiSettings,
@@ -48,6 +53,7 @@ import {
   canGenerate,
   createInitialState,
   extraViewSet,
+  hasUnsavedModelEdits,
   meshParamsForJob,
   reducer,
   remeshPaused,
@@ -117,6 +123,16 @@ function editProviderOf(s: AppState): ProviderConfig | null {
   return resolveProvider(s.aiSettings, 'image-edit', s.aiProviderId, s.serverAvailable);
 }
 
+/**
+ * The image-edit provider for new views: the chosen one when it can render
+ * views (Stability keeps the composition), else the first usable one that can.
+ */
+export function viewProviderOf(s: Pick<AppState, 'aiSettings' | 'aiProviderId' | 'serverAvailable'>): ProviderConfig | null {
+  const chosen = resolveProvider(s.aiSettings, 'image-edit', s.aiProviderId, s.serverAvailable);
+  if (chosen && canRenderViews(chosen)) return chosen;
+  return usableProviders(s.aiSettings, 'image-edit', s.serverAvailable).find(canRenderViews) ?? null;
+}
+
 /** Background removal of AI outputs: a provider offering it, else null (the local model). */
 function bgProviderOf(s: AppState): ProviderConfig | null {
   return resolveProvider(s.aiSettings, 'background-removal', null, s.serverAvailable);
@@ -136,6 +152,21 @@ export function meshSignature(root: Object3D): string {
     if (mesh.isMesh) parts.push(`${mesh.uuid}:${mesh.geometry?.uuid ?? ''}`);
   });
   return parts.join('|');
+}
+
+const TEXT_INPUT_TYPES = new Set(['text', 'search', 'url', 'email', 'tel', 'password', 'number']);
+
+/**
+ * Keys typed here belong to the field or the dialog, not to the page
+ * shortcuts: text fields, contentEditable, and anything inside a dialog.
+ */
+export function isShortcutExcluded(target: EventTarget | null): boolean {
+  const el = target as (HTMLElement & { isContentEditable?: boolean }) | null;
+  if (!el || typeof el.tagName !== 'string') return false;
+  const tag = el.tagName;
+  if (tag === 'TEXTAREA' || el.isContentEditable) return true;
+  if (tag === 'INPUT' && TEXT_INPUT_TYPES.has(((el as HTMLInputElement).type || 'text').toLowerCase())) return true;
+  return typeof el.closest === 'function' && !!el.closest('dialog, [role="dialog"], [role="alertdialog"]');
 }
 
 /** The model on screen and the input it was built from (texture image / rig front image). */
@@ -173,6 +204,10 @@ export function useStudio() {
   const viewSeq = useRef(0);
   /** Set synchronously while an image decodes (stateRef only catches up on render). */
   const loadingRef = useRef(false);
+  /** View uploads still decoding: no job starts meanwhile (it would miss / overwrite the view). */
+  const viewDecodes = useRef(0);
+  /** Uploaded views whose AI background removal could not start yet (another job ran). */
+  const bgPending = useRef(new Map<OtherViewId, ViewEntry>());
   const stateRef = useRef(state);
   stateRef.current = state;
   const modelRef = useRef(model);
@@ -201,12 +236,34 @@ export function useStudio() {
   // Persist settings / params (secrets are stripped by saveState).
   useEffect(() => {
     saveState(store, stateRef.current, DRIVERS);
-  }, [store, state.lang, state.theme, state.explicitTheme, state.driverId, state.bgMode, state.view, state.stlSizeMm, state.showMask, state.meshParams, state.params, state.prep, state.step, state.aiProviderId]);
+  }, [store, state.lang, state.theme, state.explicitTheme, state.driverId, state.bgMode, state.view, state.stlSizeMm, state.showMask, state.meshParams, state.params, state.prep, state.aiProviderId]);
 
   // AI provider settings: keys to exactly one store (local when remembered, else session).
+  // Settings just reloaded from another tab's write are not written back
+  // (two open tabs would otherwise echo each other's writes forever).
+  const aiFromStorageRef = useRef<AiSettings | null>(null);
   useEffect(() => {
-    saveAiSettings(store, session, state.aiSettings);
+    if (aiFromStorageRef.current === state.aiSettings) return;
+    const saved = saveAiSettings(store, session, state.aiSettings);
+    // Another tab may have turned "remember keys" off meanwhile: show what was saved.
+    if (saved.rememberKeys !== state.aiSettings.rememberKeys) dispatch({ type: 'setAiSettings', settings: saved });
   }, [store, session, state.aiSettings]);
+
+  // Another tab changed the AI settings: reload them (keeping this tab's server-managed entries).
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== null && !e.key.endsWith(AI_SETTINGS_KEY) && !e.key.endsWith(AI_KEYS_KEY)) return;
+      const cur = stateRef.current.aiSettings;
+      const managed = cur.providers.filter((p) => p.managed);
+      const loaded = loadAiSettings(store, session);
+      const next = managed.length ? mergeServerProviders(loaded, managed) : loaded;
+      aiFromStorageRef.current = next;
+      dispatch({ type: 'setAiSettings', settings: next });
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, [store, session]);
 
   // Is there a server (managed providers, proxy)? Static hosting answers 404 / HTML → no.
   useEffect(() => {
@@ -291,6 +348,10 @@ export function useStudio() {
   const editProviders = useMemo(() => usableProviders(state.aiSettings, 'image-edit', state.serverAvailable), [state.aiSettings, state.serverAvailable]);
   const editProvider = useMemo(
     () => resolveProvider(state.aiSettings, 'image-edit', state.aiProviderId, state.serverAvailable),
+    [state.aiSettings, state.aiProviderId, state.serverAvailable],
+  );
+  const viewProvider = useMemo(
+    () => viewProviderOf({ aiSettings: state.aiSettings, aiProviderId: state.aiProviderId, serverAvailable: state.serverAvailable }),
     [state.aiSettings, state.aiProviderId, state.serverAvailable],
   );
   const canPrep = editProviders.length > 0;
@@ -380,11 +441,21 @@ export function useStudio() {
 
   // ---------------------------------------------------------------- 3D generation
 
-  const generate = useCallback(async () => {
+  /**
+   * Generates a new model. When the model on screen carries sculpt / rig /
+   * depth edits, the first call only asks for confirmation (GeneratePanel
+   * shows it); `confirmed` goes ahead and replaces them.
+   */
+  const generate = useCallback(async (opts?: { confirmed?: boolean }) => {
     const s = stateRef.current;
     const drv = getDriver(s.driverId);
     // Same guard as the Generate button (the Ctrl/Cmd+Enter shortcut lands here too).
-    if (!s.source || !drv || jobRef.current || aiJobRef.current || loadingRef.current || !canGenerate(s, availabilityRef.current, drv)) return;
+    if (!s.source || !drv || jobRef.current || aiJobRef.current || loadingRef.current || viewDecodes.current > 0) return;
+    if (!canGenerate(s, availabilityRef.current, drv)) return;
+    if (!opts?.confirmed && hasUnsavedModelEdits(s)) {
+      dispatch({ type: 'setRegenConfirm', open: true });
+      return;
+    }
     const ctrl = new AbortController();
     jobRef.current = ctrl;
     const source = s.source;
@@ -469,7 +540,7 @@ export function useStudio() {
 
   /** Starts the one AI job (null when another job / a decode is in the way). */
   const startAiJob = useCallback((kind: AiJobKind, target: OtherViewId | 'all' | null) => {
-    if (aiJobRef.current || jobRef.current || loadingRef.current) return null;
+    if (aiJobRef.current || jobRef.current || loadingRef.current || viewDecodes.current > 0) return null;
     const ctrl = new AbortController();
     aiJobRef.current = ctrl;
     const isCurrent = () => aiJobRef.current === ctrl;
@@ -497,13 +568,15 @@ export function useStudio() {
     const s = stateRef.current;
     const source = s.source;
     if (!source) return;
-    const cfg = editProviderOf(s);
-    if (!cfg) {
-      dispatch({ type: 'aiJobFailed', kind: 'prep', error: s.aiSettings.providers.length ? UI.aiNoEditProvider : UI.aiNoProviders });
+    const needed = prepNeeded(s.prep);
+    if (!needed && !s.prep.removeBackground) {
+      dispatch({ type: 'aiJobFailed', kind: 'prep', error: UI.aiNothingToDo });
       return;
     }
-    if (!prepNeeded(s.prep)) {
-      dispatch({ type: 'aiJobFailed', kind: 'prep', error: UI.aiNothingToDo });
+    // Background removal alone needs no image-edit provider (see prepareFrontImage).
+    const cfg = needed ? editProviderOf(s) : null;
+    if (needed && !cfg) {
+      dispatch({ type: 'aiJobFailed', kind: 'prep', error: s.aiSettings.providers.length ? UI.aiNoEditProvider : UI.aiNoProviders });
       return;
     }
     const job = startAiJob('prep', null);
@@ -521,7 +594,7 @@ export function useStudio() {
       throwIfAborted(job.signal);
       if (!job.isCurrent()) return;
       job.finish();
-      dispatch({ type: 'prepReady', prepared });
+      dispatch({ type: 'prepReady', prepared, options: s.prep });
     } catch (e) {
       job.finish(e);
     }
@@ -533,9 +606,10 @@ export function useStudio() {
       const s = stateRef.current;
       const source = s.source;
       if (!source || targets.length === 0) return;
-      const cfg = editProviderOf(s);
+      const cfg = viewProviderOf(s);
       if (!cfg) {
-        dispatch({ type: 'aiJobFailed', kind: 'views', error: s.aiSettings.providers.length ? UI.aiNoEditProvider : UI.aiNoProviders });
+        const error = editProviderOf(s) ? UI.aiNoViewProvider : s.aiSettings.providers.length ? UI.aiNoEditProvider : UI.aiNoProviders;
+        dispatch({ type: 'aiJobFailed', kind: 'views', error });
         return;
       }
       const job = startAiJob('views', busy);
@@ -556,6 +630,7 @@ export function useStudio() {
             onProgress: job.onProgress,
             isHuman,
             bgProvider: bgProviderOf(s),
+            frontPrep: s.frontPrep,
           });
           throwIfAborted(job.signal);
           const entry = await decodeView(blob, aiFileName(source.name, view), 'ai');
@@ -581,11 +656,19 @@ export function useStudio() {
     );
   }, [runViews]);
 
-  /** Background removal (local MODNet) for an uploaded view without a usable mask, in the AI background mode. */
+  /**
+   * Background removal (local MODNet) for an uploaded view without a usable
+   * mask, in the AI background mode. When another job is running it is queued
+   * and runs once that job ends.
+   */
   const removeViewBackground = useCallback(
     async (view: OtherViewId, entry: ViewEntry) => {
       const job = startAiJob('views', view);
-      if (!job) return;
+      if (!job) {
+        bgPending.current.set(view, entry);
+        return;
+      }
+      bgPending.current.delete(view);
       try {
         job.onProgress({ label: UI.removingViewBg });
         const mask = await resolveMask(entry.image, 'ai', { signal: job.signal, onProgress: job.onProgress });
@@ -600,22 +683,52 @@ export function useStudio() {
     [startAiJob],
   );
 
+  /**
+   * Runs the next queued background removal once nothing is in the way (one
+   * at a time; a view replaced, cleared or no longer in the AI mode is skipped).
+   */
+  const drainBgQueue = useCallback(() => {
+    if (jobRef.current || aiJobRef.current || loadingRef.current || viewDecodes.current > 0) return;
+    const s = stateRef.current;
+    for (const [view, entry] of bgPending.current) {
+      bgPending.current.delete(view);
+      if (s.bgMode === 'ai' && s.views[view] === entry && !entry.mask) {
+        void removeViewBackground(view, entry);
+        return;
+      }
+    }
+  }, [removeViewBackground]);
+
   const uploadView = useCallback(
     async (view: OtherViewId, file: File) => {
       if (aiJobRef.current) return; // the slots are locked while an AI job runs
       const seq = viewSeq.current;
+      viewDecodes.current++;
+      let entry: ViewEntry;
       try {
-        const entry = await decodeView(file, file.name || `${view}.png`, 'upload');
-        if (seq !== viewSeq.current || !stateRef.current.source) return;
-        dispatch({ type: 'viewSet', view, entry });
-        if (!entry.mask && stateRef.current.bgMode === 'ai') void removeViewBackground(view, entry);
+        entry = await decodeView(file, file.name || `${view}.png`, 'upload');
       } catch (e) {
         if (seq !== viewSeq.current) return;
         dispatch({ type: 'aiJobFailed', kind: 'views', error: errorToText(e) });
+        return;
+      } finally {
+        viewDecodes.current--;
       }
+      // A views job would not use the upload as a reference and could overwrite it.
+      if (seq !== viewSeq.current || !stateRef.current.source || aiJobRef.current) return;
+      dispatch({ type: 'viewSet', view, entry });
+      // Queued (see drainBgQueue) when another job or decode is in the way.
+      if (!entry.mask && stateRef.current.bgMode === 'ai') void removeViewBackground(view, entry);
+      else drainBgQueue();
     },
-    [removeViewBackground],
+    [removeViewBackground, drainBgQueue],
   );
+
+  // Queued background removals start when the job in the way ends.
+  const jobsIdle = state.status !== 'running' && !state.aiJob && !state.loadingImage;
+  useEffect(() => {
+    if (jobsIdle) drainBgQueue();
+  }, [jobsIdle, drainBgQueue]);
 
   const clearView = useCallback((view: OtherViewId) => {
     if (aiJobRef.current) return;
@@ -643,7 +756,10 @@ export function useStudio() {
 
   // ---------------------------------------------------------------- model edits
 
-  const onSculptEdited = useCallback((stats: MeshStats) => dispatch({ type: 'sculptEdited', stats }), []);
+  /** `strokes`: the session's stroke count after the edit (0 after undoing / resetting everything). */
+  const onSculptEdited = useCallback((stats: MeshStats, strokes?: number) => dispatch({ type: 'sculptEdited', stats, strokes }), []);
+  /** A new sculpt session starts from the geometry as it is now. */
+  const onSculptSession = useCallback(() => dispatch({ type: 'sculptSessionStart' }), []);
   const onSculptActive = useCallback((active: boolean) => dispatch({ type: 'setSculptActive', active }), []);
 
   /** Throws the sculpt edits away: rebuilds the depth surface from the cached depth. */
@@ -718,14 +834,19 @@ export function useStudio() {
     return () => window.removeEventListener('paste', onPaste);
   }, [loadFile]);
 
-  // Ctrl/Cmd + Enter generates, Escape cancels (the 3D job first, else the AI job).
+  // Ctrl/Cmd + Enter generates (asking first when that discards edits), Escape
+  // closes that question, else cancels (the 3D job first, else the AI job).
+  // Not while typing in a field or a dialog, and not in sculpt mode, where Ctrl
+  // is held down to invert the brush.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        if (e.defaultPrevented || isShortcutExcluded(e.target) || stateRef.current.sculptActive) return;
         e.preventDefault();
         void generate();
       } else if (e.key === 'Escape') {
-        if (jobRef.current) cancel();
+        if (stateRef.current.regenConfirm) dispatch({ type: 'setRegenConfirm', open: false });
+        else if (jobRef.current) cancel();
         else if (aiJobRef.current) cancelAi();
       }
     };
@@ -750,6 +871,8 @@ export function useStudio() {
       clearImage,
       setBgMode,
       generate,
+      confirmRegenerate: () => void generate({ confirmed: true }),
+      cancelRegenerate: () => dispatch({ type: 'setRegenConfirm', open: false }),
       cancel,
       setLang: (lang: Lang) => dispatch({ type: 'setLang', lang }),
       setTheme: (theme: Theme) => dispatch({ type: 'setTheme', theme }),
@@ -786,6 +909,7 @@ export function useStudio() {
       detectHuman,
       // Model edits
       onSculptEdited,
+      onSculptSession,
       onSculptActive,
       discardSculpt,
       onRigChanged,
@@ -811,6 +935,7 @@ export function useStudio() {
       clearView,
       detectHuman,
       onSculptEdited,
+      onSculptSession,
       onSculptActive,
       discardSculpt,
       onRigChanged,
@@ -831,6 +956,7 @@ export function useStudio() {
     coreRef,
     editProviders,
     editProvider,
+    viewProvider,
     actions,
   };
 }

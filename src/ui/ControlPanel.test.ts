@@ -52,6 +52,7 @@ beforeEach(async () => {
   mocks.analyzeHuman.mockReset().mockResolvedValue({ width: 2, height: 2, faces: [], hands: [], poses: [], isHuman: false });
   vi.stubGlobal('fetch', vi.fn(async () => new Response('not found', { status: 404, headers: { 'content-type': 'text/html' } })));
   vi.spyOn(console, 'warn').mockImplementation(() => {});
+  vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(null); // view thumbnails (no canvas in jsdom)
   host = document.createElement('div');
   document.body.append(host);
   root = createRoot(host);
@@ -108,6 +109,54 @@ describe('ControlPanel', () => {
     await act(async () => studio.actions.setAiSettings({ providers: [stability], defaults: {}, rememberKeys: false }));
     await act(async () => studio.actions.setStep('views'));
     expect(q('views-ai-reason')!.textContent).toMatch(/My Stability: .*server/);
+  });
+
+  it('extra views the selected driver ignores: a note with a switch to multi-view fusion (step 4, Generate, Views)', async () => {
+    await act(async () => studio.actions.loadFile(new Blob(['a']), 'a.png'));
+    await act(async () => studio.actions.selectDriver('depth-anything-v2-small'));
+    expect(q('generate-views-unused')).toBeNull(); // no views yet
+    await act(async () => studio.actions.uploadView('back', new File(['b'], 'back.png')));
+    expect(studio.state.views.back).toBeDefined();
+    expect(q('generate-views-unused')!.textContent).toContain('does not use your 1 extra views');
+
+    await act(async () => studio.actions.setStep('views'));
+    await act(async () => q('views-use-fusion')!.click());
+    expect(studio.state).toMatchObject({ driverId: 'multiview-fusion', step: '3d' });
+    expect(q('views-unused')).toBeNull();
+    expect(q('generate-views-unused')).toBeNull();
+
+    await act(async () => studio.actions.selectDriver('depth-anything-v2-small'));
+    expect(q('views-unused')!.textContent).toContain('front image only');
+    await act(async () => q('views-unused-fusion')!.click());
+    expect(studio.state.driverId).toBe('multiview-fusion');
+    expect(q('views-unused')).toBeNull();
+    await act(async () => studio.actions.setStep('views'));
+    expect(q('views-use-fusion')).toBeNull(); // fusion uses them already
+  });
+
+  it('without an image, Generate links back to the image step', async () => {
+    await act(async () => studio.actions.setStep('rig'));
+    expect(q('generate-blocked')!.textContent).toContain('Upload an image first');
+    await act(async () => q('generate-blocked-action')!.click());
+    expect(studio.state.step).toBe('image');
+    expect(q('generate-blocked-action')).toBeNull();
+  });
+
+  it('Generate warns about and confirms discarding sculpt edits', async () => {
+    await act(async () => studio.actions.loadFile(new Blob(['a']), 'a.png'));
+    await act(async () => studio.actions.selectDriver('silhouette-extrude'));
+    expect(q('generate-warning')).toBeNull();
+    await act(async () => studio.actions.onSculptEdited({ vertices: 3, triangles: 1, watertight: false }, 2));
+    expect(q('generate-warning')!.textContent).toBe('Regenerating discards your sculpt edits.');
+    await act(async () => q('generate')!.click());
+    expect(q('generate')).toBeNull();
+    expect(q('generate-confirm-box')!.textContent).toContain('discards your sculpt edits');
+    expect(studio.state.status).toBe('idle');
+    await act(async () => q('generate-confirm-cancel')!.click());
+    expect(q('generate-confirm-box')).toBeNull();
+    expect(q('generate')).not.toBeNull();
+    await act(async () => studio.actions.onSculptEdited({ vertices: 3, triangles: 1, watertight: false }, 0)); // reset
+    expect(q('generate-warning')).toBeNull();
   });
 
   it('step 4 shows the human-detail note for drivers with that badge', async () => {

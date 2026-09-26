@@ -85,9 +85,14 @@ export interface CropJob {
   open: { left: boolean; right: boolean; top: boolean; bottom: boolean };
 }
 
-/** Crop boxes worth a high-res pass: faces first, then hands, largest first, at most `maxCrops`. */
-export function planCrops(a: HumanAnalysis, opts: { maxCrops: number; faces: boolean; hands: boolean }): CropJob[] {
+/**
+ * Crop boxes worth a high-res pass: faces first, then hands, largest first, at
+ * most `maxCrops`. `sideRatio` = crop inference side / global inference side
+ * (default 1).
+ */
+export function planCrops(a: HumanAnalysis, opts: { maxCrops: number; faces: boolean; hands: boolean; sideRatio?: number }): CropJob[] {
   const { width: W, height: H } = a;
+  const sideRatio = opts.sideRatio !== undefined && opts.sideRatio > 0 && Number.isFinite(opts.sideRatio) ? opts.sideRatio : 1;
   const jobs: (CropJob & { area: number; rank: number })[] = [];
   const add = (kind: 'face' | 'hand', b: Box, rank: number) => {
     const side = Math.max(b.width, b.height);
@@ -97,8 +102,9 @@ export function planCrops(a: HumanAnalysis, opts: { maxCrops: number; faces: boo
     const x1 = Math.min(W, Math.ceil(b.x + b.width + m)), y1 = Math.min(H, Math.ceil(b.y + b.height + m));
     const w = x1 - x0, h = y1 - y0;
     if (w < MIN_DETAIL_SIDE || h < MIN_DETAIL_SIDE) return;
-    // Same model input budget for the crop as for the whole image: gain = sqrt(area ratio).
-    if (Math.sqrt((W * H) / (w * h)) < MIN_CROP_GAIN) return;
+    // Model input budgets scale as side² (square-equivalent), so the resolution
+    // gain over the global pass = (crop side / global side) · sqrt(area ratio).
+    if (sideRatio * Math.sqrt((W * H) / (w * h)) < MIN_CROP_GAIN) return;
     jobs.push({
       kind,
       box: { x: x0, y: y0, width: w, height: h },
@@ -309,7 +315,7 @@ export async function enhanceHumanDepth(
 
   // (a) High-res crop pass.
   if (opts.refineCrop) {
-    const jobs = planCrops({ ...a, faces, hands }, { maxCrops: opts.maxCrops ?? DEFAULT_MAX_CROPS, faces: true, hands: true });
+    const jobs = planCrops({ ...a, faces, hands }, { maxCrops: opts.maxCrops ?? DEFAULT_MAX_CROPS, faces: true, hands: true, sideRatio: opts.cropSideRatio });
     for (let i = 0; i < jobs.length; i++) {
       const job = jobs[i];
       onProgress?.({ label: cropLabel(job.kind, i + 1, jobs.length), ratio: i / jobs.length });

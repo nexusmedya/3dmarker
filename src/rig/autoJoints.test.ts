@@ -75,6 +75,9 @@ describe('autoPlaceJoints – silhouette heuristic (no pose)', () => {
       expect(r.layout[b]!.y).toBeLessThanOrEqual(0.81);
     }
     expectSymmetric(r.layout);
+    // Arms hang along the sides (relaxed pose), not horizontal.
+    expect(r.layout.LeftHand!.y).toBeLessThan(r.layout.LeftArm!.y - 0.2);
+    expect(r.layout.LeftHand!.x).toBeGreaterThan(r.layout.LeftArm!.x);
     const box = autoPlaceJointsDetailed(new Mesh(new BoxGeometry(0.6, 2, 0.4)));
     expect(box.method).toBe('proportional');
     expect(box.layout.HeadTop_End!.y).toBeCloseTo(1, 1);

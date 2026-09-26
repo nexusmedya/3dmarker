@@ -16,8 +16,10 @@
  *    the heuristic layout relative to their parent joint.
  *  - Without pose: a T-pose heuristic from the silhouette (arm band = widest
  *    rows, neck = narrowest row above it, crotch = first row below the torso
- *    whose centre is empty, feet = lowest rows); anything that does not look
- *    like a T-pose gets a symmetric proportional skeleton in its bounds.
+ *    whose centre is empty, feet = lowest rows); then an arms-down / A-pose
+ *    reading (a line fitted through the outer limb runs beside the torso);
+ *    anything else gets a symmetric proportional skeleton in its bounds, its
+ *    arms hanging along the torso sides (the most common real-world pose).
  */
 import { Box3, Vector3 } from 'three';
 import type { Object3D } from 'three';
@@ -38,7 +40,7 @@ export interface AutoJointOptions {
   resolution?: number;
 }
 
-export type JointMethod = 'pose' | 'silhouette' | 'proportional';
+export type JointMethod = 'pose' | 'silhouette' | 'arms-down' | 'proportional';
 
 export interface AutoJointResult {
   layout: JointLayout;
@@ -237,12 +239,16 @@ function occupiedFrame(s: Silhouette): Frame2D | null {
   return { cx: (left + right) / 2, bottom, top, H: Math.max(top - bottom, s.cell), halfW: (right - left) / 2 };
 }
 
-/** Symmetric skeleton with average human proportions inside the model's bounds (arms horizontal). */
+/** Arms hang this far below horizontal in the proportional fallback (relaxed pose). */
+const HANGING_ARM_DEG = 75;
+
+/** Symmetric skeleton with average human proportions inside the model's bounds (arms hanging along the torso sides). */
 function proportionalLayout(f: Frame2D): Record<CoreBone, XY> {
   const { cx, bottom: y0, H } = f;
   const reach = Math.max(Math.min(f.halfW * 0.95, 0.47 * H), 0.2 * H);
   const armX = Math.min(0.1 * H, 0.45 * reach);
-  const handX = Math.max(reach - 0.08 * H, armX + 0.12 * H);
+  // Upper arm + forearm ≈ 0.34 H, hanging HANGING_ARM_DEG below horizontal (wrist ≈ 0.48 H).
+  const a = (HANGING_ARM_DEG * Math.PI) / 180, len = 0.34 * H;
   const legX = Math.min(0.09 * H, Math.max(0.3 * f.halfW, 0.04 * H));
   const armY = y0 + 0.81 * H;
   const out = {} as Record<CoreBone, XY>;
@@ -256,8 +262,8 @@ function proportionalLayout(f: Frame2D): Record<CoreBone, XY> {
     const S = sgn > 0 ? 'Left' : 'Right';
     set(`${S}Shoulder` as CoreBone, cx + sgn * 0.3 * armX, armY + 0.02 * H);
     set(`${S}Arm` as CoreBone, cx + sgn * armX, armY);
-    set(`${S}ForeArm` as CoreBone, cx + sgn * (armX + 0.55 * (handX - armX)), armY);
-    set(`${S}Hand` as CoreBone, cx + sgn * handX, armY);
+    set(`${S}ForeArm` as CoreBone, cx + sgn * (armX + 0.55 * len * Math.cos(a)), armY - 0.55 * len * Math.sin(a));
+    set(`${S}Hand` as CoreBone, cx + sgn * (armX + len * Math.cos(a)), armY - len * Math.sin(a));
     set(`${S}UpLeg` as CoreBone, cx + sgn * legX, y0 + 0.51 * H);
     set(`${S}Leg` as CoreBone, cx + sgn * legX, y0 + 0.28 * H);
     set(`${S}Foot` as CoreBone, cx + sgn * legX, y0 + 0.045 * H);
@@ -404,6 +410,95 @@ function tposeLayout(s: Silhouette, f: Frame2D): Record<CoreBone, XY> | null {
     out[`${S}Leg` as CoreBone] = { x: kneeX, y: kneeY };
     out[`${S}Foot` as CoreBone] = { x: footX, y: footY };
     out[`${S}ToeBase` as CoreBone] = { x: footX, y: f.bottom + 0.015 * H };
+  }
+  return out;
+}
+
+/**
+ * Arms-down / A-pose reading of the silhouette: below the shoulders the arms
+ * show up as separate runs outside the torso (or outside the two legs, lower
+ * down). A least-squares line x = a + b·y through each side's outer run
+ * centres gives the arm axis; the arm joints go along it (the rest of the
+ * skeleton is proportional). Null when either arm is not found.
+ */
+function armsDownLayout(s: Silhouette, f: Frame2D): Record<CoreBone, XY> | null {
+  const { cx, bottom, H } = f;
+  const cxCol = colOf(s, cx);
+  const pts: [XY[], XY[]] = [[], []]; // left (+x), right (-x)
+  const low = [Infinity, Infinity];
+  const done = [false, false], lastJ = [-1, -1];
+  for (let j = rowOf(s, bottom + 0.78 * H); j >= rowOf(s, bottom + 0.3 * H); j--) {
+    const runs = mergedRuns(s, j);
+    if (runs.length < 2) continue;
+    // Inner runs: the torso (containing the centre) or, below the crotch, the two legs flanking it.
+    let lo = runs.findIndex((r) => r.i0 <= cxCol && r.i1 >= cxCol), hi = lo;
+    if (lo < 0) {
+      hi = runs.findIndex((r) => r.i0 > cxCol);
+      lo = hi - 1;
+      if (lo < 0 || hi < 0 || cx - cellX(s, runs[lo].i1) > 0.15 * H || cellX(s, runs[hi].i0) - cx > 0.15 * H) continue;
+    }
+    const y = cellY(s, j);
+    for (const [side, r, inner] of [[0, runs[runs.length - 1], runs[hi]], [1, runs[0], runs[lo]]] as const) {
+      if (done[side] || r === inner || runWidth(s, r) > 0.12 * H) continue;
+      const gap = side === 0 ? r.i0 - inner.i1 - 1 : inner.i0 - r.i1 - 1;
+      if (gap < 1) continue;
+      // One continuous limb from the top: a jump (e.g. to a leg below the hand) ends the chain.
+      const x = runCenter(s, r), prev = pts[side][pts[side].length - 1];
+      if (prev && (lastJ[side] - j > 3 || Math.abs(x - prev.x) > Math.max(4 * s.cell, 0.02 * H))) {
+        done[side] = true;
+        continue;
+      }
+      lastJ[side] = j;
+      pts[side].push({ x, y });
+      low[side] = Math.min(low[side], y - s.cell / 2);
+    }
+  }
+  const lines: { a: number; b: number; yLow: number }[] = [];
+  for (const side of [0, 1] as const) {
+    const p = pts[side], sgn = side === 0 ? 1 : -1;
+    if (p.length < 3) return null;
+    let my = 0, mx = 0;
+    for (const q of p) {
+      my += q.y;
+      mx += q.x;
+    }
+    my /= p.length;
+    mx /= p.length;
+    let syy = 0, sxy = 0;
+    for (const q of p) {
+      syy += (q.y - my) ** 2;
+      sxy += (q.y - my) * (q.x - mx);
+    }
+    if (syy < 1e-12) return null;
+    const b = sxy / syy, a = mx - b * my;
+    // Length covered along the line, and its angle below horizontal (x grows outwards going down).
+    const yTop = p[0].y, yLow = low[side];
+    const len = Math.hypot(yTop - yLow, b * (yTop - yLow));
+    const deg = (Math.atan2(1, -sgn * b) * 180) / Math.PI;
+    if (len < 0.15 * H || !(deg >= 20 && deg <= 95)) return null;
+    // The fit must be good (an arm, not scattered clutter).
+    let err = 0;
+    for (const q of p) err = Math.max(err, Math.abs(a + b * q.y - q.x));
+    if (err > 0.04 * H) return null;
+    lines.push({ a, b, yLow });
+  }
+  const out = proportionalLayout(f);
+  const shoulderY = bottom + 0.8 * H;
+  for (const side of [0, 1] as const) {
+    const { a, b, yLow } = lines[side], sgn = side === 0 ? 1 : -1;
+    const S = sgn > 0 ? 'Left' : 'Right';
+    const xAt = (y: number) => a + b * y;
+    // The arm merges with the torso near the shoulder: extrapolate the axis up to shoulder height.
+    const armY = Math.max(shoulderY, pts[side][0].y);
+    const armX = sgn * (xAt(armY) - cx) >= 0.04 * H ? xAt(armY) : cx + sgn * 0.04 * H;
+    // Wrist ≈ 0.09 H back from the fingertips along the line.
+    const dirLen = Math.hypot(1, b);
+    const handY = Math.min(yLow + (0.09 * H) / dirLen, armY - 0.1 * H);
+    const hand = { x: xAt(handY), y: handY };
+    out[`${S}Arm` as CoreBone] = { x: armX, y: armY };
+    out[`${S}ForeArm` as CoreBone] = { x: armX + 0.55 * (hand.x - armX), y: armY + 0.55 * (hand.y - armY) };
+    out[`${S}Hand` as CoreBone] = hand;
+    out[`${S}Shoulder` as CoreBone] = { x: cx + 0.3 * (armX - cx), y: armY + 0.02 * H };
   }
   return out;
 }
@@ -563,11 +658,12 @@ export function autoPlaceJointsDetailed(root: Object3D, opts: AutoJointOptions =
   const data = opts.meshData ?? collectMeshData(root);
   const s = buildSilhouette(data, opts.resolution ?? 192);
   const f = occupiedFrame(s) ?? { cx: 0, bottom: -1, top: 1, H: 2, halfW: 1 };
-  const t = tposeLayout(s, f);
-  const heurXY = t ?? proportionalLayout(f);
+  const down = armsDownLayout(s, f);
+  const t = down ? null : tposeLayout(s, f);
+  const heurXY = t ?? down ?? proportionalLayout(f);
   const heuristic = toLayout(s, heurXY, f.H);
   fixToes(s, heuristic, f);
-  let method: JointMethod = t ? 'silhouette' : 'proportional';
+  let method: JointMethod = t ? 'silhouette' : down ? 'arms-down' : 'proportional';
   let layout = heuristic;
 
   const { pose, imageSize } = opts;

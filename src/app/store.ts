@@ -23,7 +23,7 @@ import { detectLang, type UIKey } from './i18n';
 import { suggestedMeshMode } from './driverMeta';
 import { isBackgroundMode, type BackgroundMode, type MaskNote, type SourceImage } from './pipeline';
 import { loadJSON, persistableParams, sanitizeParams, saveJSON, type KeyValueStore } from './persist';
-import { isStepId, type StepId } from './steps';
+import type { StepId } from './steps';
 
 export type Theme = 'dark' | 'light';
 export type JobStatus = 'idle' | 'running' | 'done' | 'error' | 'cancelled';
@@ -135,6 +135,13 @@ export interface AppState {
   viewsError: I18nText | null;
   /** AI-prepared front image awaiting Accept / Discard. */
   prepared: SourceImage | null;
+  /** The prep options that produced `prepared`. */
+  preparedWith: PrepOptions | null;
+  /**
+   * The prep options that produced the current front (an accepted
+   * preparation; null for an original image). Views repeat its instructions.
+   */
+  frontPrep: PrepOptions | null;
   /** The source before an accepted AI preparation ("Revert to original"). */
   original: SourceImage | null;
   views: ViewEntries;
@@ -144,9 +151,19 @@ export interface AppState {
   sculptActive: boolean;
   /** The model on screen carries sculpt edits (live re-meshing is paused). */
   sculpted: boolean;
+  /**
+   * The current sculpt session started on geometry that already carried sculpt
+   * edits (an earlier session): undoing it back to 0 strokes does not make the
+   * model unsculpted.
+   */
+  sculptBase: boolean;
   /** The model on screen is rigged (skinned meshes; re-mesh and sculpt are off). */
   rigged: boolean;
   depthEditorOpen: boolean;
+  /** The model on screen is the result of a depth-map edit. */
+  depthEdited: boolean;
+  /** Generate was requested while the model carries edits: the panel asks before discarding them. */
+  regenConfirm: boolean;
 }
 
 export type Action =
@@ -190,7 +207,7 @@ export type Action =
   | { type: 'aiJobDone' }
   | { type: 'aiJobFailed'; kind: AiJobKind; error: I18nText }
   | { type: 'aiJobCancelled' }
-  | { type: 'prepReady'; prepared: SourceImage }
+  | { type: 'prepReady'; prepared: SourceImage; options?: PrepOptions }
   | { type: 'prepDiscard' }
   | { type: 'prepAccept'; mask: Mask | null; maskNote: MaskNote }
   | { type: 'revertOriginal'; mask: Mask | null; maskNote: MaskNote }
@@ -200,11 +217,14 @@ export type Action =
   | { type: 'viewClear'; view: OtherViewId }
   // Model edits
   | { type: 'setSculptActive'; active: boolean }
-  | { type: 'sculptEdited'; stats: MeshStats }
+  | { type: 'sculptSessionStart' }
+  /** `strokes`: the session's stroke count after the edit (undo / redo / reset included). */
+  | { type: 'sculptEdited'; stats: MeshStats; strokes?: number }
   | { type: 'sculptDiscarded'; stats: MeshStats }
   | { type: 'setRigged'; rigged: boolean }
   | { type: 'setDepthEditor'; open: boolean }
-  | { type: 'depthEdited'; stats: MeshStats; depthPreview: RGBAImage };
+  | { type: 'depthEdited'; stats: MeshStats; depthPreview: RGBAImage }
+  | { type: 'setRegenConfirm'; open: boolean };
 
 export const DEFAULT_VIEW: ViewSettings = {
   texture: true,
@@ -239,6 +259,8 @@ export function sanitizePrep(stored: unknown, base: PrepOptions = DEFAULT_PREP_O
 const freshSubject = (): Partial<AppState> => ({
     views: {},
     prepared: null,
+    preparedWith: null,
+    frontPrep: null,
     original: null,
     human: null,
     aiJob: null,
@@ -247,7 +269,25 @@ const freshSubject = (): Partial<AppState> => ({
 });
 
 /** A new model replaced the one on screen: edits / rig belonged to the old one. */
-const freshModel: Partial<AppState> = { sculpted: false, sculptActive: false, rigged: false, depthEditorOpen: false };
+const freshModel: Partial<AppState> = {
+  sculpted: false,
+  sculptActive: false,
+  sculptBase: false,
+  rigged: false,
+  depthEditorOpen: false,
+  depthEdited: false,
+  regenConfirm: false,
+};
+
+/** Views made by AI from the previous front: dropped when the front changes (uploads are kept). */
+function withoutAiViews(views: ViewEntries): ViewEntries {
+  const out: ViewEntries = {};
+  for (const id of OTHER_VIEWS) {
+    const v = views[id];
+    if (v && v.origin !== 'ai') out[id] = v;
+  }
+  return out;
+}
 
 export function reducer(state: AppState, action: Action): AppState {
   switch (action.type) {
@@ -325,7 +365,7 @@ export function reducer(state: AppState, action: Action): AppState {
     case 'resetMeshParams':
       return { ...state, meshParams: defaultParams(MESH_PARAMS), meshNotice: null, pendingMeshMode: null };
     case 'jobStart':
-      return { ...state, status: 'running', progress: null, error: null };
+      return { ...state, status: 'running', progress: null, error: null, regenConfirm: false };
     case 'jobProgress':
       return state.status === 'running' ? { ...state, progress: action.progress } : state;
     case 'jobDone': {
@@ -407,19 +447,26 @@ export function reducer(state: AppState, action: Action): AppState {
     case 'dismissAiError':
       return action.kind === 'prep' ? { ...state, prepError: null } : { ...state, viewsError: null };
     case 'prepReady':
-      return { ...state, aiJob: null, prepError: null, prepared: action.prepared };
+      return { ...state, aiJob: null, prepError: null, prepared: action.prepared, preparedWith: action.options ?? null };
     case 'prepDiscard':
-      return { ...state, prepared: null };
+      return { ...state, prepared: null, preparedWith: null };
     case 'prepAccept': {
       const prepared = state.prepared;
       if (!prepared || !state.source) return state;
-      // The prepared image becomes the front; the extra views are kept (they
-      // may have been made for it) and the first original is remembered.
+      // The prepared image becomes the front and the first original is
+      // remembered. AI views were generated from the previous front (never from
+      // a pending prepared image): they no longer match it and are dropped;
+      // uploaded views are kept (they may have been made for it).
+      const views = withoutAiViews(state.views);
       return {
         ...state,
+        views,
+        viewsError: null,
         source: prepared,
         original: state.original ?? state.source,
         prepared: null,
+        preparedWith: null,
+        frontPrep: state.preparedWith,
         mask: action.mask,
         maskNote: action.maskNote,
         aiMask: null,
@@ -428,7 +475,18 @@ export function reducer(state: AppState, action: Action): AppState {
     }
     case 'revertOriginal': {
       if (!state.original) return state;
-      return { ...state, source: state.original, original: null, mask: action.mask, maskNote: action.maskNote, aiMask: null, human: null };
+      return {
+        ...state,
+        views: withoutAiViews(state.views),
+        viewsError: null,
+        source: state.original,
+        original: null,
+        frontPrep: null,
+        mask: action.mask,
+        maskNote: action.maskNote,
+        aiMask: null,
+        human: null,
+      };
     }
 
     case 'viewSet':
@@ -442,13 +500,18 @@ export function reducer(state: AppState, action: Action): AppState {
 
     case 'setSculptActive':
       return state.sculptActive === action.active ? state : { ...state, sculptActive: action.active };
+    case 'sculptSessionStart':
+      // A new session's history starts from the geometry as it is now.
+      return state.sculptBase === state.sculpted ? state : { ...state, sculptBase: state.sculpted };
     case 'sculptEdited': {
-      const next: AppState = { ...state, sculpted: true };
+      // Back to 0 strokes (undo / reset) is the session's starting geometry.
+      const sculpted = action.strokes === undefined ? true : action.strokes > 0 || state.sculptBase;
+      const next: AppState = { ...state, sculpted };
       if (state.result) next.result = { ...state.result, stats: action.stats };
       return next;
     }
     case 'sculptDiscarded': {
-      const next: AppState = { ...state, sculpted: false };
+      const next: AppState = { ...state, sculpted: false, sculptBase: false, regenConfirm: false };
       if (state.result) next.result = { ...state.result, stats: action.stats };
       return next;
     }
@@ -460,8 +523,11 @@ export function reducer(state: AppState, action: Action): AppState {
       return {
         ...state,
         ...freshModel,
+        depthEdited: true,
         result: state.result ? { ...state.result, kind: 'depth', stats: action.stats, depthPreview: action.depthPreview } : state.result,
       };
+    case 'setRegenConfirm':
+      return state.regenConfirm === action.open ? state : { ...state, regenConfirm: action.open };
   }
 }
 
@@ -522,6 +588,11 @@ export function canGenerate(state: AppState, availability: Availability | 'check
   return generateBlock(state, availability, driver) === null;
 }
 
+/** The model on screen carries work a new generation would throw away (sculpt, rig or depth edits). */
+export function hasUnsavedModelEdits(state: Pick<AppState, 'sculpted' | 'rigged' | 'depthEdited'>): boolean {
+  return state.sculpted || state.rigged || state.depthEdited;
+}
+
 /** Live re-meshing is paused while the model carries sculpt edits, is being sculpted or is rigged. */
 export function remeshPaused(state: Pick<AppState, 'sculpted' | 'sculptActive' | 'rigged'>): boolean {
   return state.sculpted || state.sculptActive || state.rigged;
@@ -535,7 +606,6 @@ interface StoredSettings {
   view?: unknown;
   stlSizeMm?: unknown;
   showMask?: unknown;
-  step?: unknown;
   aiProviderId?: unknown;
 }
 
@@ -597,7 +667,8 @@ export function createInitialState(env: InitEnv): AppState {
     result: null,
     view,
     stlSizeMm: stl,
-    step: isStepId(settings.step) ? settings.step : 'image',
+    // No image survives a reload, so every later step would open empty.
+    step: 'image',
     aiSettings,
     serverAvailable: false,
     serverChecked: false,
@@ -609,12 +680,17 @@ export function createInitialState(env: InitEnv): AppState {
     prepError: null,
     viewsError: null,
     prepared: null,
+    preparedWith: null,
+    frontPrep: null,
     original: null,
     views: {},
     sculptActive: false,
     sculpted: false,
+    sculptBase: false,
     rigged: false,
     depthEditorOpen: false,
+    depthEdited: false,
+    regenConfirm: false,
   };
 }
 
@@ -635,7 +711,6 @@ export function saveState(store: KeyValueStore | null, state: AppState, drivers:
     view: darkBackground === (state.theme === 'dark') ? view : state.view,
     stlSizeMm: state.stlSizeMm,
     showMask: state.showMask,
-    step: state.step,
     aiProviderId: state.aiProviderId ?? undefined,
   });
   saveJSON(store, 'mesh', state.meshParams);

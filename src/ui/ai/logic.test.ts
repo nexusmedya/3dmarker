@@ -35,7 +35,7 @@ describe('provider settings edits', () => {
     expect(a.settings.providers).toHaveLength(1);
     expect(a.settings.providers[0]).toMatchObject({ id: a.id, kind: 'openai', label: 'OpenAI', apiKey: '', enabled: true });
     expect(a.settings.defaults['image-edit']).toBe(a.id);
-    expect(a.settings.defaults['background-removal']).toBe(a.id);
+    expect(a.settings.defaults['background-removal']).toBeUndefined(); // OpenAI only re-renders: the local model stays the default
     const b = addProvider(a.settings, 'openai');
     expect(b.settings.providers[1].label).toBe('OpenAI 2');
     expect(b.settings.defaults['image-edit']).toBe(a.id); // an existing default is kept

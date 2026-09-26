@@ -14,6 +14,12 @@ import type { BuiltModel } from '../../app/pipeline';
 import { LangProvider } from '../i18n';
 import { SculptPanel } from './SculptPanel';
 import { fakeHost, gridGeometry } from '../../sculpt/testing';
+import { computeMeshStats } from '../../core/mesh/stats';
+
+vi.mock('../../core/mesh/stats', async (importOriginal) => {
+  const mod = await importOriginal<typeof import('../../core/mesh/stats')>();
+  return { ...mod, computeMeshStats: vi.fn(mod.computeMeshStats) };
+});
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -45,13 +51,13 @@ function mount(props: Partial<Parameters<typeof SculptPanel>[0]> & { lang?: 'tr'
   root = createRoot(container);
   const onEdited = vi.fn();
   const onActiveChange = vi.fn();
-  const render = (p: Partial<Parameters<typeof SculptPanel>[0]> = {}) =>
+  const render = (p: Partial<Parameters<typeof SculptPanel>[0]> & { mounted?: boolean } = {}) =>
     act(() =>
       root!.render(
         createElement(
           LangProvider,
           { value: props.lang ?? 'en' },
-          createElement(SculptPanel, { coreRef, model: null, enabled: true, onEdited, onActiveChange, ...props, ...p }),
+          p.mounted === false ? null : createElement(SculptPanel, { coreRef, model: null, enabled: true, onEdited, onActiveChange, ...props, ...p }),
         ),
       ),
     );
@@ -121,5 +127,77 @@ describe('SculptPanel', () => {
     const mesh2 = new Mesh(gridGeometry(8), new MeshBasicMaterial());
     render({ model: modelOf(mesh2) });
     expect(mesh.geometry.boundsTree).toBeUndefined();
+  });
+
+  const stroke = (canvas: HTMLCanvasElement, x = 50) => {
+    const fire = (type: string, cx: number) =>
+      canvas.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, pointerId: 1, isPrimary: true, button: 0, clientX: cx, clientY: 50, pointerType: 'mouse' }));
+    act(() => {
+      fire('pointerdown', x);
+      fire('pointermove', x + 5);
+      fire('pointerup', x + 5);
+    });
+  };
+  const startSculpt = async () => {
+    await act(async () => (q('[data-testid="sculpt-toggle"]') as HTMLButtonElement).click());
+    await flush();
+  };
+
+  it('keeps undo history and the pre-sculpt mesh after leaving the step (geometry models)', async () => {
+    const mesh = new Mesh(gridGeometry(16), new MeshBasicMaterial());
+    const model = modelOf(mesh);
+    const { canvas, render, core } = mount({ model });
+    const z0 = (mesh.geometry.getAttribute('position').array as Float32Array).slice();
+    await startSculpt();
+    stroke(canvas, 40);
+    stroke(canvas, 55);
+    expect(q('[data-testid="sculpt-strokes"]')!.dataset.strokes).toBe('2');
+
+    // Leave the Edit step (panel unmounted), then come back.
+    render({ model, mounted: false });
+    expect(core.overlays.size).toBe(0);
+    expect(core.orbit.at(-1)).toBe(true);
+    render({ model });
+    await startSculpt();
+    expect(q('[data-testid="sculpt-strokes"]')!.dataset.strokes).toBe('2');
+    const undo = q('[data-testid="sculpt-undo"]') as HTMLButtonElement;
+    expect(undo.disabled).toBe(false);
+    const reset = q('[data-testid="sculpt-reset"]') as HTMLButtonElement;
+    expect(reset.disabled).toBe(false);
+    act(() => reset.click());
+    expect(mesh.geometry.getAttribute('position').array).toEqual(z0);
+    act(() => undo.click());
+    expect(mesh.geometry.getAttribute('position').array).not.toEqual(z0);
+
+    // Busy / rigged (not enabled) only ends sculpt mode.
+    render({ model, enabled: false });
+    expect(q('[data-testid="sculpt-panel"]')!.dataset.active).toBe('false');
+    render({ model, enabled: true });
+    await startSculpt();
+    expect(q('[data-testid="sculpt-strokes"]')!.dataset.strokes).toBe('2');
+
+    // Another model: the kept session goes (BVH released), even while unmounted.
+    render({ model, mounted: false });
+    expect(mesh.geometry.boundsTree).toBeDefined();
+    render({ model: modelOf(new Mesh(gridGeometry(4), new MeshBasicMaterial())) });
+    expect(mesh.geometry.boundsTree).toBeUndefined();
+  });
+
+  it('computes mesh stats once per session, not after every stroke', async () => {
+    const mesh = new Mesh(gridGeometry(16), new MeshBasicMaterial());
+    const { canvas, onEdited } = mount({ model: modelOf(mesh) });
+    const spy = vi.mocked(computeMeshStats);
+    spy.mockClear();
+    await startSculpt();
+    const afterStart = spy.mock.calls.length;
+    expect(afterStart).toBe(1);
+    stroke(canvas, 40);
+    await act(async () => new Promise((r) => setTimeout(r, 400)));
+    stroke(canvas, 55);
+    act(() => (q('[data-testid="sculpt-undo"]') as HTMLButtonElement).click());
+    await act(async () => new Promise((r) => setTimeout(r, 400)));
+    expect(onEdited).toHaveBeenCalledTimes(2);
+    expect(onEdited.mock.calls[1][0]).toMatchObject({ vertices: 17 * 17, triangles: 16 * 16 * 2 });
+    expect(spy.mock.calls.length).toBe(afterStart);
   });
 });

@@ -16,7 +16,7 @@ import {
   VIEW_LABELS,
   viewAspect,
 } from './generate';
-import { T_POSE_PROMPT } from './prompts';
+import { ALPHA_BACKGROUND_PROMPT, T_POSE_PROMPT, WHITE_BACKGROUND_PROMPT } from './prompts';
 
 const saved = { ...aiTiming };
 beforeEach(() => Object.assign(aiTiming, saved, { pollMs: 1 }));
@@ -96,7 +96,7 @@ describe('prepareFrontImage', () => {
   });
 
   it('refuses kinds without image editing', async () => {
-    await expect(prepareFrontImage(pngBlob(), opts(), createProviderConfig('tripo', { apiKey: 'tsk_abcdefghij' }), ctx().ctx)).rejects.toMatchObject({ code: 'unsupported' });
+    await expect(prepareFrontImage(pngBlob(), opts({ styleId: 'marble' }), createProviderConfig('tripo', { apiKey: 'tsk_abcdefghij' }), ctx().ctx)).rejects.toMatchObject({ code: 'unsupported' });
   });
 });
 
@@ -112,8 +112,78 @@ describe('generateViewImage', () => {
     const prompt = String(form.get('prompt'));
     expect(prompt).toContain('image 1 is the front view, image 2 is the back view, image 3 is the left side view, image 4 is the top view');
     expect(prompt).toContain('The subject faces toward the RIGHT edge of the image.');
-    expect(form.get('background')).toBe('auto');
+    expect(form.get('background')).toBeNull();
     expect(progress[0].label).toEqual({ tr: 'Sağ görünüm üretiliyor (OpenAI)', en: 'Generating the right view (OpenAI)' });
+  });
+});
+
+describe('provider capabilities', () => {
+  const stability = () => createProviderConfig('stability', { id: 'server-st', managed: true });
+
+  it('refuses structure-preserving editors for new views, T-pose and body completion', async () => {
+    const net = fakeNet().on('POST', /control\/structure$/, new Response(pngBlob(), { headers: { 'content-type': 'image/png' } }));
+    vi.stubGlobal('fetch', net.fetch);
+    await expect(generateViewImage('back', { front: pngBlob(), others: {} }, opts(), stability(), ctx({ bgProvider: null }).ctx)).rejects.toMatchObject({ code: 'unsupported' });
+    await expect(prepareFrontImage(pngBlob(), opts({ tPose: true, subject: 'human' }), stability(), ctx({ bgProvider: null }).ctx)).rejects.toMatchObject({ code: 'unsupported' });
+    await expect(prepareFrontImage(pngBlob(), opts({ completeBody: true }), stability(), ctx({ bgProvider: null }).ctx)).rejects.toMatchObject({ code: 'unsupported' });
+    expect(net.calls).toHaveLength(0);
+    // A plain restyle is fine.
+    await prepareFrontImage(pngBlob(), opts({ styleId: 'marble', removeBackground: false }), stability(), ctx({ bgProvider: null }).ctx);
+    expect(net.calls).toHaveLength(1);
+  });
+
+  it('asks only alpha-capable models for a transparent background, the others for flat white', async () => {
+    const openai = openaiOk();
+    vi.stubGlobal('fetch', openai.fetch);
+    await prepareFrontImage(pngBlob(), opts({ styleId: 'marble' }), createProviderConfig('openai', { apiKey: 'sk-1' }), ctx({ bgProvider: null }).ctx);
+    expect(String(openai.calls[0].form!.get('prompt'))).toContain(ALPHA_BACKGROUND_PROMPT);
+
+    const gemini = fakeNet().on('POST', /generateContent$/, json({ candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: PNG_BASE64 } }] } }] }));
+    vi.stubGlobal('fetch', gemini.fetch);
+    const cfg = createProviderConfig('gemini', { apiKey: 'AIza' });
+    await prepareFrontImage(pngBlob(), opts({ styleId: 'marble' }), cfg, ctx({ bgProvider: null }).ctx);
+    await generateViewImage('back', { front: pngBlob(), others: {} }, opts(), cfg, ctx({ bgProvider: null }).ctx);
+    for (const call of gemini.calls) {
+      const text = (call.json as { contents: { parts: { text?: string }[] }[] }).contents[0].parts[0].text!;
+      expect(text).toContain(WHITE_BACKGROUND_PROMPT);
+      expect(text).not.toContain('transparent background');
+    }
+  });
+
+  it('sends single-image templates only the front, and says so in the prompt', async () => {
+    const net = fakeNet()
+      .on('POST', 'https://queue.fal.run/fal-ai/flux-pro/kontext', json({ request_id: 'k1' }))
+      .on('GET', /requests\/k1\/status$/, json({ status: 'COMPLETED' }))
+      .on('GET', /requests\/k1$/, json({ images: [{ url: `data:image/png;base64,${PNG_BASE64}` }] }));
+    vi.stubGlobal('fetch', net.fetch);
+    const cfg = createProviderConfig('fal', { apiKey: 'k:s', models: { 'image-edit': 'fal-ai/flux-pro/kontext' } });
+    await generateViewImage('top', { front: pngBlob(), others: { back: pngBlob(), left: pngBlob() } }, opts({ removeBackground: false }), cfg, ctx({ bgProvider: null }).ctx);
+    const input = net.calls[0].json as Record<string, unknown>;
+    expect(String(input.prompt)).toContain('The reference image shows the front view');
+    expect(String(input.prompt)).not.toContain('image 2');
+    expect(input.aspect_ratio).toBe('1:1'); // top views are square
+  });
+
+  it('keeps the reference images of one request within the byte budget', async () => {
+    const net = openaiOk();
+    vi.stubGlobal('fetch', net.fetch);
+    const big = () => new Blob([new Uint8Array(5 * 1024 * 1024)], { type: 'image/png' });
+    await generateViewImage('back', { front: big(), others: { left: big(), right: big(), top: big() } }, opts({ removeBackground: false }), createProviderConfig('openai', { apiKey: 'sk-1' }), ctx({ bgProvider: null }).ctx);
+    const form = net.calls[0].form!;
+    expect(form.getAll('image[]')).toHaveLength(2); // 5 + 5 MB fit in REF_BYTE_BUDGET, a third would not
+    expect(String(form.get('prompt'))).toContain('image 1 is the front view, image 2 is the left side view.');
+  });
+
+  it('removes the background alone without an image-edit call', async () => {
+    const net = openaiOk();
+    vi.stubGlobal('fetch', net.fetch);
+    const img = pngBlob();
+    // Node cannot decode: no provider → returned as is, and no edit request was made.
+    expect(await prepareFrontImage(img, opts({ removeBackground: true }), null, ctx({ bgProvider: null }).ctx)).toBe(img);
+    await prepareFrontImage(img, opts({ removeBackground: true }), null, ctx({ bgProvider: createProviderConfig('openai', { apiKey: 'sk-1' }) }).ctx);
+    expect(net.calls).toHaveLength(1);
+    expect(String(net.calls[0].form!.get('prompt'))).toMatch(/Remove the background/);
+    await expect(prepareFrontImage(img, opts({ styleId: 'marble' }), null, ctx().ctx)).rejects.toMatchObject({ code: 'unsupported' });
   });
 });
 

@@ -11,10 +11,9 @@
  * 'data-uri' encoding strategy). Output files are downloaded by URL.
  */
 import type { ProviderAdapter, ProviderConfig } from '../types';
-import { AbortError } from '../../core/types';
-import { aiFetch, AiError, aiTiming, AI_ERROR_TEXT, providerName, readJson, sleep } from '../transport';
+import { aiFetch, AiError, aiTiming, AI_ERROR_TEXT, providerName, readJson, sleep, withRetry } from '../transport';
 import { asGlb, asImage, PROGRESS, toModelPlan } from './common';
-import { runGeneric, type GenericRequest } from './generic';
+import { genericEditImageLimit, runGeneric, type GenericRequest } from './generic';
 
 export interface Prediction {
   id?: string;
@@ -55,10 +54,14 @@ export async function runPrediction(cfg: ProviderConfig, model: string, input: u
       'bad-request',
     );
   }
+  // Blocking creates (Prefer: wait) leave no id to cancel when the user aborts
+  // meanwhile, so long-running jobs (3D) are created without waiting and polled.
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (!req.longRunning) headers.Prefer = 'wait=60';
   let pred = await readJson<Prediction>(
     await aiFetch(cfg, create.path, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Prefer: 'wait=60' },
+      headers,
       body: JSON.stringify(create.body),
       signal,
     }),
@@ -73,10 +76,14 @@ export async function runPrediction(cfg: ProviderConfig, model: string, input: u
       if (Date.now() > deadline) throw new AiError(AI_ERROR_TEXT.timeout(name, Math.round(aiTiming.maxJobMs / 1000)), 'timeout');
       req.onProgress?.(pred.status === 'starting' ? PROGRESS.queued(name) : PROGRESS.generating(name, logPercent(pred.logs)));
       await sleep(aiTiming.pollMs, signal);
-      pred = await readJson<Prediction>(await aiFetch(cfg, `v1/predictions/${id}`, { method: 'GET', signal, timeoutMs: aiTiming.pollTimeoutMs }), name, signal);
+      pred = await withRetry(
+        async () => readJson<Prediction>(await aiFetch(cfg, `v1/predictions/${id}`, { method: 'GET', signal, timeoutMs: aiTiming.pollTimeoutMs }), name, signal),
+        { signal, deadline },
+      );
     }
   } catch (e) {
-    if (id && (signal.aborted || e instanceof AbortError)) cancelPrediction(cfg, id);
+    // Abort, timeout or a persistent polling error: stop the (billed) prediction unless it already ended.
+    if (id && !TERMINAL.has(pred.status ?? '')) cancelPrediction(cfg, id);
     throw e;
   }
   if (pred.status === 'succeeded') return pred.output;
@@ -90,7 +97,7 @@ export async function runPrediction(cfg: ProviderConfig, model: string, input: u
   );
 }
 
-/** Best-effort cancel after the user aborted (the job would otherwise keep billing). */
+/** Best-effort cancel of a prediction we stopped waiting for (it would otherwise keep billing). */
 function cancelPrediction(cfg: ProviderConfig, id: string): void {
   aiFetch(cfg, `v1/predictions/${id}/cancel`, { method: 'POST', signal: new AbortController().signal, timeoutMs: 15_000 }).catch(() => {});
 }
@@ -99,8 +106,9 @@ const run = (cfg: ProviderConfig) => (model: string, input: unknown, req: Generi
 
 export const replicateAdapter: ProviderAdapter = {
   kind: 'replicate',
+  editImageLimit: genericEditImageLimit,
   async editImage(cfg, req) {
-    const blob = await runGeneric(cfg, 'image-edit', { prompt: req.prompt, images: req.images, signal: req.signal, onProgress: req.onProgress }, 'image', run(cfg));
+    const blob = await runGeneric(cfg, 'image-edit', { prompt: req.prompt, images: req.images, aspect: req.aspect, signal: req.signal, onProgress: req.onProgress }, 'image', run(cfg));
     return asImage(blob, providerName(cfg));
   },
   async removeBackground(cfg, image, signal) {

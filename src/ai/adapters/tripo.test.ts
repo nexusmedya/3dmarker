@@ -6,7 +6,7 @@ import { buildTripoForm, tripoAdapter } from './tripo';
 
 const signal = () => new AbortController().signal;
 const saved = { ...aiTiming };
-beforeEach(() => Object.assign(aiTiming, saved, { pollMs: 1 }));
+beforeEach(() => Object.assign(aiTiming, saved, { pollMs: 1, retryBaseMs: 1, retryMaxMs: 2 }));
 afterEach(() => vi.unstubAllGlobals());
 
 describe('buildTripoForm', () => {
@@ -59,5 +59,17 @@ describe('tripoAdapter', () => {
     vi.stubGlobal('fetch', fakeNet().on(null, /./, new TypeError('Failed to fetch')).fetch);
     await expect(tripoAdapter.toModel!(cfg, { views: { front: pngBlob() }, signal: signal() })).rejects.toMatchObject({ code: 'needs-server' });
     await expect(tripoAdapter.toModel!(createProviderConfig('tripo', { apiKey: 'bad key!' }), { views: { front: pngBlob() }, signal: signal() })).rejects.toMatchObject({ code: 'key-format' });
+  });
+});
+
+describe('tripo polling resilience', () => {
+  it('retries transient poll and download failures (e.g. our proxy’s 429)', async () => {
+    const net = fakeNet()
+      .on('POST', '/api/tripo/tasks', json({ taskId: 't2' }))
+      .on('GET', '/api/tripo/tasks/t2', json({ error: 'busy' }, 429, { 'retry-after': '0' }), json({}, 502), json({ status: 'success', progress: 100 }))
+      .on('GET', '/api/tripo/tasks/t2/model', json({}, 503), binary(glbBytes(), 'model/gltf-binary'));
+    vi.stubGlobal('fetch', net.fetch);
+    const glb = await tripoAdapter.toModel!(createProviderConfig('tripo', { apiKey: 'tsk_abcdefghij' }), { views: { front: pngBlob() }, signal: signal() });
+    expect(glb.byteLength).toBe(64);
   });
 });

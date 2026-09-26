@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { AI_CAPABILITIES } from './types';
-import { configCapabilities, defaultModel, getProviderKind, isProviderKindId, kindNeedsKey, PROVIDER_KINDS, templateKey } from './kinds';
+import { configCapabilities, defaultModel, getProviderKind, isProviderKindId, kindNeedsKey, migrateOutputPath, outputPathKey, PROVIDER_KINDS, templateKey } from './kinds';
 import { getAdapter } from './adapters';
 import { createProviderConfig } from './settings';
 
@@ -34,8 +34,23 @@ describe('PROVIDER_KINDS', () => {
     for (const id of ['replicate', 'fal'] as const) {
       const keys = getProviderKind(id).fields.map((f) => f.key);
       for (const cap of AI_CAPABILITIES) expect(keys).toContain(templateKey(cap));
-      expect(keys).toContain('outputPath');
+      // One output path per capability, so a 3D path never breaks image edits of the same entry.
+      for (const cap of AI_CAPABILITIES) expect(keys).toContain(outputPathKey(cap));
+      expect(keys).not.toContain('outputPath');
     }
+  });
+
+  it('migrates the old single output path to the capabilities it was meant for', () => {
+    // A custom template marks the capability the path belongs to.
+    expect(migrateOutputPath('fal', { outputPath: 'result.mesh', multiviewTemplate: '{"f":"{{front}}"}' })).toEqual({ multiviewTemplate: '{"f":"{{front}}"}', multiviewOutputPath: 'result.mesh' });
+    // Otherwise a model-looking path goes to the 3D capabilities only, an image path to the image ones.
+    expect(migrateOutputPath('fal', { outputPath: 'model_glb.url' })).toEqual({ modelOutputPath: 'model_glb.url', multiviewOutputPath: 'model_glb.url' });
+    expect(migrateOutputPath('replicate', { outputPath: 'images.0.url' })).toEqual({ editOutputPath: 'images.0.url', bgOutputPath: 'images.0.url' });
+    expect(migrateOutputPath('fal', { outputPath: 'x', editOutputPath: 'own' })).toMatchObject({ editOutputPath: 'own' });
+    expect(migrateOutputPath('custom-http', { outputPath: 'x' })).toEqual({ outputPath: 'x' });
+    const cfg = createProviderConfig('fal', { values: { outputPath: 'model_glb.url' } });
+    expect(cfg.values.modelOutputPath).toBe('model_glb.url');
+    expect(cfg.values.editOutputPath).toBe('');
   });
 
   it('helpers', () => {

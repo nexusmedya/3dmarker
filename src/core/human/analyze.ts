@@ -19,7 +19,7 @@ import { resizeRGBA } from '../image/ops';
 import { compositeOver, NEUTRAL_GREY } from '../preprocess/composite';
 import { AbortError, throwIfAborted, type I18nText, type Progress, type RGBAImage } from '../types';
 import { yieldToPaint } from '../yield';
-import type { Detector, DetectorBackend, RawLandmark } from './backend';
+import type { Detector, DetectorBackend, LoadContext, RawLandmark } from './backend';
 import { humanConfigFrom } from './config';
 import { cropRGBA } from './raster';
 import { FACE, LEFT_EYE_LOOP, RIGHT_EYE_LOOP } from './topology';
@@ -253,7 +253,32 @@ interface Flight {
 
 let inflight = new WeakMap<RGBAImage, Map<string, Flight>>();
 
-/** Forget cached analyses (all images, or one). */
+/**
+ * A detector load that failed slowly (stalled download on a blackholed host,
+ * hung GPU init: up to the stall / init timeouts) is remembered for a while
+ * and fails at once, so every later depth run does not wait again. Fast
+ * failures (HTTP / DNS / CORS errors) are cheap and retried every time.
+ */
+export const SLOW_LOAD_FAILURE_MS = 5_000;
+export const LOAD_FAILURE_TTL_MS = 5 * 60_000;
+let loadFailures = new Map<HumanDetector, { at: number; error: unknown }>();
+
+async function loadDetector(backend: DetectorBackend, kind: HumanDetector, ctx: LoadContext): Promise<Detector> {
+  const known = loadFailures.get(kind);
+  if (known && Date.now() - known.at < LOAD_FAILURE_TTL_MS) throw known.error;
+  const start = Date.now();
+  try {
+    const d = await backend.load(kind, ctx);
+    loadFailures.delete(kind);
+    return d;
+  } catch (e) {
+    const end = Date.now();
+    if (!(e instanceof AbortError) && !ctx.signal.aborted && end - start >= SLOW_LOAD_FAILURE_MS) loadFailures.set(kind, { at: end, error: e });
+    throw e;
+  }
+}
+
+/** Forget cached analyses (all images, or one); clearing all also forgets remembered model load failures. */
 export function clearHumanCache(image?: RGBAImage): void {
   if (image) {
     cache.delete(image);
@@ -261,6 +286,7 @@ export function clearHumanCache(image?: RGBAImage): void {
   }
   cache = new WeakMap();
   inflight = new WeakMap();
+  loadFailures = new Map();
 }
 
 function requested(detect: AnalyzeOptions['detect']): HumanDetector[] {
@@ -444,7 +470,7 @@ async function runAnalysis(
     const mb = t > 0 ? ` ${(l / MB).toFixed(1)} / ${(t / MB).toFixed(1)} MB` : '';
     emit({ label: { tr: `${TEXT.loading.tr}${mb}`, en: `${TEXT.loading.en}${mb}` }, ratio: t > 0 ? Math.min(1, l / t) : undefined });
   };
-  const loaded = await Promise.allSettled(detectors.map((kind) => backend.load(kind, { signal, onBytes: onBytes(kind) })));
+  const loaded = await Promise.allSettled(detectors.map((kind) => loadDetector(backend, kind, { signal, onBytes: onBytes(kind) })));
   throwIfAborted(signal);
 
   const failed: Partial<Record<HumanDetector, string>> = {};
@@ -513,6 +539,7 @@ export async function analyzeHuman(image: RGBAImage, opts: AnalyzeOptions): Prom
   let flights = inflight.get(image);
   if (!flights) inflight.set(image, (flights = new Map()));
   let flight = flights.get(key);
+  if (flight?.controller.signal.aborted) flight = undefined; // being cancelled: never join it
   if (!flight) {
     const controller = new AbortController();
     const f: Flight = { controller, waiters: 0, listeners: new Set(), last: null, promise: Promise.resolve(empty(image)) };
@@ -552,6 +579,11 @@ export async function analyzeHuman(image: RGBAImage, opts: AnalyzeOptions): Prom
   } finally {
     if (listener) flight.listeners.delete(listener);
     flight.waiters--;
-    if (flight.waiters === 0 && signal.aborted) flight.controller.abort();
+    if (flight.waiters === 0 && signal.aborted) {
+      // Unlisted at once: a caller arriving before the run settles starts a fresh one.
+      const owner = inflight.get(image);
+      if (owner?.get(key) === flight) owner.delete(key);
+      flight.controller.abort();
+    }
   }
 }

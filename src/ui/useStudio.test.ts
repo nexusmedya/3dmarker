@@ -9,12 +9,15 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SourceImage } from '../app/pipeline';
 
-const mocks = vi.hoisted(() => ({ prepareSource: vi.fn(), runPipeline: vi.fn() }));
+const mocks = vi.hoisted(() => ({ prepareSource: vi.fn(), runPipeline: vi.fn(), resolveMask: vi.fn(), quickMask: vi.fn() }));
 vi.mock('../app/pipeline', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../app/pipeline')>();
-  return { ...actual, prepareSource: mocks.prepareSource, runPipeline: mocks.runPipeline };
+  mocks.quickMask.mockImplementation(actual.quickMask);
+  return { ...actual, prepareSource: mocks.prepareSource, runPipeline: mocks.runPipeline, resolveMask: mocks.resolveMask, quickMask: mocks.quickMask };
 });
 
+import { Object3D } from 'three';
+import type { PipelineResult } from '../app/pipeline';
 import { useStudio, type Studio } from './useStudio';
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -62,7 +65,31 @@ beforeEach(() => {
   localStorage.clear();
   mocks.prepareSource.mockReset();
   mocks.runPipeline.mockReset();
+  mocks.resolveMask.mockReset();
 });
+
+const STATS = { vertices: 3, triangles: 1, watertight: false };
+
+/** A finished pipeline run (a plain object as the model). */
+const pipelineResult = (): PipelineResult =>
+  ({
+    model: { kind: 'geometry', object: new Object3D(), stats: STATS, depth: null, mask: null, meshKey: null, remesh: null },
+    inputMask: null,
+  }) as unknown as PipelineResult;
+
+/** Load an image and generate a model from it (silhouette driver: always available). */
+async function withModel() {
+  await mount();
+  await act(async () => studio.actions.selectDriver('silhouette-extrude'));
+  await loadNow('a.png');
+  mocks.runPipeline.mockImplementation(async () => pipelineResult());
+  await act(async () => studio.actions.generate());
+  expect(studio.state.status).toBe('done');
+  mocks.runPipeline.mockClear();
+}
+
+const keyOn = (target: EventTarget, init: KeyboardEventInit) =>
+  act(async () => void target.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, ...init })));
 
 afterEach(async () => {
   await act(async () => root?.unmount());
@@ -138,6 +165,125 @@ describe('useStudio generation guards', () => {
     });
     expect(studio.state.source).toBeNull();
     expect(studio.state.loadingImage).toBe(false);
+  });
+});
+
+describe('useStudio: generating over an edited model', () => {
+  it('Ctrl+Enter and Generate ask before replacing a sculpted model; confirming regenerates', async () => {
+    await withModel();
+    await act(async () => studio.actions.onSculptEdited(STATS, 1));
+    expect(studio.state.sculpted).toBe(true);
+
+    await ctrlEnter();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+    expect(studio.state.regenConfirm).toBe(true);
+    // Escape closes the question (and cancels nothing).
+    await keyOn(window, { key: 'Escape' });
+    expect(studio.state.regenConfirm).toBe(false);
+
+    await act(async () => studio.actions.generate()); // the Generate button
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+    expect(studio.state.regenConfirm).toBe(true);
+    await act(async () => studio.actions.cancelRegenerate());
+    expect(studio.state).toMatchObject({ regenConfirm: false, sculpted: true });
+
+    await act(async () => studio.actions.generate());
+    await act(async () => studio.actions.confirmRegenerate());
+    expect(mocks.runPipeline).toHaveBeenCalledOnce();
+    expect(studio.state).toMatchObject({ status: 'done', sculpted: false, regenConfirm: false });
+  });
+
+  it('a rigged model asks too; an unedited one regenerates at once', async () => {
+    await withModel();
+    await act(async () => studio.actions.onRigged(true));
+    await ctrlEnter();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+    expect(studio.state.regenConfirm).toBe(true);
+    await act(async () => studio.actions.onRigged(false));
+    await act(async () => studio.actions.cancelRegenerate());
+    await ctrlEnter();
+    expect(mocks.runPipeline).toHaveBeenCalledOnce();
+  });
+
+  it('Ctrl+Enter does nothing in sculpt mode (Ctrl inverts the brush), in text fields or in dialogs', async () => {
+    await withModel();
+    await act(async () => studio.actions.onSculptActive(true));
+    await ctrlEnter();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+    expect(studio.state).toMatchObject({ regenConfirm: false, status: 'done' });
+    await act(async () => studio.actions.onSculptActive(false));
+
+    const text = document.createElement('textarea');
+    const dialog = document.createElement('div');
+    dialog.setAttribute('role', 'dialog');
+    const button = document.createElement('button');
+    dialog.append(button);
+    document.body.append(text, dialog);
+    try {
+      await keyOn(text, { key: 'Enter', ctrlKey: true });
+      await keyOn(button, { key: 'Enter', metaKey: true });
+      expect(mocks.runPipeline).not.toHaveBeenCalled();
+      await keyOn(document.body, { key: 'Enter', ctrlKey: true });
+      expect(mocks.runPipeline).toHaveBeenCalledOnce();
+    } finally {
+      text.remove();
+      dialog.remove();
+    }
+  });
+});
+
+describe('useStudio view uploads', () => {
+  it('no job starts while an uploaded view decodes', async () => {
+    await mount();
+    await act(async () => studio.actions.selectDriver('silhouette-extrude'));
+    await loadNow('a.png');
+    const decode = deferred<SourceImage>();
+    mocks.prepareSource.mockImplementationOnce(() => decode.promise);
+    let pending!: Promise<unknown>;
+    await act(async () => {
+      pending = studio.actions.uploadView('back', new File(['b'], 'back.png'));
+    });
+    await ctrlEnter();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+    await act(async () => {
+      decode.resolve(sourceOf('back.png'));
+      await pending;
+    });
+    expect(studio.state.views.back?.name).toBe('back.png');
+    mocks.runPipeline.mockImplementationOnce(() => new Promise(() => {}));
+    await ctrlEnter();
+    expect(mocks.runPipeline).toHaveBeenCalledOnce();
+    expect(mocks.runPipeline.mock.calls[0][0].views.back).toBeDefined(); // the upload is part of the job
+  });
+
+  it('AI background removal of an upload blocked by a running job is queued, not dropped', async () => {
+    await mount();
+    await act(async () => studio.actions.selectDriver('silhouette-extrude'));
+    await act(async () => studio.actions.setBgMode('ai'));
+    await loadNow('a.png');
+    const run = deferred<PipelineResult>();
+    mocks.runPipeline.mockImplementationOnce(() => run.promise);
+    let job!: Promise<unknown>;
+    await act(async () => {
+      job = studio.actions.generate();
+    });
+    expect(studio.state.status).toBe('running');
+
+    mocks.quickMask.mockImplementationOnce(() => ({ mask: null, note: 'border-failed' })); // no usable border
+    mocks.prepareSource.mockImplementationOnce(async () => sourceOf('back.jpg'));
+    const cut = { width: 2, height: 2, data: new Uint8Array([1, 1, 1, 0]) };
+    mocks.resolveMask.mockResolvedValue(cut);
+    await act(async () => studio.actions.uploadView('back', new File(['b'], 'back.jpg')));
+    expect(studio.state.views.back?.mask).toBeNull();
+    expect(mocks.resolveMask).not.toHaveBeenCalled(); // the 3D job is in the way
+
+    await act(async () => {
+      run.resolve(pipelineResult());
+      await job;
+    });
+    await vi.waitFor(() => expect(studio.state.views.back?.mask).toBe(cut));
+    expect(mocks.resolveMask).toHaveBeenCalledOnce();
+    expect(studio.state.aiJob).toBeNull();
   });
 });
 

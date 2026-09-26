@@ -1,15 +1,21 @@
 /**
  * AI style presets: the image-edit model restyles the source image into one
  * of these looks before the other views are generated. Every prompt keeps the
- * subject's identity, pose and composition and asks for a clean studio
- * render that 3D reconstruction can use. No brand or trademark names.
+ * subject's identity, features and clothing and asks for a clean studio
+ * render that 3D reconstruction can use; keeping the pose and composition
+ * (STYLE_KEEP_POSE) is added by buildPrepPrompt only when no T-pose / body
+ * completion is asked for. No brand or trademark names, nor descriptions of
+ * protected product shapes.
  */
 import type { I18nText } from '../core/types';
 import type { StyleCategory, StylePreset } from './types';
 
 /** Appended to every look: keep who / what it is, and make it reconstructable. */
 export const STYLE_KEEP =
-  'Preserve the subject’s identity, recognisable features, clothing, pose and composition. Render it as a clean studio shot on a plain background with soft, even lighting and the whole subject in frame, suitable for 3D reconstruction.';
+  'Preserve the subject’s identity, recognisable features and clothing. Render it as a clean studio shot on a plain background with soft, even lighting and the whole subject in frame, suitable for 3D reconstruction.';
+
+/** Added after a style when the pose and framing must stay (no T-pose / body completion). */
+export const STYLE_KEEP_POSE = 'Keep the original pose and composition.';
 
 export const STYLE_CATEGORIES: { id: StyleCategory; name: I18nText }[] = [
   { id: 'realistic', name: { tr: 'Gerçekçi', en: 'Realistic' } },
@@ -48,7 +54,7 @@ export const STYLES: StylePreset[] = [
 
   // Toy
   s('vinyl-figure', 'Vinil koleksiyon figürü', 'Vinyl collectible figure', 'toy', 'a glossy vinyl collectible figure with a slightly oversized head, simplified features and smooth plastic surfaces', g('#ff7b54', '#ffb26b', '#ffd56b')),
-  s('brick-minifig', 'Tuğla oyuncak minifigürü', 'Brick-toy minifigure', 'toy', 'a small interlocking-brick toy minifigure with a cylindrical head, a blocky torso, C-shaped hands, a printed face and glossy ABS plastic', g('#ffcf00', '#e3000b')),
+  s('block-toy', 'Blok oyuncak figür', 'Blocky toy figure', 'toy', 'a chunky stylized toy figure built from simple geometric plastic blocks, with blocky limbs, flat colours and a glossy plastic finish', g('#4fb3ff', '#ff8a3d')),
   s('plush', 'Peluş oyuncak', 'Plush toy', 'toy', 'a soft plush toy made of fuzzy fabric with visible seams, embroidered eyes and stuffed rounded limbs', g('#f6d6ad', '#e8a87c')),
   s('action-figure', 'Aksiyon figürü', 'Action figure', 'toy', 'an articulated plastic action figure with visible joints, sculpted details and factory paint', g('#3a506b', '#5bc0be')),
   s('bobblehead', 'Sallanan kafa figürü', 'Bobblehead', 'toy', 'a bobblehead figurine with a big oversized head on a small body, in glossy painted resin', g('#f4a261', '#2a9d8f')),
@@ -102,6 +108,9 @@ export const STYLES: StylePreset[] = [
 
 const BY_ID = new Map(STYLES.map((st) => [st.id, st]));
 
+/** Renamed presets (saved options may still name the old id). */
+const ALIASES: Record<string, string> = { 'brick-minifig': 'block-toy' };
+
 export function getStyle(id: string | null): StylePreset | null {
-  return id ? BY_ID.get(id) ?? null : null;
+  return id ? BY_ID.get(id) ?? BY_ID.get(ALIASES[id] ?? '') ?? null : null;
 }

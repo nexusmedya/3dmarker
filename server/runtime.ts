@@ -1,7 +1,7 @@
 /**
  * Pieces of the server entry (./index.ts) kept apart so they can be tested
  * without starting a server: startup options, the production SPA/static
- * handler and the dev-mode Host guard.
+ * handler and the Host guard (DNS rebinding).
  */
 import { isIP } from 'node:net';
 import type { Env, Hono } from 'hono';
@@ -14,14 +14,27 @@ export interface ServerOptions {
   hostname: string | undefined;
   /** Also serve the built SPA. */
   production: boolean;
-  /** Refuse Host headers a DNS-rebinding page could send (see isRebindSafeHost). */
+  /** Refuse Host headers a DNS-rebinding page could send (see isRebindSafeHost); off only with ALLOWED_HOSTS=*. */
   guardHost: boolean;
+  /** Host names accepted besides localhost and IP literals (ALLOWED_HOSTS; '*.example.com' = its subdomains). */
+  allowedHosts: string[];
+}
+
+/** ALLOWED_HOSTS → lower-case names without port or trailing dot ('*' and invalid entries dropped). */
+export function parseAllowedHosts(value: string | undefined): string[] {
+  return (value ?? '')
+    .split(',')
+    .map((h) => h.trim().toLowerCase().replace(/:\d{1,5}$/, '').replace(/\.$/, ''))
+    .filter((h) => /^(\*\.)?[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$/.test(h));
 }
 
 /**
  * `--production` (or NODE_ENV=production): serve dist/ as well and listen on
- * all interfaces. Development listens on 127.0.0.1 only and checks the Host
- * header, so a key in .env is not exposed to the network; HOST overrides both.
+ * all interfaces. Development listens on 127.0.0.1 only, so a key in .env is
+ * not exposed to the network; HOST overrides that. In every mode the Host
+ * header is checked (a page rebinding its own domain to this server would
+ * otherwise use the keys in .env): localhost, IP literals and ALLOWED_HOSTS
+ * pass; ALLOWED_HOSTS=* turns the check off.
  */
 export function serverOptions(argv: readonly string[], env: NodeJS.ProcessEnv): ServerOptions {
   const production = argv.includes('--production') || env.NODE_ENV === 'production';
@@ -30,29 +43,38 @@ export function serverOptions(argv: readonly string[], env: NodeJS.ProcessEnv): 
     port: Number(env.PORT ?? 8787),
     hostname: host ?? (production ? undefined : '127.0.0.1'),
     production,
-    guardHost: !production && !host,
+    guardHost: env.ALLOWED_HOSTS?.trim() !== '*',
+    allowedHosts: parseAllowedHosts(env.ALLOWED_HOSTS),
   };
 }
 
+/** Whether `hostname` (a bind address; undefined = all interfaces) only accepts local connections. */
+export const isLoopbackBind = (hostname: string | undefined): boolean =>
+  hostname === 'localhost' || hostname === '::1' || /^127\.\d+\.\d+\.\d+$/.test(hostname ?? '');
+
 /**
  * True for a Host header that DNS rebinding cannot produce: localhost (or
- * *.localhost) or an IP literal, with any port. A rebinding page always
- * sends its own domain name.
+ * *.localhost) or an IP literal, with any port; or one of `allowed` (the
+ * operator's own domain names, see parseAllowedHosts). A rebinding page
+ * always sends its own domain name.
  */
-export function isRebindSafeHost(host: string | null | undefined): boolean {
+export function isRebindSafeHost(host: string | null | undefined, allowed: readonly string[] = []): boolean {
   const m = /^(?:\[([^\]]+)\]|([^:[\]]+))(?::\d{1,5})?$/.exec(host?.trim() ?? '');
   if (!m) return false;
   if (m[1] !== undefined) return isIP(m[1]) === 6;
   const name = m[2].toLowerCase().replace(/\.$/, '');
-  return name === 'localhost' || name.endsWith('.localhost') || isIP(name) === 4;
+  if (name === 'localhost' || name.endsWith('.localhost') || isIP(name) === 4) return true;
+  return allowed.some((a) => (a.startsWith('*.') ? name.endsWith(a.slice(1)) : name === a));
 }
 
 type FetchHandler<A extends unknown[]> = (request: Request, ...rest: A) => Response | Promise<Response>;
 
-/** Wrap a fetch handler so requests whose Host fails isRebindSafeHost get a 403. */
-export function withHostGuard<A extends unknown[]>(handler: FetchHandler<A>): FetchHandler<A> {
+/** Wrap a fetch handler so requests whose Host fails isRebindSafeHost (with `allowed`) get a 403. */
+export function withHostGuard<A extends unknown[]>(handler: FetchHandler<A>, allowed: readonly string[] = []): FetchHandler<A> {
   return (request, ...rest) =>
-    isRebindSafeHost(request.headers.get('host')) ? handler(request, ...rest) : new Response('Forbidden host', { status: 403 });
+    isRebindSafeHost(request.headers.get('host'), allowed)
+      ? handler(request, ...rest)
+      : new Response('Forbidden host (add it to ALLOWED_HOSTS)', { status: 403 });
 }
 
 const isApi = (path: string) => path === '/api' || path.startsWith('/api/');

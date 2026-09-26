@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { base64ToBlob, base64ToBytes, blobToBase64, blobToDataUri, bytesToBase64, dataUriToBlob, isGlbBuffer, sniffType, toUploadPng, withSniffedType } from './encode';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { base64ToBlob, base64ToBytes, blobToBase64, blobToDataUri, bytesToBase64, dataUriToBlob, isGlbBuffer, sniffType, toUploadImage, toUploadPng, withSniffedType } from './encode';
 import { glbBytes, PNG_BASE64, pngBlob } from './testing';
 
 describe('base64', () => {
@@ -46,5 +46,59 @@ describe('toUploadPng', () => {
   it('passes blobs through where no canvas exists (Node)', async () => {
     const b = pngBlob();
     expect(await toUploadPng(b)).toBe(b);
+  });
+});
+
+describe('toUploadImage (stubbed canvas)', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  function stubCanvas(width: number, height: number) {
+    const ops: string[] = [];
+    const bitmaps = vi.fn(async () => ({ width, height, close: () => {} }));
+    class FakeCanvas {
+      constructor(
+        readonly width: number,
+        readonly height: number,
+      ) {}
+      getContext() {
+        return {
+          set fillStyle(v: string) {
+            ops.push(`fill ${v}`);
+          },
+          fillRect: () => ops.push('fillRect'),
+          drawImage: () => ops.push('draw'),
+          imageSmoothingEnabled: true,
+          imageSmoothingQuality: 'high',
+        };
+      }
+      async convertToBlob(o: { type: string; quality?: number }) {
+        ops.push(`encode ${o.type}`);
+        return new Blob(['x'], { type: o.type });
+      }
+    }
+    vi.stubGlobal('createImageBitmap', bitmaps);
+    vi.stubGlobal('OffscreenCanvas', FakeCanvas);
+    return { ops, bitmaps };
+  }
+
+  it('flattens transparent references over white as JPEG for alpha-less providers', async () => {
+    const { ops } = stubCanvas(100, 50);
+    const png = new Blob(['p'], { type: 'image/png' });
+    const out = await toUploadImage(png, { keepAlpha: false });
+    expect(out.type).toBe('image/jpeg');
+    // White is painted before the image, so transparent pixels are not exported as black.
+    expect(ops).toEqual(['fill #ffffff', 'fillRect', 'draw', 'encode image/jpeg']);
+    // PNGs within the size limit keep their alpha untouched otherwise.
+    expect(await toUploadImage(png)).toBe(png);
+  });
+
+  it('prepares each blob once (memoised), and is idempotent', async () => {
+    const { bitmaps } = stubCanvas(3000, 1000);
+    const jpg = new Blob(['j'], { type: 'image/jpeg' });
+    const a = await toUploadImage(jpg, { keepAlpha: false });
+    const b = await toUploadImage(jpg, { keepAlpha: false });
+    expect(b).toBe(a);
+    expect(await toUploadImage(a, { keepAlpha: false })).toBe(a);
+    expect(bitmaps).toHaveBeenCalledTimes(1);
   });
 });

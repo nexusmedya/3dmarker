@@ -9,6 +9,7 @@ import {
   DEFAULT_AI_SETTINGS,
   fetchServerInfo,
   fetchServerProviders,
+  LOCAL_PROVIDER_ID,
   loadAiSettings,
   mergeServerProviders,
   normalizeDefaults,
@@ -83,7 +84,7 @@ describe('save / load', () => {
     ]);
     expect(loaded.providers[1].models['image-to-3d']).toBe('fal-ai/trellis-2');
     expect(loaded.defaults['image-edit']).toBe('b');
-    expect(loaded.defaults['background-removal']).toBe('a'); // auto-picked
+    expect(loaded.defaults['background-removal']).toBe('b'); // auto-picked: a dedicated matting model, never an OpenAI re-render
     // A new tab (empty session) has the providers but not the keys.
     expect(loadAiSettings(local, new MemStore()).providers.map((p) => p.apiKey)).toEqual(['', '']);
   });
@@ -177,7 +178,9 @@ describe('providerUsable / resolveProvider', () => {
     expect(resolveProvider(s, 'image-edit', 'off')?.id).toBe('b');
     expect(resolveProvider(s, 'image-edit', 'c')?.id).toBe('b'); // replicate needs the server
     expect(resolveProvider(s, 'image-edit', 'c', true)?.id).toBe('c');
-    expect(resolveProvider(s, 'background-removal')?.id).toBe('a');
+    // OpenAI only re-renders the image: never picked for background removal unless chosen (null = local model).
+    expect(resolveProvider(s, 'background-removal')).toBeNull();
+    expect(resolveProvider({ ...s, defaults: { 'background-removal': 'a' } }, 'background-removal')?.id).toBe('a');
     expect(resolveProvider(s, 'image-to-3d')).toBeNull();
     expect(resolveProvider(s, 'image-to-3d', null, true)?.id).toBe('c');
     expect(usableProviders(s, 'image-edit', false).map((p) => p.id)).toEqual(['a', 'b']);
@@ -221,7 +224,7 @@ describe('server providers', () => {
     const stale = createProviderConfig('stability', { id: 'server-stability', managed: true });
     const merged = mergeServerProviders({ providers: [own, stale], defaults: { 'background-removal': 'server-stability' }, rememberKeys: false }, server!);
     expect(merged.providers.map((p) => p.id)).toEqual(['g', 'server-openai']);
-    expect(merged.defaults).toEqual({ 'image-edit': 'g', 'background-removal': 'server-openai' });
+    expect(merged.defaults).toEqual({ 'image-edit': 'g' }); // background removal: the local model, not an OpenAI re-render
   });
 
   it('returns null without a server', async () => {
@@ -243,5 +246,68 @@ describe('current settings snapshot', () => {
     setCurrentAiSettings(s, true);
     expect(currentAiSettings()).toEqual({ settings: s, serverAvailable: true });
     setCurrentAiSettings(DEFAULT_AI_SETTINGS, false);
+  });
+});
+
+describe('background-removal defaults', () => {
+  it('never auto-picks an OpenAI re-render; a dedicated matting model or the local model instead', () => {
+    const gem = createProviderConfig('gemini', { id: 'g', apiKey: 'AIza' });
+    const oai = createProviderConfig('openai', { id: 'o', apiKey: 'sk' });
+    const fal = createProviderConfig('fal', { id: 'f', apiKey: 'k:s' });
+    const s = normalizeDefaults({ providers: [gem, oai], defaults: {}, rememberKeys: false });
+    expect(s.defaults['background-removal']).toBeUndefined();
+    expect(resolveProvider(s, 'background-removal')).toBeNull(); // local
+    expect(normalizeDefaults({ ...s, providers: [gem, oai, fal] }).defaults['background-removal']).toBe('f');
+    // An explicit choice is respected, and 'local' pins the local model even when a matting provider exists.
+    expect(resolveProvider({ ...s, defaults: { 'background-removal': 'o' } }, 'background-removal')?.id).toBe('o');
+    const local = normalizeDefaults({ providers: [gem, oai, fal], defaults: { 'background-removal': LOCAL_PROVIDER_ID }, rememberKeys: false });
+    expect(local.defaults['background-removal']).toBe(LOCAL_PROVIDER_ID);
+    expect(resolveProvider(local, 'background-removal')).toBeNull();
+    expect(resolveProvider(local, 'background-removal', 'f')?.id).toBe('f');
+  });
+
+  it('drops the auto-filled OpenAI default of version-1 settings', () => {
+    const local = new MemStore();
+    local.setItem(
+      `3dmarker:${AI_SETTINGS_KEY}`,
+      JSON.stringify({ version: 1, providers: [{ id: 'o', kind: 'openai' }], defaults: { 'image-edit': 'o', 'background-removal': 'o' }, rememberKeys: false }),
+    );
+    expect(loadAiSettings(local, new MemStore()).defaults).toEqual({ 'image-edit': 'o' });
+    saveAiSettings(local, new MemStore(), { ...loadAiSettings(local, null), defaults: { 'image-edit': 'o', 'background-removal': 'o' } });
+    expect(loadAiSettings(local, null).defaults['background-removal']).toBe('o'); // chosen after the migration: kept
+  });
+});
+
+describe('remember keys across tabs', () => {
+  it('a stale tab cannot write the keys back to the device after another tab turned remembering off', async () => {
+    const local = new MemStore();
+    // Two tabs = two module instances sharing localStorage, each with its own sessionStorage.
+    const tabA = await import('./settings');
+    vi.resetModules();
+    const tabB = await import('./settings');
+    expect(tabB).not.toBe(tabA);
+    const sessA = new MemStore();
+    const sessB = new MemStore();
+    const cfg = createProviderConfig('openai', { id: 'a', apiKey: 'sk-secret' });
+    const on: AiSettings = { providers: [cfg], defaults: {}, rememberKeys: true };
+
+    tabA.saveAiSettings(local, sessA, on);
+    expect(keysIn(local)).toContain('sk-secret');
+    const b = tabB.loadAiSettings(local, sessB);
+    tabB.saveAiSettings(local, sessB, { ...b, rememberKeys: false });
+    expect(keysIn(local)).toBeUndefined();
+
+    // Tab A (still rememberKeys=true in memory) changes something.
+    const saved = tabA.saveAiSettings(local, sessA, { ...on, providers: [{ ...cfg, enabled: false }] });
+    expect(saved.rememberKeys).toBe(false);
+    expect(keysIn(local)).toBeUndefined();
+    expect(JSON.parse(local.getItem(`3dmarker:${AI_SETTINGS_KEY}`)!).rememberKeys).toBe(false);
+    expect(keysIn(sessA)).toContain('sk-secret');
+    tabA.saveAiSettings(local, sessA, on);
+    expect(keysIn(local)).toBeUndefined();
+    // Tab A's user turns it off and on again: a deliberate choice.
+    tabA.saveAiSettings(local, sessA, { ...on, rememberKeys: false });
+    tabA.saveAiSettings(local, sessA, on);
+    expect(keysIn(local)).toContain('sk-secret');
   });
 });

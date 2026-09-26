@@ -39,7 +39,7 @@ async function generateInflate(page: Page): Promise<number> {
 }
 
 test.describe('step navigator', () => {
-  test('tabs are keyboard accessible, show completion and the active step survives a reload', async ({ page, context }) => {
+  test('tabs are keyboard accessible, show completion, and a reload starts at the image step', async ({ page, context }) => {
     await offline(context);
     await page.goto('/');
     await page.getByTestId('lang-en').click();
@@ -61,13 +61,16 @@ test.describe('step navigator', () => {
 
     await page.getByTestId(`sample-${MASCOT}`).click();
     await expect(page.getByTestId('step-image')).toHaveAttribute('data-done', 'true');
+    await expect(page.getByTestId('viewer-empty-body')).toContainText('Image loaded');
     // Next / Back buttons move between steps; Generate stays reachable and names the driver.
     await page.getByTestId('step-next-image').click();
     await expect(page.getByTestId('step-prep')).toHaveAttribute('aria-selected', 'true');
     await expect(page.getByTestId('generate-driver')).toContainText('Driver:');
     await step(page, 'views');
+    // No image survives a reload: the studio starts over at the image step (not an empty later one).
     await page.reload();
-    await expect(page.getByTestId('step-views')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByTestId('step-image')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByTestId('viewer-empty-body')).toContainText('Upload an image');
   });
 
   test('multi-view drivers need an extra view; Generate says so and links to the views step', async ({ page, context }) => {
@@ -93,7 +96,7 @@ test.describe('step navigator', () => {
     await page.getByTestId('view-back').locator('input[type=file]').setInputFiles({ name: 'back.png', mimeType: 'image/png', buffer: Buffer.from(png) });
     await expect(page.getByTestId('view-back')).toHaveAttribute('data-filled', 'true');
     await expect(page.getByTestId('generate')).toBeEnabled();
-    await expect(page.getByTestId('step-views')).toContainText('1/5');
+    await expect(page.getByTestId('step-views')).toContainText('2/6'); // the front counts, like the panel's pill
   });
 });
 
@@ -164,11 +167,11 @@ test.describe('AI provider flows (mocked OpenAI)', () => {
     expect(material).toEqual({ vertexColors: true, color: true, map: false });
     await page.screenshot({ path: `${SHOTS}/steps-multiview-fusion.png` });
 
-    // Revert keeps the views; the key never reached localStorage.
+    // Revert drops the AI views made from the prepared front; the key never reached localStorage.
     await step(page, 'image');
     await page.locator('#step-panel-image [data-testid="revert-original"]').click();
     await expect(page.locator('#step-panel-image [data-testid="revert-original"]')).toHaveCount(0);
-    await expect(page.getByTestId('step-views')).toContainText('5/5');
+    await expect(page.getByTestId('step-views')).toContainText('1/6');
     expect(await page.evaluate(() => JSON.stringify(Object.entries(localStorage)))).not.toContain('sk-e2e-test');
   });
 });

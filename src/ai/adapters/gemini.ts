@@ -93,11 +93,13 @@ export function parseGenerateResponse(body: GenerateResponse, name: string): Blo
 
 export const geminiAdapter: ProviderAdapter = {
   kind: 'gemini',
+  editImageLimit: () => 14,
   async editImage(cfg, req) {
     const name = providerName(cfg);
     const model = modelFor(cfg, 'image-edit');
     req.onProgress?.(PROGRESS.sending(name));
-    const images = await prepareImages(req.images.slice(0, 14));
+    // Gemini ignores alpha: transparent references are flattened over white (JPEG, which also keeps the inline request small).
+    const images = await prepareImages(req.images.slice(0, 14), { keepAlpha: false });
     const body = await buildGenerateBody(cfg, req, images);
     req.onProgress?.(PROGRESS.generating(name));
     const res = await aiFetch(cfg, generatePath(model), {

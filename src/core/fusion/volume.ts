@@ -10,6 +10,7 @@ import type { Axis } from './types';
 import type { ObjectBox, PreparedView, ViewProjection } from './frame';
 import { viewProjection } from './frame';
 import { dilateMask, SummedArea } from './silhouette';
+import { drain, type Steps } from './steps';
 
 export interface Grid {
   dims: [number, number, number];
@@ -95,6 +96,11 @@ export function dilationRadius(view: PreparedView, o: HullOptions): number {
  * front/back-only set).
  */
 export function buildHull(views: PreparedView[], box: ObjectBox, grid: Grid, o: HullOptions): Float32Array {
+  return drain(buildHullSteps(views, box, grid, o));
+}
+
+/** buildHull as cooperative steps (a yield per view and per Z slab). */
+export function* buildHullSteps(views: PreparedView[], box: ObjectBox, grid: Grid, o: HullOptions): Steps<Float32Array> {
   const [nx, ny, nz] = grid.dims;
   const xy = new Float32Array(nx * ny).fill(1);
   const zy = new Float32Array(nz * ny).fill(1);
@@ -105,6 +111,7 @@ export function buildHull(views: PreparedView[], box: ObjectBox, grid: Grid, o: 
     const table = coverageTable(viewProjection(view, box.size), grid, sil);
     const plane = view.id === 'front' || view.id === 'back' ? xy : view.id === 'left' || view.id === 'right' ? zy : xz;
     for (let i = 0; i < plane.length; i++) if (table[i] < plane[i]) plane[i] = table[i];
+    yield;
   }
   // Every view's bbox maps onto the box, so the box bounds the hull; this also
   // keeps dilated (tolerant) silhouettes from growing the object's extents.
@@ -115,6 +122,7 @@ export function buildHull(views: PreparedView[], box: ObjectBox, grid: Grid, o: 
   for (let k = 0; k < nz; k++) {
     const zk = zBox[k];
     if (zk <= 0) continue;
+    yield;
     for (let j = 0; j < ny; j++) {
       const zyv = Math.min(zk, yBox[j], zy[k + nz * j]);
       if (zyv <= 0) continue;
@@ -158,6 +166,11 @@ export function gaussianKernel(sigma: number): Float32Array {
 
 /** In-place separable 3D Gaussian blur (edges clamped). Lines that are all zero are skipped. */
 export function gaussianBlur3D(field: Float32Array, dims: readonly [number, number, number], sigma: number): void {
+  drain(gaussianBlur3DSteps(field, dims, sigma));
+}
+
+/** gaussianBlur3D as cooperative steps (a yield per plane of lines). */
+export function* gaussianBlur3DSteps(field: Float32Array, dims: readonly [number, number, number], sigma: number): Steps {
   if (!(sigma > 0.05)) return;
   const kernel = gaussianKernel(sigma);
   const r = (kernel.length - 1) / 2;
@@ -168,7 +181,7 @@ export function gaussianBlur3D(field: Float32Array, dims: readonly [number, numb
     const n = dims[axis], stride = strides[axis];
     // The two other axes enumerate the line starts.
     const [a1, a2] = axis === 0 ? [1, 2] : axis === 1 ? [0, 2] : [0, 1];
-    for (let q = 0; q < dims[a2]; q++)
+    for (let q = 0; q < dims[a2]; q++, yield)
       for (let p = 0; p < dims[a1]; p++) {
         const start = p * strides[a1] + q * strides[a2];
         let any = false;
@@ -197,12 +210,17 @@ export function gaussianBlur3D(field: Float32Array, dims: readonly [number, numb
  * added on every face. Returns the new field and its grid.
  */
 export function downsample(field: Float32Array, grid: Grid, factor: number): { field: Float32Array; grid: Grid } {
+  return drain(downsampleSteps(field, grid, factor));
+}
+
+/** downsample as cooperative steps (a yield per coarse Z slab). */
+export function* downsampleSteps(field: Float32Array, grid: Grid, factor: number): Steps<{ field: Float32Array; grid: Grid }> {
   if (factor <= 1) return { field, grid };
   const [nx, ny, nz] = grid.dims;
   const cx = Math.ceil(nx / factor), cy = Math.ceil(ny / factor), cz = Math.ceil(nz / factor);
   const dims: [number, number, number] = [cx + 2, cy + 2, cz + 2];
   const out = new Float32Array(dims[0] * dims[1] * dims[2]);
-  for (let K = 0; K < cz; K++)
+  for (let K = 0; K < cz; K++, yield)
     for (let J = 0; J < cy; J++)
       for (let I = 0; I < cx; I++) {
         let sum = 0, cnt = 0;
@@ -224,10 +242,15 @@ export function downsample(field: Float32Array, grid: Grid, factor: number): { f
 
 /** Cubes whose corners straddle `iso` (≈ half the triangle count of their surface). */
 export function countSurfaceCells(field: Float32Array, dims: readonly [number, number, number], iso = 0.5): number {
+  return drain(countSurfaceCellsSteps(field, dims, iso));
+}
+
+/** countSurfaceCells as cooperative steps (a yield per Z slab). */
+export function* countSurfaceCellsSteps(field: Float32Array, dims: readonly [number, number, number], iso = 0.5): Steps<number> {
   const [nx, ny, nz] = dims;
   const nxy = nx * ny;
   let count = 0;
-  for (let k = 0; k < nz - 1; k++)
+  for (let k = 0; k < nz - 1; k++, yield)
     for (let j = 0; j < ny - 1; j++) {
       let p = nx * (j + ny * k);
       for (let i = 0; i < nx - 1; i++, p++) {

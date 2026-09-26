@@ -24,7 +24,7 @@ import {
   type StatusResponse,
   type TaskStateResponse,
 } from '../../drivers/cloud/api';
-import { AiError, aiTiming, AI_ERROR_TEXT, cleanKey, providerName, readJson, send, sleep } from '../transport';
+import { AiError, aiTiming, AI_ERROR_TEXT, cleanKey, providerName, readJson, send, sleep, withRetry } from '../transport';
 import { asGlb, fileName, modelFor, prepareImages, PROGRESS, toModelPlan } from './common';
 
 /** Views the multi-view route takes (Tripo's own order). */
@@ -84,7 +84,11 @@ export const tripoAdapter: ProviderAdapter = {
     for (;;) {
       await sleep(aiTiming.pollMs, signal);
       if (Date.now() > deadline) throw new AiError(AI_ERROR_TEXT.timeout(name, Math.round(aiTiming.maxJobMs / 1000)), 'timeout');
-      const st = await readJson<TaskStateResponse>(await send(taskPath(created.taskId), { method: 'GET', headers, signal, timeoutMs: aiTiming.pollTimeoutMs }, ctx), name, signal);
+      // Idempotent GETs: transient failures (5xx, 429, network) are retried. (No cancel route exists.)
+      const st = await withRetry(
+        async () => readJson<TaskStateResponse>(await send(taskPath(created.taskId), { method: 'GET', headers, signal, timeoutMs: aiTiming.pollTimeoutMs }, ctx), name, signal),
+        { signal, deadline },
+      );
       if (st.status === 'success') break;
       if (st.status === 'failed' || st.status === 'cancelled') {
         const d = st.reason === 'banned' ? 'content moderation' : st.reason ?? st.error ?? st.status;
@@ -95,9 +99,12 @@ export const tripoAdapter: ProviderAdapter = {
       req.onProgress?.(st.status === 'queued' && !pct ? PROGRESS.queued(name) : PROGRESS.generating(name, pct));
     }
     req.onProgress?.(PROGRESS.downloading(name));
-    const res = await send(taskModelPath(created.taskId), { method: 'GET', headers, signal, timeoutMs: aiTiming.downloadTimeoutMs }, ctx);
+    const blob = await withRetry(
+      async () => (await send(taskModelPath(created.taskId), { method: 'GET', headers, signal, timeoutMs: aiTiming.downloadTimeoutMs }, ctx)).blob(),
+      { signal },
+    );
     if (signal.aborted) throw new AbortError();
-    return asGlb(await res.blob(), name);
+    return asGlb(blob, name);
   },
   async testConnection(cfg, signal) {
     const res = await send(TRIPO_STATUS_PATH, { method: 'GET', signal, timeoutMs: 10_000 }, { name: providerName(cfg), route: 'proxy' });

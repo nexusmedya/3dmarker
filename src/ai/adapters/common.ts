@@ -3,7 +3,7 @@ import type { I18nText, Progress, ViewId } from '../../core/types';
 import { VIEW_IDS } from '../../core/types';
 import type { AiCapability, ProviderConfig, ToModelRequest } from '../types';
 import { configCapabilities, defaultModel } from '../kinds';
-import { blobToBase64, isGlbBuffer, sniffType, toUploadPng } from '../encode';
+import { blobToBase64, isGlbBuffer, sniffType, toUploadImage, type UploadOptions } from '../encode';
 import { AiError, providerName } from '../transport';
 import { templatePlaceholders, type TemplateVars } from '../template';
 
@@ -40,9 +40,25 @@ export function toModelPlan(cfg: ProviderConfig, req: ToModelRequest): { cap: 'i
   return { cap, views };
 }
 
-/** Downscaled PNGs of the reference images (as-is outside the browser). */
-export function prepareImages(images: Blob[]): Promise<Blob[]> {
-  return Promise.all(images.map((b) => toUploadPng(b)));
+/**
+ * Downscaled reference images (as-is outside the browser): PNGs with alpha
+ * by default; `keepAlpha: false` flattens them over white (JPEG) for
+ * providers that drop the alpha channel.
+ */
+export function prepareImages(images: Blob[], opts: UploadOptions = {}): Promise<Blob[]> {
+  return Promise.all(images.map((b) => toUploadImage(b, opts)));
+}
+
+/** Aspect → the usual 'aspect_ratio' enum value and fal's 'image_size' preset. */
+export const ASPECT_RATIO: Record<'square' | 'portrait' | 'landscape', string> = { square: '1:1', portrait: '3:4', landscape: '4:3' };
+export const IMAGE_SIZE_PRESET: Record<'square' | 'portrait' | 'landscape', string> = { square: 'square_hd', portrait: 'portrait_4_3', landscape: 'landscape_4_3' };
+
+/** Placeholders that carry more than the first image. */
+const MULTI_IMAGE = /^(images|image(?:[2-9]|[1-9]\d+)|back|left|right|top|bottom)(_base64)?$/;
+
+/** Whether a template sends more than one reference image. */
+export function templateTakesSeveralImages(templateText: string): boolean {
+  return templatePlaceholders(templateText).some((p) => MULTI_IMAGE.test(p));
 }
 
 export function fileName(blob: Blob, base: string): string {
@@ -106,12 +122,24 @@ export const PROGRESS = {
  */
 export async function buildTemplateVars(
   templateText: string,
-  data: { prompt?: string; key?: string; images?: Blob[]; views?: Partial<Record<ViewId, Blob>>; swapSides?: boolean },
+  data: {
+    prompt?: string;
+    key?: string;
+    images?: Blob[];
+    views?: Partial<Record<ViewId, Blob>>;
+    swapSides?: boolean;
+    /** Wanted output aspect: fills {{aspect}} ('1:1' / '3:4' / '4:3') and {{image_size}} (fal presets); unset = the key is dropped. */
+    aspect?: 'square' | 'portrait' | 'landscape';
+  },
 ): Promise<TemplateVars> {
   const used = new Set(templatePlaceholders(templateText));
   const vars: TemplateVars = {};
   if (data.prompt !== undefined) vars.prompt = data.prompt;
   if (data.key !== undefined) vars.key = data.key;
+  if (data.aspect) {
+    vars.aspect = ASPECT_RATIO[data.aspect];
+    vars.image_size = IMAGE_SIZE_PRESET[data.aspect];
+  }
   const views: Partial<Record<ViewId, Blob>> = { ...(data.views ?? {}) };
   if (data.swapSides) [views.left, views.right] = [views.right, views.left];
   const images = data.images ?? (VIEW_IDS.map((v) => views[v]).filter(Boolean) as Blob[]);

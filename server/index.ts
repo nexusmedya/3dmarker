@@ -3,14 +3,16 @@
  * proxies /api here; `--production` or NODE_ENV=production: all interfaces,
  * and also serves the built SPA from ./dist, or STATIC_DIR).
  * Env: PORT (8787), HOST (default 127.0.0.1 in dev, all interfaces in
- * production), plus the API settings documented in ./app.ts and ./ai/providers.ts.
+ * production), ALLOWED_HOSTS (domain names accepted in the Host header besides
+ * localhost / IPs; '*' = no check), plus the API settings documented in
+ * ./app.ts and ./ai/providers.ts.
  */
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { serve } from '@hono/node-server';
-import { byokEnabled, managedProviders } from './ai/providers';
+import { allServerKeys, byokEnabled, managedProviders } from './ai/providers';
 import { createApp } from './app';
-import { mountStatic, serverOptions, withHostGuard } from './runtime';
+import { isLoopbackBind, mountStatic, serverOptions, withHostGuard } from './runtime';
 
 // .env is optional; existing environment variables win.
 try {
@@ -19,7 +21,7 @@ try {
   // no .env file
 }
 
-const { port, hostname, production, guardHost } = serverOptions(process.argv.slice(2), process.env);
+const { port, hostname, production, guardHost, allowedHosts } = serverOptions(process.argv.slice(2), process.env);
 if (production) process.env.NODE_ENV = 'production';
 const app = createApp();
 
@@ -27,13 +29,24 @@ if (production) {
   mountStatic(app, process.env.STATIC_DIR ? resolve(process.env.STATIC_DIR) : fileURLToPath(new URL('../dist', import.meta.url)));
 }
 
-// On loopback in dev, still refuse foreign Host headers (DNS rebinding from a web page).
-const server = serve({ fetch: guardHost ? withHostGuard(app.fetch) : app.fetch, port, hostname }, (info) => {
+// Refuse foreign Host headers (DNS rebinding from a web page), unless ALLOWED_HOSTS=*.
+const server = serve({ fetch: guardHost ? withHostGuard(app.fetch, allowedHosts) : app.fetch, port, hostname }, (info) => {
   const host = hostname && hostname !== '0.0.0.0' && hostname !== '::' ? hostname : 'localhost';
   console.log(`3D Marker ${production ? 'server' : 'API'} listening on http://${host}:${info.port}`);
   console.log(`Tripo3D server key: ${process.env.TRIPO_API_KEY?.trim() ? 'configured' : 'not set (users must supply their own key)'}`);
   const managed = managedProviders(process.env).map((p) => p.kind);
   console.log(`AI providers with server keys: ${managed.length ? managed.join(', ') : 'none'}${byokEnabled(process.env) ? ' (users may add their own keys)' : ' (user keys disabled)'}`);
+  if (guardHost) {
+    console.log(`Host check: localhost, IP addresses${allowedHosts.length ? `, ${allowedHosts.join(', ')}` : ''} (set ALLOWED_HOSTS to your domain name when serving one)`);
+  } else if (allServerKeys(process.env).length && !isLoopbackBind(hostname)) {
+    console.warn('ALLOWED_HOSTS=*: no Host check, so a DNS-rebinding page can use the server keys; list your domain names instead.');
+  }
+  if (/^(1|true)$/i.test(process.env.TRUST_PROXY?.trim() ?? '') && !isLoopbackBind(hostname)) {
+    console.warn(
+      'TRUST_PROXY=1 while listening on a non-loopback address: bind HOST=127.0.0.1 or firewall PORT so only the proxy can connect ' +
+        '(X-Forwarded-For is only believed from TRUSTED_PROXIES, by default loopback and private addresses).',
+    );
+  }
 });
 
 const shutdown = () => {

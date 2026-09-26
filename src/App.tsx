@@ -44,6 +44,7 @@ export default function App() {
               depthPreview={state.result?.depthPreview ?? null}
               running={running}
               progress={state.progress}
+              hasSource={!!state.source}
             />
             <div className="stage-footer">
               {state.result ? <MeshStatsLine result={state.result} /> : <div className="stats" />}

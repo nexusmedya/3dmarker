@@ -33,7 +33,7 @@
  * TRIPO_MAX_CONCURRENT_UPLOADS, TRIPO_MULTIVIEW_ORDER, TRUST_PROXY,
  * CROSS_ORIGIN_ISOLATION, and the AI provider keys / AI_PROXY_* / AI_FETCH_*.
  */
-import { isIP } from 'node:net';
+import { BlockList, isIP } from 'node:net';
 import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { HTTPException } from 'hono/http-exception';
@@ -115,8 +115,18 @@ export interface ServerEnv extends AiServerEnv {
    * (default 'front,left,back,right'; ASSUMPTION, see DEFAULT_MULTIVIEW_ORDER).
    */
   TRIPO_MULTIVIEW_ORDER?: string;
-  /** '1' behind exactly one reverse proxy: identify clients by the last X-Forwarded-For hop. */
+  /**
+   * '1' behind exactly one reverse proxy: identify clients by the last
+   * X-Forwarded-For hop, but only on connections from a trusted proxy
+   * (TRUSTED_PROXIES); anyone else is identified by their own address.
+   */
   TRUST_PROXY?: string;
+  /**
+   * Comma-separated addresses / CIDR ranges of the reverse proxy (with
+   * TRUST_PROXY). Default: loopback and private ranges (127.0.0.0/8, ::1,
+   * 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7).
+   */
+  TRUSTED_PROXIES?: string;
   /** '1' to send COEP: credentialless (with COOP) so onnxruntime-web can use threaded WASM. */
   CROSS_ORIGIN_ISOLATION?: string;
 }
@@ -180,6 +190,33 @@ export function rateKeyForIp(ip: string): string {
   const t = tail ? tail.split(':') : [];
   const groups = addr.includes('::') ? [...h, ...Array<string>(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t] : h;
   return `${groups.slice(0, 4).map((g) => g.replace(/^0+(?=.)/, '')).join(':')}::/64`;
+}
+
+/** Default TRUSTED_PROXIES: loopback and private / unique-local ranges, where a reverse proxy on the same host or network connects from. */
+export const DEFAULT_TRUSTED_PROXIES = '127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7';
+
+/** TRUSTED_PROXIES (IPs and CIDR ranges; invalid entries dropped, so an all-invalid list trusts nobody) → a matcher; the default ranges when unset or empty. */
+export function parseTrustedProxies(value: string | undefined): BlockList {
+  const list = new BlockList();
+  for (const raw of (value?.trim() ? value : DEFAULT_TRUSTED_PROXIES).split(',')) {
+    const [addr, bits, extra] = raw.trim().split('/');
+    const type = isIP(addr ?? '');
+    if (!type || extra !== undefined) continue;
+    const max = type === 4 ? 32 : 128;
+    const prefix = bits === undefined ? max : /^\d{1,3}$/.test(bits) ? Number(bits) : NaN;
+    if (!(prefix >= 0 && prefix <= max)) continue;
+    list.addSubnet(addr, prefix, type === 4 ? 'ipv4' : 'ipv6');
+  }
+  return list;
+}
+
+/** Whether a socket peer address is in `trusted` (IPv4-mapped IPv6 is checked as IPv4). */
+export function isTrustedPeer(address: string, trusted: BlockList): boolean {
+  const addr = address.replace(/%.*$/, '');
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(addr);
+  const ip = mapped ? mapped[1] : addr;
+  const type = isIP(ip);
+  return type !== 0 && trusted.check(ip, type === 4 ? 'ipv4' : 'ipv6');
 }
 
 /**
@@ -270,8 +307,10 @@ export function createApp(deps: AppDeps = {}): Hono<AppEnv> {
   const pendingHits = new InFlight();
   const downloads = new InFlight();
   const trustProxy = flagEnv(env.TRUST_PROXY);
+  const trustedProxies = parseTrustedProxies(env.TRUSTED_PROXIES);
   const multiviewOrder = parseMultiviewOrder(env.TRIPO_MULTIVIEW_ORDER) ?? DEFAULT_MULTIVIEW_ORDER;
   let warnedBadForwardedFor = false;
+  let warnedUntrustedPeer = false;
 
   const tripo = (key: string) => new TripoClient({ apiKey: key, baseUrl: apiBase, fetch: deps.fetch });
   const aiKeys = allServerKeys(env);
@@ -288,8 +327,24 @@ export function createApp(deps: AppDeps = {}): Hono<AppEnv> {
     return { key: header, source: 'user' };
   };
 
+  /** The socket peer's address; null without a Node socket (e.g. app.request in tests). */
+  const peerAddress = (c: Context): string | null => {
+    try {
+      return getConnInfo(c).remote.address ?? 'unknown';
+    } catch {
+      return null;
+    }
+  };
+
   const clientIp = (c: Context): string => {
-    if (trustProxy) {
+    const peer = peerAddress(c);
+    // X-Forwarded-For is whatever the sender wants it to be: only a trusted proxy's is believed.
+    const fromProxy = trustProxy && (peer === null || isTrustedPeer(peer, trustedProxies));
+    if (trustProxy && !fromProxy && !warnedUntrustedPeer && c.req.header('x-forwarded-for') !== undefined) {
+      warnedUntrustedPeer = true;
+      log.warn('TRUST_PROXY: ignoring X-Forwarded-For on a direct connection from an address outside TRUSTED_PROXIES (bind HOST=127.0.0.1 or firewall PORT so only the proxy can connect)');
+    }
+    if (fromProxy) {
       const hops = (c.req.header('x-forwarded-for') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
       const ip = hops.length ? parseForwardedHop(hops[hops.length - 1]) : null;
       if (ip) return rateKeyForIp(ip);
@@ -298,11 +353,7 @@ export function createApp(deps: AppDeps = {}): Hono<AppEnv> {
         log.warn('TRUST_PROXY: unparseable X-Forwarded-For hop; rate-limiting by the proxy address instead');
       }
     }
-    try {
-      return rateKeyForIp(getConnInfo(c).remote.address ?? 'unknown');
-    } catch {
-      return 'unknown'; // no Node socket (e.g. app.request in tests)
-    }
+    return peer === null ? 'unknown' : rateKeyForIp(peer);
   };
 
   const tooMany = (c: Context, retryAfterSec: number) => {

@@ -16,10 +16,9 @@
  * untouched instead of uploading).
  */
 import type { ProviderAdapter, ProviderConfig } from '../types';
-import { AbortError } from '../../core/types';
-import { aiFetch, AiError, aiTiming, AI_ERROR_TEXT, providerName, readJson, sleep } from '../transport';
+import { aiFetch, AiError, aiTiming, AI_ERROR_TEXT, providerName, readJson, sleep, withRetry } from '../transport';
 import { asGlb, asImage, PROGRESS, toModelPlan } from './common';
-import { runGeneric, type GenericRequest } from './generic';
+import { genericEditImageLimit, runGeneric, type GenericRequest } from './generic';
 
 const ENDPOINT = /^[A-Za-z0-9_.-]+(\/[A-Za-z0-9_.-]+)+$/;
 const NAMESPACES = ['workflows', 'comfy'];
@@ -59,11 +58,16 @@ export async function runFalJob(cfg: ProviderConfig, model: string, input: unkno
   if (!id) throw new AiError(AI_ERROR_TEXT.badResponse(name, 'no request id'), 'bad-response');
   const base = `queue/${falAppPath(model)}/requests/${id}`;
   const deadline = Date.now() + aiTiming.maxJobMs;
+  // Status / result GETs are idempotent: transient failures (5xx, 429, network) are retried.
+  const get = (path: string) =>
+    withRetry(async () => readJson<unknown>(await aiFetch(cfg, path, { method: 'GET', signal, timeoutMs: aiTiming.pollTimeoutMs }), name, signal), { signal, deadline });
+  let completed = false;
   try {
     for (;;) {
       if (Date.now() > deadline) throw new AiError(AI_ERROR_TEXT.timeout(name, Math.round(aiTiming.maxJobMs / 1000)), 'timeout');
-      const st = await readJson<QueueStatus>(await aiFetch(cfg, `${base}/status`, { method: 'GET', signal, timeoutMs: aiTiming.pollTimeoutMs }), name, signal);
+      const st = (await get(`${base}/status`)) as QueueStatus;
       if (st.status === 'COMPLETED') {
+        completed = true;
         if (st.error) {
           const d = typeof st.error === 'string' ? st.error : JSON.stringify(st.error);
           throw new AiError({ tr: `${name} işi başarısız oldu: ${d.slice(0, 300)}`, en: `The ${name} job failed: ${d.slice(0, 300)}` }, 'failed', 0, d);
@@ -74,13 +78,14 @@ export async function runFalJob(cfg: ProviderConfig, model: string, input: unkno
       await sleep(aiTiming.pollMs, signal);
     }
   } catch (e) {
-    if (signal.aborted || e instanceof AbortError) cancelJob(cfg, base);
+    // Abort, timeout or a persistent polling error: stop the (billed) job unless it already finished.
+    if (!completed) cancelJob(cfg, base);
     throw e;
   }
-  return readJson<unknown>(await aiFetch(cfg, base, { method: 'GET', signal, timeoutMs: aiTiming.pollTimeoutMs }), name, signal);
+  return get(base);
 }
 
-/** Best-effort cancel after the user aborted. */
+/** Best-effort cancel of a job we stopped waiting for (abort, deadline, persistent errors). */
 function cancelJob(cfg: ProviderConfig, base: string): void {
   aiFetch(cfg, `${base}/cancel`, { method: 'PUT', signal: new AbortController().signal, timeoutMs: 15_000 }).catch(() => {});
 }
@@ -89,8 +94,9 @@ const run = (cfg: ProviderConfig) => (model: string, input: unknown, req: Generi
 
 export const falAdapter: ProviderAdapter = {
   kind: 'fal',
+  editImageLimit: genericEditImageLimit,
   async editImage(cfg, req) {
-    const blob = await runGeneric(cfg, 'image-edit', { prompt: req.prompt, images: req.images, signal: req.signal, onProgress: req.onProgress }, 'image', run(cfg));
+    const blob = await runGeneric(cfg, 'image-edit', { prompt: req.prompt, images: req.images, aspect: req.aspect, signal: req.signal, onProgress: req.onProgress }, 'image', run(cfg));
     return asImage(blob, providerName(cfg));
   },
   async removeBackground(cfg, image, signal) {

@@ -4,6 +4,7 @@ import type { Progress, ViewId } from '../types';
 import { AbortError } from '../types';
 import { LocalizedError } from '../errors';
 import { computeMeshStats } from '../mesh/stats';
+import { distanceTransform } from '../image/distance';
 import { FUSION_TEXT, reconstructFromViews, sanitizeFusionOptions } from './reconstruct';
 import type { DepthEstimator, FusionContext, FusionOptions, FusionViewInput } from './types';
 import { box, cylinderY, fakeDepthEstimator, renderView, renderViews, sphere, VIEW_COLORS, type Solid } from './testing';
@@ -175,6 +176,61 @@ describe('reconstructFromViews: shapes', () => {
   });
 });
 
+describe('reconstructFromViews: depth calibration on non-spherical subjects', () => {
+  // Torso (half-width 0.3, depth 0.36) with arms; exact rendered depth, 4 views, default strength.
+  const torso = box([-0.3, -1, -0.18], [0.3, 0.6, 0.18]);
+  const H = 1.6;
+  /** Mesh positions back in world units (the result is rescaled to a longest side of 2 and centred). */
+  function toWorld(g: BufferGeometry) {
+    const b = bounds(g);
+    const s = b.size[1] / H;
+    const c = [(b.max[0] + b.min[0]) / 2, b.min[1], (b.max[2] + b.min[2]) / 2];
+    return { s, at: (p: Float32Array, i: number) => [(p[i] - c[0]) / s, (p[i + 1] - c[1]) / s - 1, (p[i + 2] - c[2]) / s] };
+  }
+  const voxel = H / 144;
+
+  it('keeps the torso side face under side arms and the full Z extent', async () => {
+    const solid: Solid = [torso, cylinderY(0.42, 0, 0.08, -0.6, 0.55), cylinderY(-0.42, 0, 0.08, -0.6, 0.55)];
+    const { inputs, renders } = renderViews(solid, ['front', 'back', 'left', 'right'], { width: 400, height: 400, scale: 190 });
+    const { geometry: g } = await reconstructFromViews(inputs, { resolution: 144 }, ctx({ estimateDepth: fakeDepthEstimator(renders) }));
+    const { s, at } = toWorld(g);
+    const p = attr(g, 'position'), n = attr(g, 'normal');
+    const xs: number[] = [];
+    for (let i = 0; i < p.length; i += 3) {
+      const [x, y, z] = at(p, i);
+      // The torso's +X face beside the arm (z outside the arm's radius).
+      if (Math.abs(y) < 0.3 && z > 0.1 && z < 0.15 && x > 0 && x < 0.34 && n[i] > 0.8) xs.push(x);
+    }
+    expect(xs.length).toBeGreaterThan(20);
+    xs.sort((a, b) => a - b);
+    expect(Math.abs(xs[xs.length >> 1] - 0.3)).toBeLessThan(2 * voxel);
+    expect(Math.abs(bounds(g).size[2] / s - 0.36)).toBeLessThan(2 * voxel);
+  });
+
+  it('keeps an arm lying in front of the torso', async () => {
+    const solid: Solid = [torso, cylinderY(0.12, 0.26, 0.08, -0.6, 0.4)];
+    const { inputs, renders } = renderViews(solid, ['front', 'back', 'left', 'right'], { width: 400, height: 400, scale: 190 });
+    const { geometry: g } = await reconstructFromViews(inputs, { resolution: 144 }, ctx({ estimateDepth: fakeDepthEstimator(renders) }));
+    const { s, at } = toWorld(g);
+    expect(Math.abs(bounds(g).size[2] / s - 0.52)).toBeLessThan(2 * voxel);
+    // Torso front (away from the arm) and the arm's front stay where they are.
+    const p = attr(g, 'position'), n = attr(g, 'normal');
+    const torsoFront: number[] = [], armFront: number[] = [];
+    for (let i = 0; i < p.length; i += 3) {
+      const [x, y, z] = at(p, i);
+      if (n[i + 2] < 0.9 || y < -0.5 || y > 0.3) continue;
+      if (x < -0.1 && x > -0.25) torsoFront.push(z);
+      if (Math.abs(x - 0.12) < 0.02) armFront.push(z);
+    }
+    const median = (v: number[]) => v.sort((a, b) => a - b)[v.length >> 1];
+    expect(torsoFront.length).toBeGreaterThan(20);
+    expect(armFront.length).toBeGreaterThan(5);
+    // World Z is centred on the box: torso front at 0.18 − 0.08, arm front at 0.34 − 0.08.
+    expect(Math.abs(median(torsoFront) - 0.1)).toBeLessThan(2 * voxel);
+    expect(Math.abs(median(armFront) - 0.26)).toBeLessThan(2 * voxel);
+  });
+});
+
 describe('reconstructFromViews: view conventions', () => {
   // Base slab + a pillar at the subject's left (+X) rear (Z < 0).
   const pillar: Solid = [box([-1, -1, -0.5], [1, -0.6, 0.5]), box([0.4, -0.6, -0.5], [1, 1, 0])];
@@ -249,6 +305,27 @@ describe('reconstructFromViews: view conventions', () => {
     }
   });
 
+  it.each([[['front', 'back']], [['front', 'back', 'left', 'right']]] as ViewId[][][])(
+    'does not paint a matting fringe onto the rim (%j)',
+    async (views) => {
+      const skin: [number, number, number] = [230, 180, 150];
+      const { inputs } = renderViews([cylinderY(0, 0, 0.15, -1, 1)], views, { width: 300, height: 300, scale: 140, color: () => skin });
+      // A 2 px blue fringe inside every alpha mask, as matting on a blue backdrop leaves it.
+      for (const inp of inputs) {
+        const { width: w, height: h, data } = inp.image;
+        const m = new Uint8Array(w * h);
+        for (let i = 0; i < w * h; i++) m[i] = data[i * 4 + 3] > 0 ? 1 : 0;
+        const d = distanceTransform({ width: w, height: h, data: m });
+        for (let i = 0; i < w * h; i++) if (m[i] && d[i] <= 2) data.set([30, 60, 220, 255], i * 4);
+      }
+      const { geometry: g } = await reconstructFromViews(inputs, { resolution: 96 }, ctx());
+      const c = attr(g, 'color');
+      let blue = 0;
+      for (let i = 0; i < c.length; i += 3) if (c[i + 2] > c[i]) blue++;
+      expect(blue / (c.length / 3)).toBeLessThan(0.02);
+    },
+  );
+
   it('respects occlusion: a colour is not painted through the object', async () => {
     // A small box in front of a big one; the front view sees red on the small box, green on the big one.
     const solid: Solid = [box([-1, -1, -0.5], [1, 1, 0]), box([-0.3, -0.3, 0], [0.3, 0.3, 0.5])];
@@ -271,6 +348,18 @@ describe('reconstructFromViews: view conventions', () => {
 });
 
 describe('reconstructFromViews: robustness', () => {
+  it('keeps a small detached part that every view shows', async () => {
+    // Body box plus a ball of radius 0.05 (about 320 px of a 512² render).
+    const solid: Solid = [box([-0.25, -0.6, -0.15], [0.25, 0.6, 0.15]), sphere([0.45, 0.2, 0], 0.05)];
+    const { inputs } = renderViews(solid, ['front', 'back', 'left', 'right'], { width: 512, height: 512, scale: 204.8 });
+    const { geometry: g } = await reconstructFromViews(inputs, { resolution: 144, hull: 'strict' }, ctx());
+    const { size } = bounds(g);
+    // World 0.75 × 1.2, rescaled to a longest side of 2 (without the ball: 0.5 × 1.2 → 0.83).
+    expect(size[1]).toBeCloseTo(2, 5);
+    expect(size[0]).toBeGreaterThan(1.2);
+    expect(size[0]).toBeLessThan(1.3);
+  });
+
   it('tolerant mode survives a misaligned extra view better than strict mode', async () => {
     const front = renderView([sphere([0, 0, 0], 1)], 'front', { width: 128, height: 128, scale: 50 });
     // The back view carries a bump that shifts / squeezes the sphere after bbox normalisation.
@@ -347,6 +436,31 @@ describe('reconstructFromViews: robustness', () => {
       during.abort();
     });
     await expect(reconstructFromViews(inputs, {}, ctx({ signal: during.signal, estimateDepth }))).rejects.toBeInstanceOf(AbortError);
+  });
+
+  it('yields inside long stages and aborts there, before the stage ends', async () => {
+    const { inputs } = renderViews([sphere([0, 0, 0], 1)], ['front', 'left'], { width: 96, height: 96, scale: 40 });
+    const ac = new AbortController();
+    const labels: string[] = [];
+    let inBlur = 0;
+    const c = ctx({
+      signal: ac.signal,
+      sliceMs: 0,
+      onProgress: (p) => labels.push(p.label.en),
+      yieldControl: async () => {
+        // The stage's own yield is the first one after its label; abort at the third slice inside it.
+        if (labels.at(-1) === FUSION_TEXT.smoothVolume.en && ++inBlur === 4) ac.abort();
+      },
+    });
+    await expect(reconstructFromViews(inputs, { resolution: 64 }, c)).rejects.toBeInstanceOf(AbortError);
+    expect(inBlur).toBe(4);
+    expect(labels.at(-1)).toBe(FUSION_TEXT.smoothVolume.en);
+
+    // Without an abort, every stage yields many times at sliceMs 0.
+    let ticks = 0;
+    const done = await reconstructFromViews(inputs, { resolution: 64 }, ctx({ sliceMs: 0, yieldControl: async () => void ticks++ }));
+    expect(done.info.triangles).toBeGreaterThan(0);
+    expect(ticks).toBeGreaterThan(200);
   });
 
   it('rejects a missing front, a lone front and views that do not overlap', async () => {

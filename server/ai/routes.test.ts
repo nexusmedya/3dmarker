@@ -80,7 +80,7 @@ describe('GET /api/ai/providers', () => {
     const body = r.json as { providers: { id: string; managed: boolean; apiKey: string; models: object }[]; proxyKinds: string[]; byok: boolean };
     expect(body.providers.map((p) => p.id)).toEqual(['server-openai', 'server-gemini', 'server-stability', 'server-replicate', 'server-fal', 'server-tripo']);
     expect(body.providers[0].models).toEqual({ 'image-edit': 'gpt-image-1' });
-    expect(body.proxyKinds).toEqual(['openai', 'gemini', 'stability', 'replicate', 'fal', 'tripo']);
+    expect(body.proxyKinds).toEqual(['openai', 'gemini', 'stability', 'replicate', 'fal']);
     expect(body.byok).toBe(true);
     for (const key of Object.values(ALL_KEYS)) expect(r.text).not.toContain(key);
   });
@@ -88,7 +88,7 @@ describe('GET /api/ai/providers', () => {
   it('is empty without keys and lists extra kinds only when bases are configured', async () => {
     expect((await setup().request('/api/ai/providers')).json).toEqual({
       providers: [],
-      proxyKinds: ['openai', 'gemini', 'stability', 'replicate', 'fal', 'tripo'],
+      proxyKinds: ['openai', 'gemini', 'stability', 'replicate', 'fal'],
       byok: true,
     });
     const extra = await setup({ env: { AI_PROXY_EXTRA_BASES: 'https://llm.example.com/v1', AI_PROXY_BYOK: '0', AI_PROXY_KINDS: 'fal' } }).request(
@@ -110,9 +110,8 @@ describe('ANY /api/ai/proxy/:kind/*', () => {
       ],
       ['stability/v2beta/3d/stable-fast-3d', 'https://api.stability.ai/v2beta/3d/stable-fast-3d', ['authorization', `Bearer ${ALL_KEYS.STABILITY_API_KEY}`]],
       ['replicate/v1/predictions', 'https://api.replicate.com/v1/predictions', ['authorization', `Bearer ${ALL_KEYS.REPLICATE_API_TOKEN}`]],
-      ['fal/fal-ai/flux/dev', 'https://fal.run/fal-ai/flux/dev', ['authorization', `Key ${ALL_KEYS.FAL_KEY}`]],
+      ['replicate/v1/models/o/n/predictions', 'https://api.replicate.com/v1/models/o/n/predictions', ['authorization', `Bearer ${ALL_KEYS.REPLICATE_API_TOKEN}`]],
       ['fal/queue/fal-ai/trellis', 'https://queue.fal.run/fal-ai/trellis', ['authorization', `Key ${ALL_KEYS.FAL_KEY}`]],
-      ['tripo/v2/openapi/task', 'https://api.tripo3d.ai/v2/openapi/task', ['authorization', `Bearer ${ALL_KEYS.TRIPO_API_KEY}`]],
     ];
     for (const [path, url, [h, v]] of cases) {
       const r = await request(`/api/ai/proxy/${path}`, post('{"a":1}', { 'content-type': 'application/json' }));
@@ -152,14 +151,14 @@ describe('ANY /api/ai/proxy/:kind/*', () => {
     expect(r.res.headers.get('cache-control')).toBe('no-store');
     expect(r.res.headers.get('x-ai-proxy-error')).toBeNull();
 
-    for (const method of ['PUT', 'PATCH', 'DELETE']) {
-      await request('/api/ai/proxy/replicate/v1/x', { method, body: method === 'DELETE' ? undefined : 'b' });
-      expect(calls.at(-1)!.method).toBe(method);
+    await request('/api/ai/proxy/fal/queue/fal-ai/x/requests/r1/cancel', { method: 'PUT' });
+    expect(calls.at(-1)!.method).toBe('PUT');
+    expect(calls.at(-1)!.url).toBe('https://queue.fal.run/fal-ai/x/requests/r1/cancel');
+    // No adapter needs these: never forwarded, whatever the path.
+    for (const method of ['PATCH', 'DELETE', 'HEAD', 'OPTIONS']) {
+      expect((await request('/api/ai/proxy/replicate/v1/predictions/abc', { method })).status, method).toBe(405);
     }
-    const head = await request('/api/ai/proxy/replicate/v1/x', { method: 'HEAD' });
-    expect(head.status).toBe(200);
-    expect(calls.at(-1)!.method).toBe('HEAD');
-    expect((await request('/api/ai/proxy/replicate/v1/x', { method: 'OPTIONS' })).status).toBe(405);
+    expect(calls).toHaveLength(2);
   });
 
   it('relays the user’s own key (it wins over the server key) and validates it', async () => {
@@ -172,14 +171,14 @@ describe('ANY /api/ai/proxy/:kind/*', () => {
     expect(bad.json.error).toMatch(/invalid format/);
 
     const noKeys = setup();
-    const r = await noKeys.request('/api/ai/proxy/fal/fal-ai/x', { headers: { 'x-ai-key': 'id:secret' } });
+    const r = await noKeys.request('/api/ai/proxy/fal/queue/fal-ai/x/requests/r1/status', { headers: { 'x-ai-key': 'id:secret' } });
     expect(r.status).toBe(200);
     expect(noKeys.calls[0].headers.get('authorization')).toBe('Key id:secret');
   });
 
   it('answers 401 JSON without any key and never calls upstream', async () => {
     const { request, calls } = setup({ env: { OPENAI_API_KEY: OPENAI_KEY } });
-    const r = await request('/api/ai/proxy/stability/v2beta/x', post('x'));
+    const r = await request('/api/ai/proxy/stability/v2beta/3d/stable-fast-3d', post('x'));
     expect(r.status).toBe(401);
     expect(r.json.error).toMatch(/No Stability AI API key/);
     expect(r.res.headers.get('x-ai-proxy-error')).toBe('1');
@@ -215,16 +214,17 @@ describe('ANY /api/ai/proxy/:kind/*', () => {
     expect((await request('/api/ai/proxy/openai-compatible/v1/x')).status).toBe(404);
     expect((await request('/api/ai/proxy/openai')).status).toBe(400);
     expect(calls).toHaveLength(0);
-    // Whatever the path, the host is the kind's.
-    await request('/api/ai/proxy/openai/@evil.com/x');
-    await request('/api/ai/proxy/openai/v1/x?host=evil.com&url=https://evil.com');
-    expect(calls.map((c) => new URL(c.url).host)).toEqual(['api.openai.com', 'api.openai.com']);
+    expect((await request('/api/ai/proxy/openai/@evil.com/x')).status).toBe(403); // not an allowed endpoint
+    expect(calls).toHaveLength(0);
+    // Whatever the query, the host is the kind's.
+    await request('/api/ai/proxy/openai/v1/models?host=evil.com&url=https://evil.com');
+    expect(calls.map((c) => new URL(c.url).host)).toEqual(['api.openai.com']);
   });
 
   it('honours AI_PROXY_KINDS', async () => {
     const { request, calls } = setup({ env: { ...ALL_KEYS, AI_PROXY_KINDS: 'fal' } });
     expect((await request('/api/ai/proxy/openai/v1/models')).status).toBe(404);
-    expect((await request('/api/ai/proxy/fal/fal-ai/x')).status).toBe(200);
+    expect((await request('/api/ai/proxy/fal/queue/fal-ai/x/requests/r1/status')).status).toBe(200);
     expect(calls).toHaveLength(1);
   });
 
@@ -242,7 +242,7 @@ describe('ANY /api/ai/proxy/:kind/*', () => {
     const big = await request('/api/ai/proxy/openai/v1/images/edits', post(new Uint8Array(2000), { 'content-length': '2000' }));
     expect(big.status).toBe(413);
     expect(big.json.error).toMatch(/larger than/);
-    expect((await request('/api/ai/proxy/openai/v1/x', post('x', { 'content-length': 'abc' }))).status).toBe(400);
+    expect((await request('/api/ai/proxy/openai/v1/images/edits', post('x', { 'content-length': 'abc' }))).status).toBe(400);
     expect(calls).toHaveLength(0);
     expect((await request('/api/ai/proxy/openai/v1/images/edits', post(new Uint8Array(1000), { 'content-length': '1000' }))).status).toBe(200);
     expect(calls[0].headers.get('content-length')).toBe('1000');
@@ -303,7 +303,7 @@ describe('ANY /api/ai/proxy/:kind/*', () => {
         c.close();
       },
     });
-    const res = await app.request('/api/ai/proxy/openai/v1/responses', {
+    const res = await app.request('/api/ai/proxy/openai/v1/images/edits', {
       method: 'POST',
       body,
       duplex: 'half',
@@ -412,7 +412,7 @@ describe('ANY /api/ai/proxy/:kind/*', () => {
 
   it('refuses upstream redirects and maps transport failures', async () => {
     const redirect = setup({ env: ALL_KEYS, handler: () => new Response(null, { status: 302, headers: { location: 'https://evil.com/' } }) });
-    const r = await redirect.request('/api/ai/proxy/openai/v1/x');
+    const r = await redirect.request('/api/ai/proxy/openai/v1/models');
     expect(r.status).toBe(502);
     expect(r.json.error).toMatch(/redirect/);
     expect(r.res.headers.get('location')).toBeNull();
@@ -424,7 +424,7 @@ describe('ANY /api/ai/proxy/:kind/*', () => {
         throw new TypeError('fetch failed');
       },
     });
-    const d = await down.request('/api/ai/proxy/fal/fal-ai/x', post('x'));
+    const d = await down.request('/api/ai/proxy/fal/queue/fal-ai/x', post('x'));
     expect(d.status).toBe(502);
     expect(d.json).toEqual({ error: 'Could not reach fal.ai' });
 
@@ -438,26 +438,182 @@ describe('ANY /api/ai/proxy/:kind/*', () => {
     expect(h.json.error).toMatch(/did not answer/);
   });
 
+  it('forwards only the endpoints the adapters call (never account data or other resources)', async () => {
+    const { request, calls } = setup({ env: { ...ALL_KEYS, AI_PROXY_RATE_LIMIT: '1', AI_PROXY_READ_RATE_LIMIT: '1' } });
+    const refused: [string, RequestInit][] = [
+      ['replicate/v1/predictions', {}], // every prediction on the account (other users' inputs and outputs)
+      ['replicate/v1/trainings', {}],
+      ['replicate/v1/deployments', post('{"min_instances":5}')],
+      ['openai/v1/files', {}],
+      ['openai/v1/files/file-abc/content', {}],
+      ['openai/v1/fine_tuning/jobs', post('{}')],
+      ['openai/v1/chat/completions', post('{}')],
+      ['gemini/v1beta/files', {}],
+      ['gemini/v1beta/tunedModels', {}],
+      ['fal/fal-ai/veo3', post('{}')],
+      ['fal/queue/fal-ai/veo3/requests/abc', post('{}')],
+      ['stability/v1/user/balance', {}],
+    ];
+    for (const [path, init] of refused) {
+      for (const own of [false, true]) {
+        const r = await request(`/api/ai/proxy/${path}`, { ...init, headers: own ? { 'x-ai-key': USER_KEY } : {} });
+        expect(r.status, path).toBe(403);
+        expect(r.json.error, path).toMatch(/Endpoint not allowed/);
+        expect(r.res.headers.get('x-ai-proxy-error')).toBe('1');
+      }
+    }
+    expect((await request('/api/ai/proxy/openai/v1/files/file-abc', { method: 'DELETE' })).status).toBe(405);
+    expect(calls).toHaveLength(0);
+    // Refusals used up no budget: the allowed calls still go through.
+    expect((await request('/api/ai/proxy/replicate/v1/predictions', post('{}'))).status).toBe(200);
+    expect((await request('/api/ai/proxy/replicate/v1/predictions/abc')).status).toBe(200);
+    expect(calls.map((c) => `${c.method} ${c.url}`)).toEqual(['POST https://api.replicate.com/v1/predictions', 'GET https://api.replicate.com/v1/predictions/abc']);
+  });
+
+  it('does not proxy Tripo (it has its own rate-limited /api/tripo routes)', async () => {
+    const { request, calls } = setup({ env: { TRIPO_API_KEY: ALL_KEYS.TRIPO_API_KEY, TRIPO_RATE_LIMIT: '2' } });
+    for (const path of ['tripo/v2/openapi/task', 'tripo/v2/openapi/user/balance']) {
+      const r = await request(`/api/ai/proxy/${path}`, post('{}'));
+      expect(r.status, path).toBe(404);
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it('caps server-key generations per kind over all clients, per window and per day', async () => {
+    let t = 1_000_000;
+    const { request, calls, logs } = setup({
+      env: { ...ALL_KEYS, TRUST_PROXY: '1', AI_PROXY_RATE_LIMIT: '1', AI_PROXY_GLOBAL_RATE_LIMIT: '3', AI_PROXY_RATE_WINDOW_SEC: '60' },
+      now: () => t,
+    });
+    // Each client a different /64 (a fresh per-client bucket), all in different /48s.
+    const gen = (i: number, kind = 'openai/v1/images/edits', h: Record<string, string> = {}) =>
+      request(`/api/ai/proxy/${kind}`, post('x', { 'x-forwarded-for': `2001:db8:${i}:1::1`, ...h }));
+    for (let i = 0; i < 3; i++) expect((await gen(i)).status).toBe(200);
+    const blocked = await gen(3);
+    expect(blocked.status).toBe(429);
+    expect(blocked.json.error).toMatch(/budget is used up/);
+    expect(blocked.res.headers.get('retry-after')).toBe('60');
+    expect(logs.join('\n')).toMatch(/AI_PROXY_GLOBAL_RATE_LIMIT=3/);
+    // Per kind; users' own keys are not affected.
+    expect((await gen(4, 'replicate/v1/predictions')).status).toBe(200);
+    expect((await gen(5, 'openai/v1/images/edits', { 'x-ai-key': USER_KEY })).status).toBe(200);
+    expect(calls).toHaveLength(5);
+    t += 60_000;
+    expect((await gen(6)).status).toBe(200);
+
+    let d = 0;
+    const daily = setup({ env: { ...ALL_KEYS, TRUST_PROXY: '1', AI_PROXY_RATE_LIMIT: '0', AI_PROXY_DAILY_LIMIT: '2' }, now: () => d });
+    const dgen = (ip: string) => daily.request('/api/ai/proxy/openai/v1/images/edits', post('x', { 'x-forwarded-for': ip }));
+    expect((await dgen('1.1.1.1')).status).toBe(200);
+    expect((await dgen('2.2.2.2')).status).toBe(200);
+    d += 12 * 3_600_000;
+    const r = await dgen('3.3.3.3');
+    expect(r.status).toBe(429);
+    expect(Number(r.res.headers.get('retry-after'))).toBe(12 * 3600);
+    expect(daily.logs.join('\n')).toMatch(/daily .*AI_PROXY_DAILY_LIMIT=2/);
+    d += 12 * 3_600_000;
+    expect((await dgen('3.3.3.3')).status).toBe(200);
+  });
+
+  it('also limits server-key generations per IPv6 /48, not only per /64', async () => {
+    const { request, calls } = setup({ env: { ...ALL_KEYS, TRUST_PROXY: '1', AI_PROXY_RATE_LIMIT: '1', AI_PROXY_GLOBAL_RATE_LIMIT: '0' } });
+    const gen = (ip: string) => request('/api/ai/proxy/openai/v1/images/edits', post('x', { 'x-forwarded-for': ip }));
+    // Four /64s of one /48 get their own budget each, up to 4× the per-client limit…
+    for (let i = 0; i < 4; i++) expect((await gen(`2001:db8:aa:${i}::1`)).status).toBe(200);
+    expect((await gen('2001:db8:aa:1::2')).status).toBe(429); // same /64
+    expect((await gen('2001:db8:aa:99::1')).status).toBe(429); // a fifth /64 of that /48
+    // …while other /48s and IPv4 clients are unaffected.
+    expect((await gen('2001:db8:bb:1::1')).status).toBe(200);
+    expect((await gen('203.0.113.7')).status).toBe(200);
+    expect(calls).toHaveLength(6);
+  });
+
+  it('keeps part of AI_PROXY_MAX_CONCURRENT for server-key requests', async () => {
+    let open!: () => void;
+    const gate = new Promise<void>((r) => (open = r));
+    let started = 0;
+    const { app, request } = setup({
+      env: { ...ALL_KEYS, TRUST_PROXY: '1', AI_PROXY_MAX_CONCURRENT: '8' },
+      handler: async () => {
+        started++;
+        await gate;
+        return json({ ok: true });
+      },
+    });
+    const hold = (ip: string, own: boolean) =>
+      app.request('/api/ai/proxy/openai/v1/images/edits', {
+        method: 'POST',
+        body: 'x',
+        headers: { [CLIENT_HEADER]: '1', 'x-forwarded-for': ip, ...(own ? { 'x-ai-key': USER_KEY } : {}) },
+      });
+    // Own keys (free to hold for as long as one likes) may use 6 of the 8 slots.
+    const pending = ['10.0.0.1', '10.0.0.1', '10.0.0.2', '10.0.0.2', '10.0.0.3', '10.0.0.3'].map((ip) => hold(ip, true));
+    await vi.waitFor(() => expect(started).toBe(6));
+    const byok = await request('/api/ai/proxy/openai/v1/images/edits', post('x', { 'x-forwarded-for': '10.0.0.4', 'x-ai-key': USER_KEY }));
+    expect(byok.status).toBe(429);
+    expect(byok.json.error).toMatch(/in progress/);
+    pending.push(hold('10.0.0.5', false));
+    await vi.waitFor(() => expect(started).toBe(7));
+    open();
+    for (const r of await Promise.all(pending)) {
+      expect(r.status).toBe(200);
+      await r.text();
+    }
+  });
+
+  it('shrinks the per-client cap as the slots fill up', async () => {
+    let open!: () => void;
+    const gate = new Promise<void>((r) => (open = r));
+    let started = 0;
+    const { app, request } = setup({
+      env: { ...ALL_KEYS, TRUST_PROXY: '1', AI_PROXY_MAX_CONCURRENT: '12' },
+      handler: async () => {
+        started++;
+        await gate;
+        return json({ ok: true });
+      },
+    });
+    const hold = (ip: string) => app.request('/api/ai/proxy/openai/v1/images/edits', { method: 'POST', body: 'x', headers: { [CLIENT_HEADER]: '1', 'x-forwarded-for': ip } });
+    // 12 slots: the first client gets 6 (half of what is free), the next 3, then 2 each.
+    const pending: (Response | Promise<Response>)[] = [];
+    for (let i = 0; i < 6; i++) pending.push(hold('10.0.0.1'));
+    await vi.waitFor(() => expect(started).toBe(6));
+    expect((await request('/api/ai/proxy/openai/v1/images/edits', post('x', { 'x-forwarded-for': '10.0.0.1' }))).status).toBe(429);
+    for (let i = 0; i < 3; i++) pending.push(hold('10.0.0.2'));
+    await vi.waitFor(() => expect(started).toBe(9));
+    expect((await request('/api/ai/proxy/openai/v1/images/edits', post('x', { 'x-forwarded-for': '10.0.0.2' }))).status).toBe(429);
+    for (let i = 0; i < 2; i++) pending.push(hold('10.0.0.3'));
+    await vi.waitFor(() => expect(started).toBe(11));
+    open();
+    for (const r of await Promise.all(pending)) {
+      expect(r.status).toBe(200);
+      await r.text();
+    }
+  });
+
   it('proxies openai-compatible only to listed bases', async () => {
     const env = { AI_PROXY_EXTRA_BASES: 'https://llm.example.com/v1, http://127.0.0.1:11434/v1' };
     const { request, calls } = setup({ env });
-    const ok = await request(
-      '/api/ai/proxy/openai-compatible/chat/completions',
-      post('{}', { 'x-ai-base': 'https://LLM.example.com/v1/', 'x-ai-key': USER_KEY }),
-    );
+    const ok = await request('/api/ai/proxy/openai-compatible/images/edits', post('{}', { 'x-ai-base': 'https://LLM.example.com/v1/', 'x-ai-key': USER_KEY }));
     expect(ok.status).toBe(200);
-    expect(calls[0].url).toBe('https://llm.example.com/v1/chat/completions');
+    expect(calls[0].url).toBe('https://llm.example.com/v1/images/edits');
     expect(calls[0].headers.get('authorization')).toBe(`Bearer ${USER_KEY}`);
     await request('/api/ai/proxy/openai-compatible/models', { headers: { 'x-ai-base': 'http://127.0.0.1:11434/v1', 'x-ai-auth': 'api-key', 'x-ai-key': 'k' } });
     expect(calls[1].url).toBe('http://127.0.0.1:11434/v1/models');
     expect(calls[1].headers.get('api-key')).toBe('k');
     expect(calls[1].headers.has('authorization')).toBe(false);
     // Keyless local endpoints are fine.
-    await request('/api/ai/proxy/custom-http/run', post('{}', { 'x-ai-base': 'https://llm.example.com/v1' }));
+    await request('/api/ai/proxy/custom-http/images/edits', post('{}', { 'x-ai-base': 'https://llm.example.com/v1' }));
     expect(calls[2].headers.has('authorization')).toBe(false);
     for (const base of ['https://evil.com/v1', 'https://llm.example.com', 'https://llm.example.com/v1/extra', '']) {
-      const r = await request('/api/ai/proxy/openai-compatible/chat/completions', post('{}', { 'x-ai-base': base }));
+      const r = await request('/api/ai/proxy/openai-compatible/images/edits', post('{}', { 'x-ai-base': base }));
       expect(r.status, base).toBe(403);
+    }
+    // A listed base is reachable by anyone: only the endpoints the client uses (no free chat inference on a local LLM).
+    for (const path of ['chat/completions', 'completions', 'embeddings', 'api/generate']) {
+      const r = await request(`/api/ai/proxy/openai-compatible/${path}`, post('{}', { 'x-ai-base': 'http://127.0.0.1:11434/v1' }));
+      expect(r.status, path).toBe(403);
+      expect(r.json.error, path).toMatch(/Endpoint not allowed/);
     }
     expect(calls).toHaveLength(3);
   });

@@ -14,6 +14,10 @@ export interface ModelPreset {
 }
 
 const P = '{{prompt}}';
+/** '1:1' / '3:4' / '4:3' when an aspect is wanted; the key is dropped otherwise (the model keeps the input's). */
+const AR = '{{aspect}}';
+/** fal's image_size preset ('square_hd' / 'portrait_4_3' / 'landscape_4_3'), dropped when no aspect is wanted. */
+const SIZE = '{{image_size}}';
 
 /**
  * fal.ai, verified against the @fal-ai/client 1.10 endpoint types
@@ -21,12 +25,12 @@ const P = '{{prompt}}';
  * (images[].url, image.url, model_mesh.url, model_glb.url).
  */
 export const FAL_PRESETS: Record<string, ModelPreset> = {
-  'fal-ai/nano-banana/edit': { template: { prompt: P, image_urls: '{{images}}', output_format: 'png', num_images: 1 } },
-  'fal-ai/nano-banana-pro/edit': { template: { prompt: P, image_urls: '{{images}}', output_format: 'png', num_images: 1 } },
-  'fal-ai/flux-pro/kontext': { template: { prompt: P, image_url: '{{image}}', output_format: 'png' } },
-  'fal-ai/flux-pro/kontext/max': { template: { prompt: P, image_url: '{{image}}', output_format: 'png' } },
-  'fal-ai/bytedance/seedream/v4/edit': { template: { prompt: P, image_urls: '{{images}}', num_images: 1 } },
-  'fal-ai/qwen-image-edit': { template: { prompt: P, image_url: '{{image}}', output_format: 'png' } },
+  'fal-ai/nano-banana/edit': { template: { prompt: P, image_urls: '{{images}}', output_format: 'png', num_images: 1, aspect_ratio: AR } },
+  'fal-ai/nano-banana-pro/edit': { template: { prompt: P, image_urls: '{{images}}', output_format: 'png', num_images: 1, aspect_ratio: AR } },
+  'fal-ai/flux-pro/kontext': { template: { prompt: P, image_url: '{{image}}', output_format: 'png', aspect_ratio: AR } },
+  'fal-ai/flux-pro/kontext/max': { template: { prompt: P, image_url: '{{image}}', output_format: 'png', aspect_ratio: AR } },
+  'fal-ai/bytedance/seedream/v4/edit': { template: { prompt: P, image_urls: '{{images}}', num_images: 1, image_size: SIZE } },
+  'fal-ai/qwen-image-edit': { template: { prompt: P, image_url: '{{image}}', output_format: 'png', image_size: SIZE } },
   'fal-ai/birefnet': { template: { image_url: '{{image}}', output_format: 'png', refine_foreground: true } },
   'fal-ai/birefnet/v2': { template: { image_url: '{{image}}', output_format: 'png', refine_foreground: true } },
   'fal-ai/bria/background/remove': { template: { image_url: '{{image}}' } },

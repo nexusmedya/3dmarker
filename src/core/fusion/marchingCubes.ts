@@ -18,6 +18,8 @@
  * along X, 4–7 along Y, 8–11 along Z.
  */
 
+import { drain, type Steps } from './steps';
+
 /** [lower corner, upper corner] per edge. */
 export const EDGE_CORNERS: readonly (readonly [number, number])[] = (() => {
   const edges: [number, number][] = [];
@@ -195,6 +197,17 @@ export function marchingCubes(
   origin: readonly [number, number, number] = [0, 0, 0],
   spacing = 1,
 ): IsoMesh {
+  return drain(marchingCubesSteps(field, dims, iso, origin, spacing));
+}
+
+/** marchingCubes as cooperative steps (a yield per Z slab). */
+export function* marchingCubesSteps(
+  field: Float32Array,
+  dims: readonly [number, number, number],
+  iso = 0.5,
+  origin: readonly [number, number, number] = [0, 0, 0],
+  spacing = 1,
+): Steps<IsoMesh> {
   const [nx, ny, nz] = dims;
   const nxy = nx * ny;
   const pos = new GrowF32();
@@ -207,7 +220,7 @@ export function marchingCubes(
   const vals = new Float64Array(8);
   const cornerOffset = [0, 1, nx, nx + 1, nxy, nxy + 1, nxy + nx, nxy + nx + 1];
 
-  for (let k = 0; k < nz - 1; k++) {
+  for (let k = 0; k < nz - 1; k++, yield) {
     const up = (k + 1) & 1;
     cacheX[up].fill(-1);
     cacheY[up].fill(-1);

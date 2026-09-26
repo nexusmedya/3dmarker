@@ -9,9 +9,13 @@ import {
   downloadOutput,
   errorFromStatus,
   extractErrorDetail,
+  isTransientError,
+  readJson,
   requestTarget,
   routeFor,
+  withRetry,
 } from './transport';
+import { createServer, type Server } from 'node:http';
 import { fakeNet, json, pngBlob, PNG_BASE64 } from './testing';
 
 const signal = () => new AbortController().signal;
@@ -187,5 +191,117 @@ describe('downloadOutput', () => {
     expect((await rejects(downloadOutput(url, { signal: signal() }))).code).toBe('forbidden');
     vi.stubGlobal('fetch', fakeNet().on('GET', /./, new TypeError('CORS')).fetch);
     expect((await rejects(downloadOutput(url, { signal: signal() }))).code).toBe('needs-server');
+  });
+});
+
+describe('rate limits vs billing (429)', () => {
+  const ctx = { name: 'P', route: 'direct' as const };
+
+  it('treats Gemini per-minute RESOURCE_EXHAUSTED as a rate limit and reads RetryInfo', () => {
+    const body = {
+      error: {
+        code: 429,
+        status: 'RESOURCE_EXHAUSTED',
+        message: 'You exceeded your current quota, please check your plan and billing details.',
+        details: [
+          { '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: [{ quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier' }] },
+          { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '12s' },
+        ],
+      },
+    };
+    expect(extractErrorDetail(body).retryAfterSec).toBe(12);
+    const e = errorFromStatus(429, body, ctx);
+    expect(e.code).toBe('rate-limit');
+    expect(e.retryAfterSec).toBe(12);
+    expect(e.i18n.en).toContain('try again in 12 s');
+    // A daily quota is an exhausted quota.
+    const daily = { error: { ...body.error, details: [{ violations: [{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' }] }] } };
+    expect(errorFromStatus(429, daily, ctx).code).toBe('billing');
+  });
+
+  it('treats OpenAI rate_limit_exceeded as a rate limit and insufficient_quota as billing', () => {
+    const rate = {
+      error: {
+        type: 'requests',
+        code: 'rate_limit_exceeded',
+        message: 'Rate limit reached for gpt-image-1 on images per min: Limit 5. Please try again in 12s. Visit https://platform.openai.com/account/rate-limits. You can increase your rate limit by adding a payment method to your account at https://platform.openai.com/account/billing.',
+      },
+    };
+    const e = errorFromStatus(429, rate, ctx);
+    expect(e.code).toBe('rate-limit');
+    expect(e.retryAfterSec).toBe(12);
+    expect(errorFromStatus(429, { error: { code: 'insufficient_quota', message: 'You exceeded your current quota' } }, ctx).code).toBe('billing');
+    expect(errorFromStatus(429, { error: 'slow down' }, { ...ctx, retryAfterSec: 3 }).retryAfterSec).toBe(3);
+  });
+});
+
+describe('retries', () => {
+  beforeEach(() => Object.assign(aiTiming, { retryBaseMs: 1, retryMaxMs: 2 }));
+
+  it('classifies transient errors', () => {
+    expect(isTransientError(new AiError({ tr: '', en: '' }, 'server', 502))).toBe(true);
+    expect(isTransientError(new AiError({ tr: '', en: '' }, 'server', 501))).toBe(false);
+    expect(isTransientError(new AiError({ tr: '', en: '' }, 'rate-limit', 429))).toBe(true);
+    expect(isTransientError(new AiError({ tr: '', en: '' }, 'network'))).toBe(true);
+    expect(isTransientError(new AiError({ tr: '', en: '' }, 'needs-server', 404))).toBe(false);
+    expect(isTransientError(new AiError({ tr: '', en: '' }, 'bad-request', 408))).toBe(true);
+    expect(isTransientError(new AiError({ tr: '', en: '' }, 'auth', 401))).toBe(false);
+    expect(isTransientError(new Error('x'))).toBe(false);
+  });
+
+  it('retries 5xx / 429 / network errors of idempotent GETs, and stops on others or at the deadline', async () => {
+    const net = fakeNet().on('GET', 'https://api.openai.com/v1/x', json({}, 502), json({ error: 'slow' }, 429), new TypeError('Failed to fetch'), json({ ok: 1 }));
+    vi.stubGlobal('fetch', net.fetch);
+    const cfg = createProviderConfig('openai', { apiKey: 'sk-test' });
+    const s = signal();
+    const get = async () => readJson(await aiFetch(cfg, 'v1/x', { method: 'GET', signal: s }), 'OpenAI', s);
+    expect(await withRetry(get, { signal: s })).toEqual({ ok: 1 });
+    expect(net.calls).toHaveLength(4);
+
+    const bad = fakeNet().on('GET', /./, json({ error: { message: 'nope' } }, 401));
+    vi.stubGlobal('fetch', bad.fetch);
+    expect((await rejects(withRetry(get, { signal: s }))).code).toBe('auth');
+    expect(bad.calls).toHaveLength(1);
+
+    const down = fakeNet().on('GET', /./, json({}, 500));
+    vi.stubGlobal('fetch', down.fetch);
+    expect((await rejects(withRetry(get, { signal: s, attempts: 3 }))).code).toBe('server');
+    expect(down.calls).toHaveLength(3);
+    const late = fakeNet().on('GET', /./, json({}, 500));
+    vi.stubGlobal('fetch', late.fetch);
+    expect((await rejects(withRetry(get, { signal: s, deadline: Date.now() }))).code).toBe('server');
+    expect(late.calls).toHaveLength(1);
+  });
+});
+
+describe('body reads stay under the timeout and abort', () => {
+  let server: Server;
+  let url = '';
+  beforeEach(async () => {
+    // Sends the headers and one byte, then stalls.
+    server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'image/png' });
+      res.write('x');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const addr = server.address();
+    url = `http://127.0.0.1:${typeof addr === 'object' && addr ? addr.port : 0}/out.png`;
+  });
+  afterEach(async () => {
+    server.closeAllConnections();
+    await new Promise((r) => server.close(r));
+  });
+
+  it('cancels a stalled download on abort', async () => {
+    const ctl = new AbortController();
+    const p = downloadOutput(url, { signal: ctl.signal, timeoutMs: 5000 });
+    setTimeout(() => ctl.abort(), 150);
+    await expect(p).rejects.toBeInstanceOf(AbortError);
+  });
+
+  it('times out a stalled download', async () => {
+    const e = await rejects(downloadOutput(url, { signal: signal(), timeoutMs: 200 }));
+    expect(e).toBeInstanceOf(AiError);
+    expect(e.code).toBe('timeout');
   });
 });

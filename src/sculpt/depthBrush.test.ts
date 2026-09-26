@@ -92,6 +92,46 @@ describe('DepthEditState brushes', () => {
     expect(at(s, 19, 15)).toBeCloseTo(0.8, 6);
   });
 
+  it('smooth matches a brute-force masked box mean (windows clipped at the image edges)', () => {
+    let seed = 7;
+    const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+    for (const [x, y, radius, masked] of [
+      [3, 4, 13, true],
+      [20, 15, 30, true],
+      [37, 27, 9, false],
+      [20, 15, 6, true],
+    ] as const) {
+      const d = flat();
+      for (let i = 0; i < d.data.length; i++) d.data[i] = 0.2 + 0.6 * rnd();
+      const mask: Mask = { width: W, height: H, data: new Uint8Array(W * H) };
+      for (let i = 0; i < mask.data.length; i++) mask.data[i] = rnd() < 0.7 ? 1 : 0;
+      const s = new DepthEditState(d, masked ? mask : null);
+      const src = s.data.slice();
+      const rect = s.dab({ x, y, radius, strength: 1, brush: 'smooth', falloff: 'constant' })!;
+      const k = Math.max(1, Math.round(radius / 6));
+      let checked = 0;
+      for (let py = rect.y0; py < rect.y1; py++)
+        for (let px = rect.x0; px < rect.x1; px++) {
+          const i = py * W + px;
+          const inside = Math.hypot(px + 0.5 - x, py + 0.5 - y) < radius && (!masked || mask.data[i]);
+          if (!inside) {
+            expect(s.data[i]).toBe(src[i]);
+            continue;
+          }
+          let sum = 0, cnt = 0;
+          for (let yy = Math.max(0, py - k); yy <= Math.min(H - 1, py + k); yy++)
+            for (let xx = Math.max(0, px - k); xx <= Math.min(W - 1, px + k); xx++) {
+              if (masked && !mask.data[yy * W + xx]) continue;
+              sum += src[yy * W + xx];
+              cnt++;
+            }
+          expect(s.data[i]).toBeCloseTo(sum / cnt, 5);
+          checked++;
+        }
+      expect(checked).toBeGreaterThan(0);
+    }
+  });
+
   it('undo / redo restore exact values per stroke', () => {
     const s = new DepthEditState(flat(), null);
     const orig = s.data.slice();

@@ -132,6 +132,19 @@ describe('ProviderSettingsDialog', () => {
     expect(byTestId<HTMLSelectElement>('ai-default-image-to-3d').disabled).toBe(true);
   });
 
+  it('offers the local in-browser model as the background-removal default', () => {
+    const a = createProviderConfig('openai', { id: 'p-a', apiKey: 'sk-a' });
+    const b = createProviderConfig('fal', { id: 'p-b', apiKey: 'k:s' });
+    open({ ...withProviders(a, b), defaults: {} });
+    const sel = byTestId<HTMLSelectElement>('ai-default-background-removal');
+    expect(sel.disabled).toBe(false);
+    expect(sel.value).toBe('local'); // nothing chosen: the local model runs
+    selectValue(sel, 'p-a');
+    expect(latest.defaults['background-removal']).toBe('p-a');
+    selectValue(byTestId<HTMLSelectElement>('ai-default-background-removal'), 'local');
+    expect(latest.defaults['background-removal']).toBe('local');
+  });
+
   it('toggles enabled and deletes after confirming', () => {
     const a = createProviderConfig('openai', { id: 'p-a', apiKey: 'sk-a' });
     const b = createProviderConfig('fal', { id: 'p-b', apiKey: 'k:s' });
@@ -176,6 +189,7 @@ describe('ProviderSettingsDialog', () => {
     let resolve!: (v: { ok: boolean }) => void;
     mocks.testConnection.mockImplementationOnce(() => new Promise((r) => (resolve = r)));
     click(byTestId('ai-test-p-t'));
+    await vi.waitFor(() => expect(mocks.testConnection).toHaveBeenCalled()); // the adapters load on demand
     expect(mocks.testConnection).toHaveBeenCalledWith(expect.objectContaining({ id: 'p-t', apiKey: 'sk-x' }), expect.any(AbortSignal));
     expect(byTestId<HTMLButtonElement>('ai-test-p-t').disabled).toBe(true);
     await actAsync(() => resolve({ ok: true }));

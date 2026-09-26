@@ -115,6 +115,10 @@ export const UI = {
     tr: 'Bir görsel yükleyin, sürücü seçin ve “3D Oluştur”a basın.',
     en: 'Upload an image, pick a driver and press “Generate 3D”.',
   },
+  viewerReadyBody: {
+    tr: 'Görsel yüklendi — soldaki adımları tamamlayıp “3D Oluştur”a basın.',
+    en: 'Image loaded — finish the steps on the left and press “Generate 3D”.',
+  },
   noWebgl: {
     tr: 'Bu tarayıcıda WebGL kullanılamıyor; 3D önizleme gösterilemiyor.',
     en: 'WebGL is not available in this browser; the 3D preview cannot be shown.',
@@ -185,7 +189,7 @@ export const UI = {
   hintReview: { tr: 'Onaylayın', en: 'To review' },
   hintPrepared: { tr: 'Hazırlandı', en: 'Prepared' },
   hintOptional: { tr: 'Opsiyonel', en: 'Optional' },
-  hintViews: { tr: '{n}/5 görünüm', en: '{n}/5 views' },
+  hintViews: { tr: '{n}/6 görünüm', en: '{n}/6 views' },
   hintModel: { tr: 'Model hazır', en: 'Model ready' },
   hintSculpted: { tr: 'Düzenlendi', en: 'Sculpted' },
   hintRigged: { tr: 'Kemikli', en: 'Rigged' },
@@ -203,8 +207,12 @@ export const UI = {
     en: 'No usable AI provider that can edit images.',
   },
   aiNothingToDo: {
-    tr: 'Bir stil, T-poz ya da tamamlama seçin veya talimat yazın.',
-    en: 'Pick a style, T-pose or completion, or write instructions.',
+    tr: 'Bir stil, T-poz, tamamlama ya da arka plan kaldırma seçin veya talimat yazın.',
+    en: 'Pick a style, T-pose, completion or background removal, or write instructions.',
+  },
+  aiNoViewProvider: {
+    tr: 'Seçili sağlayıcı kompozisyonu korur ve yeni görünüm üretemez (ör. Stability); görünümler için OpenAI, Gemini, fal.ai… gibi bir görsel düzenleme sağlayıcısı ekleyin.',
+    en: 'The chosen provider keeps the composition and cannot render new views (e.g. Stability); add an image-edit provider such as OpenAI, Gemini or fal.ai for the views.',
   },
   detectingPeople: { tr: 'İnsan algılanıyor…', en: 'Detecting people…' },
   removingViewBg: { tr: 'Görünümün arka planı kaldırılıyor…', en: 'Removing the view’s background…' },
@@ -219,6 +227,17 @@ export const UI = {
   },
   needViews: { tr: 'Bu sürücü şu görünümleri de ister: {views}.', en: 'This driver also needs these views: {views}.' },
   goToViews: { tr: 'Görünümlere git', en: 'Go to Views' },
+  goToImage: { tr: 'Görsele git', en: 'Go to Image' },
+  viewsUnused: {
+    tr: 'Bu sürücü {n} ek görünümünüzü kullanmaz: yalnızca ön görselden üretir.',
+    en: 'This driver does not use your {n} extra views: it builds from the front image only.',
+  },
+  useFusion: { tr: 'Çok görünümlü birleştirmeye geç', en: 'Switch to multi-view fusion' },
+  regenDiscardsSculpt: { tr: 'Yeniden oluşturmak heykel düzenlemelerinizi atar.', en: 'Regenerating discards your sculpt edits.' },
+  regenDiscardsRig: { tr: 'Yeniden oluşturmak iskeleti ve animasyonları atar.', en: 'Regenerating discards the rig and its animations.' },
+  regenDiscardsDepth: { tr: 'Yeniden oluşturmak derinlik haritası düzenlemenizi atar.', en: 'Regenerating discards your depth map edit.' },
+  regenAnyway: { tr: 'Yine de oluştur', en: 'Regenerate anyway' },
+  keepEdits: { tr: 'Vazgeç', en: 'Keep my edits' },
   generateWith: { tr: 'Sürücü: {driver}', en: 'Driver: {driver}' },
   changeDriver: { tr: 'Değiştir', en: 'Change' },
 

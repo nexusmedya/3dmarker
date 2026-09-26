@@ -146,6 +146,34 @@ describe('clip semantics (forward kinematics on the mannequin rig)', () => {
     expect(Math.min(p.LeftToeBase.y, p.RightToeBase.y)).toBeGreaterThan(ground - 0.08 * height);
   });
 
+  it('grounded clips: no foot sinks through the floor and the feet touch it (sampled over the whole clip, two layouts)', () => {
+    const tall = structuredClone(layout);
+    for (const b of Object.keys(tall) as HumanoidBone[]) tall[b]!.y *= 1.3; // longer legs than the canonical proportions
+    for (const l of [layout, tall]) {
+      const lib = buildLibrary(describeRig(l));
+      const H = l.HeadTop_End!.y - Math.min(l.LeftToeBase!.y, l.RightToeBase!.y);
+      for (const def of CLIP_DEFS) {
+        if (def.grounded === false) continue;
+        const clip = lib.find((c) => c.info.id === def.id)!.clip;
+        const sk = buildSkeleton(l);
+        const mixer = new AnimationMixer(sk.root);
+        mixer.clipAction(clip).play();
+        let lowest = Infinity;
+        for (let i = 0; i < 60; i++) {
+          mixer.setTime((i / 60) * clip.duration);
+          sk.root.updateMatrixWorld(true);
+          let frame = Infinity;
+          for (const b of ['LeftFoot', 'LeftToeBase', 'RightFoot', 'RightToeBase'] as const) {
+            frame = Math.min(frame, new Vector3().setFromMatrixPosition(sk.byName.get(b)!.matrixWorld).y - l[b]!.y);
+          }
+          lowest = Math.min(lowest, frame);
+        }
+        expect(lowest / H, `${def.id} sinks`).toBeGreaterThan(-0.015);
+        expect(lowest / H, `${def.id} never touches the floor`).toBeLessThan(0.01);
+      }
+    }
+  });
+
   it('sit-down ends seated (thighs forward, hips at knee height)', () => {
     const p = at('sit-down', 1);
     expect(p.LeftLeg.z - p.LeftUpLeg.z).toBeGreaterThan(0.3 * rig.hipHeight);

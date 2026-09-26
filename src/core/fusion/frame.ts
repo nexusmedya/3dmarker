@@ -61,7 +61,11 @@ export interface PreparedView {
   id: ViewId;
   frame: ViewFrame;
   image: RGBAImage;
-  /** Cleaned silhouette (specks removed), image-sized. */
+  /**
+   * Cleaned silhouette, image-sized: the bbox, hull, carving and colour all
+   * use it. Specks are removed (small components of a border flood-fill mask,
+   * only pixel noise of a given / alpha mask).
+   */
   mask: Mask;
   maskSource: MaskSource;
   bbox: PixelBox;
@@ -110,7 +114,10 @@ export function prepareView(input: FusionViewInput): PreparedView | null {
   const data = raw.data.slice();
   const area = maskArea(raw);
   if (area === 0) return null;
-  const minArea = Math.max(4, Math.min(w * h * 0.002, area * 0.02));
+  // A border flood fill leaves background specks; a given or alpha mask is deliberate, and a small
+  // detached part in it (a held ball, a hand clear of the body) is real: only drop pixel noise there.
+  // Anything removed here is gone from the bbox and from the hull (an intersection) alike.
+  const minArea = source === 'border' ? Math.max(4, Math.min(w * h * 0.002, area * 0.02)) : Math.max(4, w * h * 1e-5);
   removeSmallComponents(data, w, h, Math.ceil(minArea));
   let mask: Mask = { width: w, height: h, data };
   let bbox = maskBBox(mask);

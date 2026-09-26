@@ -44,6 +44,11 @@ export const VIEW_TEXT = {
   manual: { tr: 'Görünümleri elle yüklemek her zaman mümkün.', en: 'You can always upload views by hand.' },
   needFront: { tr: 'Önce ön görünüm (kaynak görsel) gerekir.', en: 'The front view (source image) is needed first.' },
   errorTitle: { tr: 'Görünüm üretilemedi', en: 'Could not generate the view' },
+  nextFusion: { tr: 'Sonraki: çok görünümlü birleştirmeyle tam 3B', en: 'Next: full 3D with multi-view fusion' },
+  nextFusionHint: {
+    tr: 'Seçili sürücü yalnızca ön görseli kullanır; bu görünümleri kullanan sürücüye geçer.',
+    en: 'The selected driver only uses the front image; this switches to the driver that uses these views.',
+  },
   hintDefault: {
     tr: 'Tüm görünümler dik, ortalanmış ve aynı ölçekte olmalı. Bir kutunun üzerine gelin ya da odaklanın: hangi yönden bakıldığını gösterir.',
     en: 'All views should be upright, centred and at the same scale. Hover or focus a slot to see where its camera is.',
@@ -78,6 +83,8 @@ interface Props {
   aiReason: string | null;
   onOpenSettings: () => void;
   disabled?: boolean;
+  /** Set when views are given but the selected driver ignores them: switch to multi-view fusion (and go on). */
+  onUseFusion?: () => void;
 }
 
 /** The first image among dropped files (or the first file). */
@@ -175,6 +182,18 @@ export function ViewsPanel(p: Props) {
         </button>
       )}
       {!busy && p.aiReady && !p.front && <p className="muted small center">{tx(T.needFront)}</p>}
+      {!busy && p.onUseFusion && missing.length < OTHER_VIEW_IDS.length && (
+        <button
+          type="button"
+          className="btn btn-secondary btn-block"
+          onClick={p.onUseFusion}
+          disabled={lock}
+          title={tx(T.nextFusionHint)}
+          data-testid="views-use-fusion"
+        >
+          <IconViews /> {tx(T.nextFusion)}
+        </button>
+      )}
 
       {p.error && !busy && (
         <div className="alert alert-danger" role="alert" data-testid="views-error">

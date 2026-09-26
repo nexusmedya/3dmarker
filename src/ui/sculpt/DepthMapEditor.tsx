@@ -244,6 +244,8 @@ function DepthEditorDialog({ depth, mask, image, onApply, onClose }: Props) {
 
   const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
     if (paintRef.current || panRef.current) return;
+    // The zoom / Fit HUD sits on the stage: its buttons neither paint nor lose their click to pointer capture.
+    if (e.target instanceof Element && e.target.closest('.dme-hud, button, input, select')) return;
     const stage = stageRef.current!;
     const pan = e.button === 1 || (e.button === 0 && spaceRef.current);
     if (!pan && (e.button !== 0 || optsRef.current.before)) return;

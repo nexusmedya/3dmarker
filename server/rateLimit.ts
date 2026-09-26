@@ -107,3 +107,13 @@ export class InFlight {
     };
   }
 }
+
+/**
+ * The IPv6 /48 bucket of a /64 rate-limit key as server/app.ts builds them
+ * ('2001:db8:1:2::/64' → '2001:db8:1::/48'): one routed /48 holds 65,536 /64s,
+ * so per-/64 budgets alone are easy to rotate around. Null for anything else.
+ */
+export function ipv6PrefixKey(key: string): string | null {
+  const m = /^([0-9a-f]{1,4}):([0-9a-f]{1,4}):([0-9a-f]{1,4}):[0-9a-f]{1,4}::\/64$/.exec(key);
+  return m ? `${m[1]}:${m[2]}:${m[3]}::/48` : null;
+}

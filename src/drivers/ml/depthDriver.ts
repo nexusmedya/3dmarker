@@ -280,13 +280,17 @@ export function createDepthDriver(spec: DepthModelSpec): Driver {
       // High-res crop pass: the same model at its native input size on each face / hand crop.
       const refineCrop = async (crop: RGBAImage, sig: AbortSignal): Promise<DepthMap> => {
         const r = await requestDepth({ ...job, image: prepareInferenceImage(crop, { side: spec.nativeSide, multiple }) }, { signal: sig });
-        return processDepth(r, { width: crop.width, height: crop.height, convention: spec.convention, mask: null });
+        // Min-max, not percentile, normalisation: the nearest ~1% of a face crop is
+        // the nose tip, which clamping would flatten; blendCrop's robust affine fit
+        // sets scale / offset (and trims outliers) anyway.
+        return processDepth(r, { width: crop.width, height: crop.height, convention: spec.convention, mask: null, robust: false });
       };
       try {
         const refined = await enhanceHumanDepth(depth, mask, image, analysis, {
           faceStrength: numberParam(params.faceStrength, 0.8),
           handStrength: numberParam(params.handStrength, 0.7),
           refineCrop: params.hiResCrops !== false ? refineCrop : undefined,
+          cropSideRatio: spec.nativeSide / side,
           signal,
           onProgress,
         });

@@ -10,7 +10,8 @@ import { STEP_IDS, stepStatus, type StepFacts, type StepStatus } from '../app/st
 import { MESH_PARAMS } from '../core/mesh/options';
 import { BACKGROUND_MODES, type BackgroundMode } from '../app/pipeline';
 import type { UIKey } from '../app/i18n';
-import { generateBlock, meshModeLabel, presentViews } from '../app/store';
+import { generateBlock, hasUnsavedModelEdits, meshModeLabel, presentViews } from '../app/store';
+import { getDriver } from '../drivers';
 import { VIEW_LABELS } from '../ai/views';
 import { providerUsable, supports } from '../ai/settings';
 import type { Studio } from './useStudio';
@@ -27,6 +28,9 @@ import { ViewsPanel } from './ai/ViewsPanel';
 import { SculptPanel } from './sculpt/SculptPanel';
 import { DepthMapEditor } from './sculpt/DepthMapEditor';
 import { RigPanel } from './rig/RigPanel';
+
+/** The in-browser driver that uses every view given. */
+const FUSION_ID = 'multiview-fusion';
 
 const BG_LABELS: Record<BackgroundMode, UIKey> = {
   auto: 'bgAuto',
@@ -78,12 +82,13 @@ export function ControlPanel({ studio }: Props) {
     if (aside && stacked && aside.getBoundingClientRect().top < 0) aside.scrollIntoView?.({ block: 'start', behavior: 'smooth' });
   }, [step]);
 
+  const viewCount = presentViews(state.views).length;
   const facts: StepFacts = {
     hasSource: !!state.source,
     loadingImage: state.loadingImage,
     preparedInUse: !!state.original,
     preparedPending: !!state.prepared,
-    viewCount: presentViews(state.views).length,
+    viewCount,
     hasModel: !!model,
     sculpted: state.sculpted,
     rigged: state.rigged,
@@ -100,6 +105,7 @@ export function ControlPanel({ studio }: Props) {
   switch (block?.kind) {
     case 'no-image':
       blockedReason = t('needImage');
+      if (step !== 'image') blockedAction = { label: t('goToImage'), onClick: () => actions.setStep('image') };
       break;
     case 'loading':
       blockedReason = t('readingImage');
@@ -116,6 +122,27 @@ export function ControlPanel({ studio }: Props) {
       break;
   }
 
+  // ---- What a new generation would discard (asked before it runs) ----
+  const discardWarning = hasUnsavedModelEdits(state)
+    ? t(state.rigged ? 'regenDiscardsRig' : state.sculpted ? 'regenDiscardsSculpt' : 'regenDiscardsDepth')
+    : null;
+
+  // ---- Extra views the selected driver would ignore ----
+  const fusion = getDriver(FUSION_ID);
+  const unusedViews = viewCount > 0 && !driver.views && !!fusion;
+  const useFusion = () => actions.selectDriver(FUSION_ID);
+  const unusedViewsNote = (testId: string) => (
+    <p className="note small views-unused" role="status" data-testid={testId}>
+      <IconInfo size={14} />
+      <span className="grow">
+        {t('viewsUnused', { n: viewCount })}{' '}
+        <button type="button" className="link-btn" onClick={useFusion} disabled={running} data-testid={`${testId}-fusion`}>
+          {t('useFusion')}
+        </button>
+      </span>
+    </p>
+  );
+
   let bgNote: string | null = null;
   if (state.source) {
     if (state.bgMode === 'ai') bgNote = state.mask ? t('bgAiReady') : t('bgAiHint');
@@ -124,9 +151,10 @@ export function ControlPanel({ studio }: Props) {
   } else if (state.bgMode === 'ai') bgNote = t('bgAiHint');
 
   // ---- AI readiness (views panel): why no image-edit provider can run, as specific as possible ----
-  const editReady = !!studio.editProvider;
+  const editReady = !!studio.viewProvider;
   let aiReason: string | null = null;
-  if (!editReady) {
+  if (!editReady && studio.editProvider) aiReason = t('aiNoViewProvider');
+  else if (!editReady) {
     const candidate = state.aiSettings.providers.find((p) => supports(p, 'image-edit'));
     const why = candidate ? providerUsable(candidate, state.serverAvailable).reason : undefined;
     aiReason = candidate && why ? `${candidate.label}: ${tx(why)}` : state.aiSettings.providers.length ? t('aiNoEditProvider') : t('aiNoProviders');
@@ -237,6 +265,7 @@ export function ControlPanel({ studio }: Props) {
             onRun={() => void actions.runPrep()}
             onCancel={actions.cancelAi}
             prepared={state.prepared}
+            aiViewCount={Object.values(state.views).filter((v) => v?.origin === 'ai').length}
             original={state.source?.image ?? null}
             onAccept={actions.acceptPrepared}
             onDiscard={actions.discardPrepared}
@@ -262,6 +291,14 @@ export function ControlPanel({ studio }: Props) {
             aiReason={aiReason}
             onOpenSettings={actions.openAiSettings}
             disabled={busy || aiBusy === 'prep'}
+            onUseFusion={
+              unusedViews
+                ? () => {
+                    useFusion();
+                    actions.setStep('3d');
+                  }
+                : undefined
+            }
           />
           <StepFooter id="views" onStep={actions.setStep} />
         </StepPanel>
@@ -269,6 +306,7 @@ export function ControlPanel({ studio }: Props) {
         <StepPanel id="3d" active={step === '3d'}>
           <StepHeading id="3d" />
           <DriverPicker driver={driver} availability={availability} onSelect={actions.selectDriver} disabled={running} />
+          {unusedViews && unusedViewsNote('views-unused')}
 
           {driver.badges.includes('human-detail') && (
             <HumanDetailNote human={human} enabled={params.humanDetail !== false} onDetect={actions.detectHuman} disabled={!state.source || busy} />
@@ -319,6 +357,7 @@ export function ControlPanel({ studio }: Props) {
               model={model}
               enabled={!!model && !busy && !state.rigged}
               onEdited={actions.onSculptEdited}
+              onSessionStart={actions.onSculptSession}
               onActiveChange={actions.onSculptActive}
             />
           )}
@@ -381,14 +420,21 @@ export function ControlPanel({ studio }: Props) {
         onGenerate={() => void actions.generate()}
         onCancel={actions.cancel}
         onDismiss={actions.dismissError}
+        discardWarning={discardWarning}
+        confirming={state.regenConfirm}
+        onConfirm={actions.confirmRegenerate}
+        onCancelConfirm={actions.cancelRegenerate}
         summary={
           step !== '3d' ? (
-            <p className="generate-summary small" data-testid="generate-driver">
-              <span className="truncate muted">{t('generateWith', { driver: tx(driver.name) })}</span>
-              <button type="button" className="link-btn" onClick={() => actions.setStep('3d')} disabled={running}>
-                {t('changeDriver')}
-              </button>
-            </p>
+            <>
+              <p className="generate-summary small" data-testid="generate-driver">
+                <span className="truncate muted">{t('generateWith', { driver: tx(driver.name) })}</span>
+                <button type="button" className="link-btn" onClick={() => actions.setStep('3d')} disabled={running}>
+                  {t('changeDriver')}
+                </button>
+              </p>
+              {unusedViews && unusedViewsNote('generate-views-unused')}
+            </>
           ) : null
         }
       />
