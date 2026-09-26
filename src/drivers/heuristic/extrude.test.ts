@@ -236,6 +236,9 @@ describe('extrudeMask', () => {
   });
 
   it('caps the ring count so noisy masks cannot hang the tab (keeps the largest rings)', () => {
+    // Vitest's default 5s per-test timeout has no headroom over the 15s
+    // assertion below on a loaded/shared CI runner; give it real slack (see
+    // the explicit timeout argument at the end of this test).
     // Dithered 55 % alpha, no smoothing, no minimum size: ~20k rings before the cap
     // (the earcut hole bridging then ran for minutes).
     let s = 7;
@@ -252,7 +255,7 @@ describe('extrudeMask', () => {
     const g = extrudeMask(m, o);
     expect(performance.now() - t0).toBeLessThan(15000); // ~1.5 s
     expect(computeMeshStats(g).watertight).toBe(true);
-  });
+  }, 20000);
 
   it('keeps holes inside their part when the point cap forces coarse outlines', () => {
     // 32² checker of 4 px squares: 1 part with 18 holes. A tiny maxPoints used
@@ -289,8 +292,8 @@ describe('extrudeMask', () => {
     const t0 = performance.now();
     const g = extrudeMask(m, opts());
     expect(g.index!.count).toBeGreaterThan(0);
-    expect(performance.now() - t0).toBeLessThan(5000);
-  });
+    expect(performance.now() - t0).toBeLessThan(5000); // typically well under 1 s
+  }, 20000); // vitest's default 5s test timeout left no headroom over the assertion above
 });
 
 describe('extrudeDriver', () => {
