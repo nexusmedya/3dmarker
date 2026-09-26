@@ -1,0 +1,69 @@
+name: Deploy demo to GitHub Pages
+
+# Builds the static front end (three.js viewer + offline/ML drivers) and
+# publishes it to GitHub Pages. Note: the Tripo3D cloud driver needs the Hono
+# API server (server/index.ts) to keep the API key server-side, so it is not
+# available on this static deployment — every other driver runs fully in the
+# browser and works here.
+on:
+  push:
+    branches: [claude/admiring-davinci-pm0r7r]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        # onnxruntime-node's postinstall tries to download a native binary the
+        # browser build never uses (the app only loads onnxruntime-web); skip it.
+        run: npm ci --ignore-scripts
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Build (static, project-page base path)
+        env:
+          BASE_PATH: ${{ steps.pages.outputs.base_path }}/
+        run: npm run build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

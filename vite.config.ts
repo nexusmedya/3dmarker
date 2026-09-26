@@ -32,6 +32,10 @@ export default defineConfig(() => {
       : {};
 
   return {
+    // Static hosting under a sub-path (e.g. GitHub Pages project sites serve
+    // from https://<user>.github.io/<repo>/); set via the BASE_PATH build env,
+    // not VITE_-prefixed since it's only read here, not by client code.
+    base: env.BASE_PATH || '/',
     plugins: [react()],
     worker: { format: 'es' as const },
     optimizeDeps: {
