@@ -25,6 +25,7 @@ import {
 import type { AnimationClip, BufferGeometry, Object3D, Side, Texture } from 'three';
 import type { DepthMap, Driver, DriverResult, Mask, ParamValues, Progress, RGBAImage, ViewImage, ViewSet } from '../core/types';
 import { AbortError, throwIfAborted } from '../core/types';
+import type { FusionReport } from '../core/fusion/types';
 import { fitRGBA, hasTransparency, maskArea, maskFromAlpha } from '../core/image/ops';
 import { autoMaskFromBorder } from '../core/image/autoMask';
 import { loadImageFile } from '../core/image/load';
@@ -309,6 +310,22 @@ export function statsForObject(obj: Object3D): MeshStats {
     any = true;
   });
   return { vertices, triangles, watertight: any && watertight };
+}
+
+/**
+ * The multi-view fusion report carried by a built model's geometry
+ * (`geometry.userData.fusion`, set by src/core/fusion/reconstruct); null for
+ * the results of other drivers.
+ */
+export function fusionReportOf(object: Object3D): FusionReport | null {
+  let report: FusionReport | null = null;
+  object.traverse((o) => {
+    if (report) return;
+    const mesh = o as Mesh;
+    const r = mesh.isMesh ? (mesh.geometry?.userData as { fusion?: unknown } | undefined)?.fusion : undefined;
+    if (r && typeof r === 'object' && Array.isArray((r as FusionReport).views) && Array.isArray((r as FusionReport).warnings)) report = r as FusionReport;
+  });
+  return report;
 }
 
 /** Parse a binary glTF (Draco / meshopt supported) into a normalised model. */

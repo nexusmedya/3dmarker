@@ -293,6 +293,10 @@ export const UI = {
   depthEditRigged: { tr: 'Kemikli modelin derinliği düzenlenemez; önce kemikleri kaldırın.', en: 'Remove the rig before editing the depth.' },
   depthEditSculpted: { tr: 'Uygulamak heykel düzenlemelerini atar.', en: 'Applying discards the sculpt edits.' },
 
+  // Multi-view fusion report (step 3D)
+  fusionReport: { tr: 'Birleştirme raporu', en: 'Fusion report' },
+  fusionColorOnly: { tr: 'yalnız renk', en: 'colour only' },
+
   // Export
   exportAnimations: { tr: 'GLB {n} animasyon içerir', en: 'GLB includes {n} animations' },
 } satisfies Record<string, I18nText>;

@@ -1,4 +1,4 @@
-/* AI UI: providers dialog, style picker, AI preparation and the views grid (tokens from src/styles.css). */
+/* AI UI: providers dialog, style picker, AI preparation, the views grid with its consistency badges / align panel (tokens from src/styles.css). */
 
 /* ---------- Shared bits ---------- */
 
@@ -1118,6 +1118,284 @@ label.ai-slot-btn:focus-within {
 
 .ai-view-hint > svg { flex: none; margin-top: 1px; }
 .ai-view-hint > svg:not(.ai-diagram) { color: var(--accent-text); margin-top: 2px; }
+.ai-view-hint.is-notice { color: var(--text); font-weight: 550; }
+
+.ai-slot-actions { flex-wrap: wrap; }
+.ai-slot-btn.is-on { color: var(--accent-text); background: var(--accent-soft); }
+
+.ai-slot.is-off .ai-slot-thumb { opacity: 0.45; filter: grayscale(0.8); }
+
+/* ---------- Consistency badge ---------- */
+
+.ai-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--text-muted);
+  background: var(--surface-3);
+  white-space: nowrap;
+}
+
+.ai-check svg { flex: none; }
+.ai-check.is-good { color: var(--ok); background: var(--ok-soft); }
+.ai-check.is-fair { color: var(--warn); background: var(--warn-soft); }
+.ai-check.is-poor { color: var(--danger); background: var(--danger-soft); }
+.ai-check.is-pending { color: var(--text-subtle); letter-spacing: 0.1em; }
+
+.ai-trust-badge {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  max-width: calc(100% - 8px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  line-height: 16px;
+  text-transform: uppercase;
+  color: #fff;
+  background: rgba(180, 83, 9, 0.9);
+}
+
+.ai-trust-badge.is-off { background: rgba(75, 85, 99, 0.9); }
+
+/* ---------- Align panel ---------- */
+
+.ai-align {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  background: color-mix(in srgb, var(--accent) 4%, var(--surface-2));
+  outline: none;
+  container-type: inline-size;
+}
+
+.ai-align:focus-visible { box-shadow: 0 0 0 3px var(--accent-soft); }
+
+.ai-align-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ai-align-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.ai-align-title svg { color: var(--accent-text); }
+
+/* Stacked (overlay above the controls) in the studio's narrow side panel; side by side when the panel is wide. */
+.ai-align-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+}
+
+@container (min-width: 520px) {
+  .ai-align-grid { grid-template-columns: 240px minmax(0, 1fr); }
+}
+
+.ai-align-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ai-align-canvas {
+  display: block;
+  width: 100%;
+  max-width: 240px;
+  max-height: 320px;
+  object-fit: contain;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+}
+
+.ai-align-legend {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-subtle);
+}
+
+.ai-align-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ai-align-field { gap: 2px; }
+.ai-align-num { display: inline-flex; align-items: center; gap: 4px; }
+.ai-align-num .input-num { width: 72px; height: 32px; }
+.ai-align .range { height: 32px; }
+.ai-align .switch { min-height: 32px; }
+
+.ai-trust {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.ai-trust legend { padding: 0; margin-bottom: 6px; }
+
+.ai-trust-opts {
+  display: inline-flex;
+  flex-wrap: wrap;
+  padding: 3px;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+}
+
+.ai-trust-opt {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 0 10px;
+  border-radius: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+
+.ai-trust-opt input {
+  position: absolute;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+}
+
+.ai-trust-opt.is-on { background: var(--surface-3); color: var(--text); }
+.ai-trust-opt:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.ai-align-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ai-align-actions .btn { min-height: 32px; }
+
+.ai-align-status {
+  margin: 0;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+/* ---------- Copy prompt fallback ---------- */
+
+.ai-prompt-text {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ai-prompt-text .ai-textarea { font-size: 12px; }
+
+.ai-prompt-text-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ---------- Guidance ---------- */
+
+.ai-guide {
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+}
+
+.ai-guide > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  list-style: none;
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.ai-guide > summary::-webkit-details-marker { display: none; }
+.ai-guide > summary svg { color: var(--accent-text); }
+.ai-guide[open] > summary { color: var(--text); margin-bottom: 6px; }
+
+.ai-guide ol {
+  margin: 0;
+  padding-left: 18px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.ai-guide p { margin: 6px 0 0; }
+
+/* ---------- Fusion report (step 3D) ---------- */
+
+.fusion-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.fusion-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: var(--surface-3);
+  white-space: nowrap;
+}
+
+.fusion-chip.is-good { color: var(--ok); background: var(--ok-soft); }
+.fusion-chip.is-fair { color: var(--warn); background: var(--warn-soft); }
+.fusion-chip.is-poor { color: var(--danger); background: var(--danger-soft); }
+.fusion-chip.is-partial { border: 1px dashed currentColor; }
+
+@media (prefers-reduced-motion: reduce) {
+  .ai-align-canvas,
+  .ai-align { transition: none; }
+}
 
 /* ---------- Responsive ---------- */
 

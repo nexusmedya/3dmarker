@@ -154,7 +154,7 @@ describe('reducer', () => {
     const stats = { vertices: 1, triangles: 1, watertight: true };
     const done = (driverId: string): Action => ({
       type: 'jobDone',
-      result: { driverId, kind: 'depth', stats, depthPreview: null, elapsedMs: 1, sourceName: 'a.png' },
+      result: { driverId, kind: 'depth', stats, depthPreview: null, elapsedMs: 1, sourceName: 'a.png', fusion: null },
       source: src(),
       bgMode: 'auto',
       inputMask: null,
@@ -258,7 +258,7 @@ describe('reducer', () => {
     s = reducer(s, { type: 'jobStart' });
     s = reducer(s, {
       type: 'jobDone',
-      result: { driverId: 'ml-a', kind: 'depth', stats: { vertices: 1, triangles: 1, watertight: false }, depthPreview: null, elapsedMs: 1, sourceName: 'a.png' },
+      result: { driverId: 'ml-a', kind: 'depth', stats: { vertices: 1, triangles: 1, watertight: false }, depthPreview: null, elapsedMs: 1, sourceName: 'a.png', fusion: null },
       source,
       bgMode: 'ai',
       inputMask: aiMask,
@@ -286,7 +286,7 @@ describe('reducer', () => {
   it('updates stats after re-meshing and validates the STL size', () => {
     let s = init();
     expect(reducer(s, { type: 'statsUpdated', stats: { vertices: 1, triangles: 2, watertight: true } })).toBe(s);
-    s = { ...s, result: { driverId: 'x', kind: 'depth', stats: { vertices: 0, triangles: 0, watertight: false }, depthPreview: null, elapsedMs: 0, sourceName: 'x' } };
+    s = { ...s, result: { driverId: 'x', kind: 'depth', stats: { vertices: 0, triangles: 0, watertight: false }, depthPreview: null, elapsedMs: 0, sourceName: 'x', fusion: null } };
     s = reducer(s, { type: 'statsUpdated', stats: { vertices: 1, triangles: 2, watertight: true } });
     expect(s.result?.stats.triangles).toBe(2);
     expect(reducer(s, { type: 'setStlSize', mm: -5 }).stlSizeMm).toBe(s.stlSizeMm);

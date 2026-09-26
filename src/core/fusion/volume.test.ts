@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { Mask, RGBAImage } from '../types';
-import { maskBBox, VIEW_FRAMES, viewProjection, type PreparedView } from './frame';
+import { DEFAULT_VIEW_ALIGN } from '../types';
+import { maskBBox, NO_CUT, VIEW_FRAMES, viewProjection, type PreparedView } from './frame';
 import { bleedImage, dilateMask, SummedArea } from './silhouette';
+import { drain } from './steps';
 import {
   buildHull,
+  buildHullPlanesSteps,
   clearBorder,
   countSurfaceCells,
   coverageTable,
@@ -27,7 +30,8 @@ function maskOf(w: number, h: number, inside: (x: number, y: number) => boolean)
 const blank = (w: number, h: number): RGBAImage => ({ width: w, height: h, data: new Uint8ClampedArray(w * h * 4) });
 
 function view(id: PreparedView['id'], mask: Mask): PreparedView {
-  return { id, frame: VIEW_FRAMES[id], image: blank(mask.width, mask.height), mask, maskSource: 'given', bbox: maskBBox(mask)! };
+  const bbox = maskBBox(mask)!;
+  return { id, frame: VIEW_FRAMES[id], image: blank(mask.width, mask.height), mask, maskSource: 'given', bbox, align: DEFAULT_VIEW_ALIGN, cut: { ...NO_CUT }, fitBox: { ...bbox }, registration: 'bbox', trust: 'full' };
 }
 
 const sum = (a: ArrayLike<number>) => Array.from(a).reduce((s, v) => s + v, 0);
@@ -126,13 +130,14 @@ describe('visual hull', () => {
     const g = createGrid([20, 20, 10], 20, 2);
     const f = buildHull([view('front', sq), view('back', sq)], { size: [20, 20, 10], depthFrom: 'default' }, g, { hull: 'strict', tolerance: 0 });
     expect(sum(f)).toBeCloseTo(20 * 20 * 10, 0);
-    // A back view with a notch: strict carves it, tolerant (dilation) fills it back in.
+    // A back view with a notch: strict carves it, tolerant (dilation) fills it back in. The back only
+    // enters the hull with hullBack: 'intersect' (the default excludes it: it mirrors the front).
     const notched = maskOf(40, 40, (x, y) => !(x > 18 && x < 22 && y > 18 && y < 22));
     const full = maskOf(40, 40, () => true);
     const g2 = createGrid([40, 40, 20], 40, 2);
     const box = { size: [40, 40, 20] as [number, number, number], depthFrom: 'default' as const };
-    const strict = sum(buildHull([view('front', full), view('back', notched)], box, g2, { hull: 'strict', tolerance: 0.05 }));
-    const tolerant = sum(buildHull([view('front', full), view('back', notched)], box, g2, { hull: 'tolerant', tolerance: 0.05 }));
+    const strict = sum(buildHull([view('front', full), view('back', notched)], box, g2, { hull: 'strict', tolerance: 0.05, hullBack: 'intersect' }));
+    const tolerant = sum(buildHull([view('front', full), view('back', notched)], box, g2, { hull: 'tolerant', tolerance: 0.05, hullBack: 'intersect' }));
     expect(tolerant).toBeCloseTo(40 * 40 * 20, 0);
     expect(strict).toBeLessThan(tolerant - 200);
   });
@@ -192,5 +197,54 @@ describe('volume filters', () => {
     expect(rayCrossings(f, 7, -1, 8, 0.5, out)).toBe(true); // reversed walk: t from the other end
     expect(out[0]).toBeCloseTo(2);
     expect(rayCrossings(new Float32Array(4), 0, 1, 4, 0.5, out)).toBe(false);
+  });
+});
+
+describe('cut-aware hull', () => {
+  it('coverage treats the region past a flagged edge as foreground, exactly', () => {
+    const m = maskOf(4, 4, () => true);
+    const s = new SummedArea(m);
+    const unknown = { top: false, bottom: true, left: false, right: false };
+    expect(s.coverage(0, 4, 4, 6, unknown)).toBe(1); // fully beyond the bottom edge
+    expect(s.coverage(0, 4, 4, 6)).toBe(0); // without the flag: background
+    expect(s.coverage(0, 3, 4, 5, unknown)).toBe(1); // straddling: 1 row inside (foreground) + 1 beyond (unknown)
+    const half = maskOf(4, 4, (_x, y) => y < 2); // top half foreground
+    const t = new SummedArea(half);
+    expect(t.coverage(0, 3, 4, 5, unknown)).toBeCloseTo(0.5, 10); // 1 row background + 1 row unknown
+    expect(t.coverage(0, 3, 4, 5, { ...unknown, bottom: false, right: true })).toBe(0);
+    expect(t.coverage(0, 0, 4, 2, unknown)).toBe(1);
+    expect(t.coverage(-2, 0, 2, 2, { ...unknown, bottom: false, left: true })).toBe(1);
+  });
+
+  it('a knee-up back view leaves the front\'s lower rows intact (unknown rows) and the back never carves by default', () => {
+    // Front: a T; back: the same T cut off below the knees, registered (fitBox reaches below the image).
+    const t = maskOf(60, 100, (x, y) => (y > 10 && y < 22) || (x > 24 && x < 36 && y > 10 && y < 95));
+    const front = view('front', t);
+    const cut = maskOf(60, 60, (x, y) => (y > 10 && y < 22) || (x > 24 && x < 36 && y > 10)); // rows ≥ 60 missing
+    const back = view('back', cut);
+    back.cut = { top: false, bottom: true, left: false, right: false };
+    back.fitBox = { x0: back.bbox.x0, y0: back.bbox.y0, x1: back.bbox.x1, y1: back.bbox.y0 + (front.bbox.y1 - front.bbox.y0) };
+    const box = { size: [front.bbox.x1 - front.bbox.x0, front.bbox.y1 - front.bbox.y0, 20] as [number, number, number], depthFrom: 'default' as const };
+    const g = createGrid(box.size, 84, 2);
+    const only = buildHull([front], box, g, { hull: 'strict', tolerance: 0 });
+    const withCut = buildHull([front, back], box, g, { hull: 'strict', tolerance: 0, hullBack: 'intersect' });
+    expect(sum(withCut)).toBeCloseTo(sum(only), 3); // the missing rows are unknown, not empty
+    back.cut = { top: false, bottom: false, left: false, right: false };
+    const carved = buildHull([front, back], box, g, { hull: 'strict', tolerance: 0, hullBack: 'intersect' });
+    expect(sum(carved)).toBeLessThan(sum(only) * 0.8); // without the flag the stretched back carves the legs off
+    // Default: the back is excluded, whatever it shows.
+    const blob = view('back', maskOf(60, 100, (x, y) => ((y > 10 && y < 22) || (x > 24 && x < 36 && y > 10 && y < 95)) && !(y > 60 && y < 70)));
+    expect(buildHull([front, blob], box, g, { hull: 'strict', tolerance: 0 })).toEqual(only);
+    // Hands but no arm bar (same bbox as the front): excluded by default, carves the bar under 'intersect'.
+    const noArms = view('back', maskOf(60, 100, (x, y) => (x > 24 && x < 36 && y > 10 && y < 95) || ((x < 6 || x > 54) && y > 10 && y < 22)));
+    expect(buildHull([front, noArms], box, g, { hull: 'strict', tolerance: 0 })).toEqual(only);
+    expect(sum(buildHull([front, noArms], box, g, { hull: 'strict', tolerance: 0, hullBack: 'intersect' }))).toBeLessThan(sum(only) * 0.9);
+    // Colour-only views never enter.
+    const colorOnly = { ...view('left', maskOf(20, 100, (_x, y) => y > 40 && y < 60)), trust: 'color' as const };
+    expect(buildHull([front, colorOnly], box, g, { hull: 'strict', tolerance: 0 })).toEqual(only);
+    const planes = drain(buildHullPlanesSteps([front, view('left', maskOf(20, 100, () => true))], box, g, { hull: 'strict', tolerance: 0 })).planes;
+    expect(planes.hasZY).toBe(true);
+    expect(planes.hasXZ).toBe(false);
+    expect(planes.xy.length).toBe(g.dims[0] * g.dims[1]);
   });
 });

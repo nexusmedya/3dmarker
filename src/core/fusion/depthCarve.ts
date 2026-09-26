@@ -4,29 +4,38 @@
  * view's axis. It only removes material, and a view only sees its near half:
  * k = 0.5 · strength.
  *
- *  - fit 'object': t_surf = min(t_face + a + b·(1 − d), (t0 + t1) / 2)
+ *  - fit 'object': t_surf = min(t_face + a + b·(1 − d), t_face + k·2E, (t0 + t1) / 2)
  *  - fit 'ray':    t_surf = t0 + (1 − d) · k · (t1 − t0)
  *
  * E = half the box extent along the axis, [t0, t1] = the ray's hull interval.
  * 'object' treats depth as one affine map along the axis. A normalised map
- * carries no scale, so (a, b) are calibrated against the hull (calibrateDepth:
- * the hull entry t0 bounds the surface and is tight on the other views'
- * profiles), with b ≤ k · 2E; a view whose hull says nothing about relief
- * (flat entries) carves nothing. Without calibration (silhouette "balloon"
- * depth, front/back-only sets) a = 0 and b = k · 2E: the map's range is
- * assumed to span the near half (exact for a sphere seen from six sides).
- * The cap at the interval's middle keeps one view from erasing a thin part
- * (or front + back from flattening it to nothing). t is measured in voxels
- * from the camera-side grid face. 'ray' rescales per ray, which over-carves
- * rays that other views already narrowed. Rays outside the view's silhouette
- * are left alone, and depth is sampled from in-silhouette pixels only. The
- * carve is a one-voxel ramp so the 0.5 crossing lands at t_surf with
- * sub-voxel accuracy.
+ * carries no scale, so b is calibrated against the hull, which is tight on
+ * the other views' profiles:
+ *  - 'anchored' (default): a = 0 (the nearest point of the map lies on the
+ *    box face — that is what the hull's nearest entry says), b = the weighted
+ *    median over (1 − d) bins of p95(hull entry)/x (calibrateDepthAnchored).
+ *    A view misregistered by a voxel contaminates a bin or two, not the
+ *    median; b may span the whole extent, and the strength caps how DEEP the
+ *    view may carve (k·2E from its face), not the map's scale.
+ *  - 'envelope' (legacy): the least-carving free-intercept line above every
+ *    bin's p95 (calibrateDepth), b ≤ k·2E. One contaminated bin can lift the
+ *    intercept by a large fraction of the extent and shift the whole carve.
+ * Without calibration (silhouette "balloon" depth, front/back-only sets)
+ * a = 0 and b = k · 2E: the map's range is assumed to span the near half
+ * (exact for a sphere seen from six sides). The cap at the interval's middle
+ * keeps one view from erasing a thin part (or front + back from flattening it
+ * to nothing); the thin-part guard (./guard.ts) holds a floor under the carve
+ * where the front shows a thin part. t is measured in voxels from the
+ * camera-side grid face. 'ray' rescales per ray, which over-carves rays that
+ * other views already narrowed. Rays outside the view's silhouette are left
+ * alone, and depth is sampled from in-silhouette pixels only. The carve is a
+ * one-voxel ramp so the 0.5 crossing lands at t_surf with sub-voxel accuracy.
  */
 import type { DepthMap, Mask } from '../types';
 import { distanceTransform, unionOfSpheres } from '../image/distance';
 import type { PixelBox, ViewProjection } from './frame';
-import type { DepthFit } from './types';
+import type { GuardField } from './guard';
+import type { Calibration, DepthFit } from './types';
 import { forEachRay, rayCrossings, worldToRayT, type Grid } from './volume';
 
 /** A depth map covering the `rect` region of the view image (it may have another resolution). */
@@ -42,7 +51,7 @@ export interface CarveOptions {
   halfExtent: number;
   /**
    * 'object' fit only: calibrate the depth map's scale against the hull
-   * (see calibrateDepth) instead of assuming that its range spans the near
+   * (see the header) instead of assuming that its range spans the near
    * half of the box. Needs a hull that constrains depth (a side / top /
    * bottom view); without one there is no scale to measure. Default true.
    */
@@ -53,6 +62,8 @@ export interface CarveOptions {
    * of the other views): added back to such hull entries before calibrating.
    */
   hullSlack?: number;
+  /** Calibration method (default 'anchored'). */
+  calibration?: Calibration;
 }
 
 /** Number of (1 − d) bins of the calibration envelope. */
@@ -61,9 +72,12 @@ const CAL_BINS = 24;
 const CAL_QUANTILE = 0.95;
 /** Fewest rays per bin for the bin to count. */
 const CAL_MIN_COUNT = 4;
+/** Anchored calibration: bins nearer the face than this x are ill-conditioned for a ratio. */
+const CAL_MIN_X = 0.1;
 
 /**
- * Scale of a view's normalised depth, measured against the hull.
+ * Scale of a view's normalised depth, measured against the hull (legacy
+ * envelope fit).
  *
  * A normalised depth map only fixes the order of the surface points, not
  * their spacing: the surface is t = t_face + a + b·x with x = 1 − d and
@@ -119,6 +133,51 @@ export function calibrateDepth(xs: ArrayLike<number>, ys: ArrayLike<number>, cou
 }
 
 /**
+ * Anchored, robust depth scale: a = 0, b = the weighted median over the
+ * (1 − d) bins (n ≥ 4 rays, mean x ≥ 0.1) of p95(y)/x with weight n·x,
+ * clamped to [0, bMax]. A contaminated bin (rays of a misregistered
+ * silhouette reaching far behind) moves one ratio, not the median. With
+ * fewer than two usable bins the envelope fit supplies b (a := 0). Returns
+ * [0, b] in voxels, or null without data.
+ */
+export function calibrateDepthAnchored(xs: ArrayLike<number>, ys: ArrayLike<number>, count: number, bMax: number): [number, number] | null {
+  if (count === 0) return null;
+  const bins: number[][] = Array.from({ length: CAL_BINS }, () => []);
+  const binX = new Float64Array(CAL_BINS);
+  for (let i = 0; i < count; i++) {
+    const j = Math.min(CAL_BINS - 1, Math.max(0, Math.floor(xs[i] * CAL_BINS)));
+    bins[j].push(ys[i]);
+    binX[j] += xs[i];
+  }
+  const ratios: { r: number; w: number }[] = [];
+  for (let j = 0; j < CAL_BINS; j++) {
+    const v = bins[j];
+    if (v.length < CAL_MIN_COUNT) continue;
+    const X = binX[j] / v.length;
+    if (X < CAL_MIN_X) continue;
+    v.sort((p, q) => p - q);
+    const Y = v[Math.min(v.length - 1, Math.floor(CAL_QUANTILE * v.length))];
+    ratios.push({ r: Math.max(0, Y / X), w: v.length * X });
+  }
+  const cap = Math.max(0, bMax);
+  if (ratios.length < 2) {
+    const lp = calibrateDepth(xs, ys, count, cap);
+    return lp ? [0, Math.min(cap, lp[1])] : null;
+  }
+  ratios.sort((p, q) => p.r - q.r);
+  const total = ratios.reduce((s, r) => s + r.w, 0);
+  let acc = 0, b = ratios[ratios.length - 1].r;
+  for (const r of ratios) {
+    acc += r.w;
+    if (acc >= total / 2) {
+      b = r.r;
+      break;
+    }
+  }
+  return [0, Math.min(cap, b)];
+}
+
+/**
  * Bilinear depth sample that only uses taps inside the view's silhouette
  * (outside it the depth map holds a meaningless 0 = "farthest"), renormalised;
  * the nearest tap when no tap is inside.
@@ -168,6 +227,7 @@ export function carveTargets(
   const tFace = worldToRayT(grid, proj, proj.ws * o.halfExtent);
   const s = grid.spacing;
   const calibrate = o.fit === 'object' && o.calibrate !== false;
+  const anchored = (o.calibration ?? 'anchored') === 'anchored';
   // Pass 1: in-silhouette rays that hit the hull, with their depth and hull interval.
   const cap = out.length;
   const ray = new Int32Array(cap), xs = new Float32Array(cap), t0s = new Float32Array(cap), t1s = new Float32Array(cap);
@@ -191,6 +251,8 @@ export function carveTargets(
   // uncalibrated, a = 0 and b = that maximum.
   const bMax = k * extentT;
   let fa = 0, fb = bMax;
+  // Anchored: the map may span the full extent; the strength caps the depth of the carve instead.
+  let tCap = Infinity;
   if (calibrate) {
     // Entries on the box face are exact; entries behind it come from a (maybe dilated) silhouette.
     const slack = Math.max(0, o.hullSlack ?? 0) / s;
@@ -199,35 +261,86 @@ export function carveTargets(
       const y = t0s[i] - tFace;
       ys[i] = y > 0.25 ? y + slack : y;
     }
-    const cal = calibrateDepth(xs, ys, count, extentT / 2);
-    if (!cal) return out;
-    // A lower strength only flattens the relief (never shifts the surface deeper).
-    fa = cal[0];
-    fb = Math.min(cal[1], bMax);
+    if (anchored) {
+      const cal = calibrateDepthAnchored(xs, ys, count, extentT);
+      if (!cal) return out;
+      fa = 0;
+      fb = cal[1];
+      tCap = tFace + bMax;
+    } else {
+      const cal = calibrateDepth(xs, ys, count, extentT / 2);
+      if (!cal) return out;
+      // A lower strength only flattens the relief (never shifts the surface deeper).
+      fa = cal[0];
+      fb = Math.min(cal[1], bMax);
+    }
   }
   for (let i = 0; i < count; i++) {
     const t0 = t0s[i], t1 = t1s[i], x = xs[i];
     const t = o.fit === 'ray'
       ? t0 + x * k * (t1 - t0)
-      : Math.min(tFace + fa + fb * x, (t0 + t1) / 2);
+      : Math.min(tFace + fa + fb * x, tCap, (t0 + t1) / 2);
     if (t > t0) out[ray[i]] = t; // never adds: in front of the hull there is nothing to carve
   }
   return out;
 }
 
-/** Apply carve targets: voxels before t_surf are emptied with a one-voxel ramp (min with the field). */
-export function applyCarve(field: Float32Array, grid: Grid, proj: ViewProjection, targets: Float32Array): void {
-  const nu = grid.dims[proj.ua];
+export interface CarveStats {
+  /** Voxels that went from occupied (> 0.5) to empty. */
+  carved: number;
+  /** Voxels the guard kept occupied although the carve would have emptied them. */
+  blocked: number;
+  /**
+   * The blocked voxels at least half a voxel inside the guard tube (floor = 1):
+   * a carve that merely grazes the tube's rim (sub-voxel discretisation of a
+   * consistent surface) does not count here, a carve that cuts into a
+   * protected part does.
+   */
+  deep: number;
+}
+
+/**
+ * Apply carve targets: voxels before t_surf are emptied with a one-voxel ramp
+ * (min with the field), never below the guard's floor where one is given.
+ * `dryRun` only counts (the field is left untouched): the stats then describe
+ * what this view would carve from the field as it is, independently of the
+ * other views' carves.
+ */
+export function applyCarve(field: Float32Array, grid: Grid, proj: ViewProjection, targets: Float32Array, guard?: GuardField | null, dryRun = false): CarveStats {
+  const nu = grid.dims[proj.ua], nx = grid.dims[0];
+  const g = guard ?? null;
+  const idx = [0, 0, 0];
+  let carved = 0, blocked = 0, deep = 0;
   forEachRay(grid, proj, (a, b, start, step, n) => {
     const ts = targets[a + nu * b];
     if (!(ts > 0)) return;
     const end = Math.min(n, Math.ceil(ts + 0.5));
+    idx[proj.ua] = a;
+    idx[proj.va] = b;
     for (let t = 0, p = start; t < end; t++, p += step) {
       const ramp = t - ts + 0.5;
-      const v = ramp <= 0 ? 0 : ramp;
-      if (v < field[p]) field[p] = v;
+      let v = ramp <= 0 ? 0 : ramp;
+      const cur = field[p];
+      if (v >= cur) continue;
+      if (g) {
+        idx[proj.wa] = proj.ws > 0 ? n - 1 - t : t;
+        if (g.half[idx[0] + nx * idx[1]] > 0) {
+          const floor = g.value(idx[0], idx[1], idx[2]);
+          if (floor > v) {
+            if (cur > 0.5 && v <= 0.5 && floor > 0.5) {
+              blocked++;
+              if (floor >= 1) deep++;
+            }
+            v = floor;
+            if (v >= cur) continue;
+          }
+        }
+      }
+      if (cur > 0.5 && v <= 0.5) carved++;
+      if (!dryRun) field[p] = v;
     }
   });
+  return { carved, blocked, deep };
 }
 
 /**

@@ -25,6 +25,7 @@ import { DepthEditCard, HumanDetailNote, OriginalNote } from './StepCards';
 import { IconCube, IconInfo, IconLayers, IconSparkles, IconUndo } from './icons';
 import { AiPrepPanel } from './ai/AiPrepPanel';
 import { ViewsPanel } from './ai/ViewsPanel';
+import { FusionReportNote } from './FusionReport';
 import { SculptPanel } from './sculpt/SculptPanel';
 import { DepthMapEditor } from './sculpt/DepthMapEditor';
 import { RigPanel } from './rig/RigPanel';
@@ -299,6 +300,12 @@ export function ControlPanel({ studio }: Props) {
                   }
                 : undefined
             }
+            checks={state.viewChecks}
+            onAlign={actions.setViewAlign}
+            onAlignAuto={actions.autoAlignView}
+            onAlignReset={actions.resetViewAlign}
+            frontMask={state.mask}
+            prompt={(v) => actions.viewPromptText(v)}
           />
           <StepFooter id="views" onStep={actions.setStep} />
         </StepPanel>
@@ -344,6 +351,7 @@ export function ControlPanel({ studio }: Props) {
               note={meshNote}
             />
           )}
+          {state.result?.fusion && <FusionReportNote report={state.result.fusion} />}
           <StepFooter id="3d" onStep={actions.setStep} />
         </StepPanel>
 

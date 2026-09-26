@@ -66,8 +66,8 @@ export function tripoMultiviewParamsFrom(p: DriverInput['params']): TripoMultivi
 export function pickMultiviewFiles(input: Pick<DriverInput, 'file' | 'views'>): Partial<Record<TripoMultiviewField, Blob>> {
   const out: Partial<Record<TripoMultiviewField, Blob>> = { front: input.views.front?.file ?? input.file };
   for (const v of SIDE_VIEWS) {
-    const file = input.views[v as ViewId]?.file;
-    if (file) out[v] = file;
+    const view = input.views[v as ViewId];
+    if (view?.file && view.align?.trust !== 'off') out[v] = view.file; // views switched off in the Views panel are not uploaded
   }
   return out;
 }

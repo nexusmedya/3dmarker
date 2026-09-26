@@ -5,7 +5,8 @@
  * mesh in the shared frame (+Y up, +Z = front, longest side 2, centred).
  */
 import type { BufferGeometry } from 'three';
-import type { DepthMap, I18nText, Mask, Progress, RGBAImage, ViewId } from '../types';
+import type { DepthMap, I18nText, Mask, Progress, RGBAImage, ViewAlign, ViewId, ViewTrust } from '../types';
+import type { Grid } from './volume';
 
 /** World axis: 0 = X, 1 = Y, 2 = Z. */
 export type Axis = 0 | 1 | 2;
@@ -32,6 +33,8 @@ export interface FusionViewInput {
   image: RGBAImage;
   /** Foreground mask; null = alpha channel, else border flood fill, else the whole image. */
   mask: Mask | null;
+  /** See ViewAlign (src/core/types.ts). Absent = DEFAULT_VIEW_ALIGN. */
+  align?: ViewAlign;
 }
 
 /** 'strict': every view carves exactly. 'tolerant': non-front views are dilated first (misaligned AI views). */
@@ -45,6 +48,13 @@ export type HullMode = 'strict' | 'tolerant';
  *  - 'ray':    each ray's own hull interval [t0, t1] (surface t = t0 + (1 − d)·k·(t1 − t0)).
  */
 export type DepthFit = 'object' | 'ray';
+
+/** How the back silhouette enters the XY hull plane: never (it mirrors the front) or intersected (legacy). */
+export type HullBack = 'exclude' | 'intersect';
+/** Depth-scale calibration: anchored robust median (a = 0) or the legacy envelope LP. */
+export type Calibration = 'anchored' | 'envelope';
+/** How extra views are placed on the object box: registered to the front by their silhouette profiles, or by the bbox alone. */
+export type AlignMode = 'auto' | 'bbox';
 
 export interface FusionOptions {
   /** Voxels along the object's longest side (64..256). */
@@ -65,6 +75,11 @@ export interface FusionOptions {
   colorSharpness: number;
   /** Triangle cap; above it the voxel step grows (coarser surface). */
   maxTriangles: number;
+  hullBack: HullBack;
+  calibration: Calibration;
+  /** Thin-part guard δ: parts thinner than δ·(front longest side) are protected from other views (0 = off, ≤ 0.15). */
+  guard: number;
+  align: AlignMode;
 }
 
 export const DEFAULT_FUSION_OPTIONS: FusionOptions = {
@@ -78,6 +93,18 @@ export const DEFAULT_FUSION_OPTIONS: FusionOptions = {
   smoothIterations: 8,
   colorSharpness: 4,
   maxTriangles: 300_000,
+  hullBack: 'exclude',
+  calibration: 'anchored',
+  guard: 0.06,
+  align: 'auto',
+};
+
+/** The options that reproduce the fusion before registration, back exclusion, the guard and anchored calibration. */
+export const LEGACY_FUSION_OPTIONS: Pick<FusionOptions, 'hullBack' | 'calibration' | 'guard' | 'align'> = {
+  hullBack: 'intersect',
+  calibration: 'envelope',
+  guard: 0,
+  align: 'bbox',
 };
 
 export interface DepthEstimateRequest {
@@ -108,13 +135,72 @@ export interface FusionContext {
   yieldControl?: () => Promise<void>;
   /** Longest synchronous run inside a stage before yielding (and checking the abort signal), ms. Default 30. */
   sliceMs?: number;
+  /** Diagnostics / tests: the occupancy field after a volume stage (the live buffer, not a copy). */
+  inspect?: (stage: 'hull' | 'guard' | 'carve' | 'smooth', field: Float32Array, grid: Grid) => void;
 }
 
 /** Where each view's depth came from: the model, the silhouette ("balloon" fallback) or nowhere. */
 export type DepthSource = 'model' | 'silhouette' | 'none';
 
+/**
+ * How a view was placed on the object box: 'bbox' (the front, or align: 'bbox'), 'aligned' (registered
+ * to the front), 'plain' (nothing to register: a plain silhouette), 'weak' (no match: bbox kept),
+ * 'stretched' (cut at an edge, scale not found: bbox kept), 'manual' (the request's dx / dy / scale).
+ */
+export type AlignStatus = 'bbox' | 'aligned' | 'plain' | 'weak' | 'stretched' | 'manual';
+export type AlignLevel = 'good' | 'fair' | 'poor';
+export type AlignNoteCode =
+  | 'aligned' | 'autoAligned' | 'cropped' | 'stretched' | 'weak' | 'plain' | 'aspect'
+  | 'sideBlind' | 'noMask' | 'mirrored' | 'colorOnly' | 'off' | 'inconsistent';
+export interface AlignNote { code: AlignNoteCode; text: I18nText; }
+export interface CutFlags { top: boolean; bottom: boolean; left: boolean; right: boolean; }
+/** Correction of the bbox fit (units as ViewAlign). */
+export interface AlignCorrection { dx: number; dy: number; scale: number; flipX: boolean; }
+
+export interface ViewAlignment {
+  id: ViewId;
+  status: AlignStatus;
+  level: AlignLevel;
+  /** 0..100 integer (alignScore). */
+  score: number;
+  /** 0..1: profile agreement with the front at the applied fit (1 = identical). */
+  confidence: number;
+  /**
+   * What the fusion uses: alignedBox(bbox, applied, SHARED_AXES[id]) === fitBox, except for a back cut
+   * on one axis only, whose uncut axis keeps its bbox extent (see align.ts, "isotropy").
+   */
+  applied: AlignCorrection;
+  /** What automatic registration found (identity when 'plain' / 'weak' / 'bbox'). */
+  suggested: AlignCorrection;
+  /** suggested ∘ applied⁻¹: dx / dy = suggested − applied, scale = suggested.scale / applied.scale. */
+  residual: { dx: number; dy: number; scale: number };
+  cut: CutFlags;
+  fitBox: { x0: number; y0: number; x1: number; y1: number };
+  /** Effective trust (the request, demoted to 'color' when the view is cut on both ends of its shared axis). */
+  trust: ViewTrust;
+  notes: AlignNote[];
+  /** Landmark rows / columns of the FRONT (front pixel coords) for overlay guides: support ends + ≤ 6 strongest edges. */
+  guides: { rows: number[]; cols: number[] };
+}
+
+export interface ViewReport {
+  id: ViewId;
+  trust: ViewTrust;
+  depth: DepthSource;
+  status: AlignStatus;
+  level: AlignLevel;
+  score: number;
+  applied: AlignCorrection;
+  suggested: AlignCorrection;
+  cut: CutFlags;
+  /** Share of this view's carve that the thin-part guard blocked (0..1); null when it did not carve. */
+  consistency: number | null;
+  notes: AlignNote[];
+}
+export interface FusionReport { views: ViewReport[]; warnings: I18nText[]; }
+
 export interface FusionInfo {
-  /** Views that contributed (empty silhouettes are skipped). */
+  /** Views that contributed (empty silhouettes and trust 'off' are skipped). */
   views: ViewId[];
   /** Object box in front-view pixels (width, height, depth) and where the depth came from. */
   box: { width: number; height: number; depth: number; depthFrom: 'side' | 'top-bottom' | 'default' };
@@ -124,6 +210,15 @@ export interface FusionInfo {
   depth: Partial<Record<ViewId, DepthSource>>;
   warnings: I18nText[];
   triangles: number;
+  /** Same order as `views` (front first, status 'bbox'). */
+  alignment: ViewAlignment[];
+  /** Effective trust per view. */
+  trust: Partial<Record<ViewId, ViewTrust>>;
+  /** Per carving view: share of its carve the thin-part guard blocked. */
+  consistency: Partial<Record<ViewId, number>>;
+  /** Front columns the thin-part guard protects. */
+  guardColumns: number;
+  report: FusionReport;
 }
 
 export interface FusionResult {

@@ -30,6 +30,7 @@ const result: ResultInfo = {
   depthPreview: null,
   elapsedMs: 1,
   sourceName: 'a.png',
+  fusion: null,
 };
 
 describe('ExportBar', () => {

@@ -261,6 +261,14 @@ function drawLandscape(ctx: Ctx, w: number, h: number): void {
 // T-pose mannequin: front / back / left / right, one silhouette frame
 // (head top at 5.8 %, feet at 94.5 % of the height, arm span 90 % of the width)
 // so the views line up for multi-view fusion and the rig's T-pose detection.
+// A second sample draws the same views the way independent artists would
+// (own scale, offset, arm height, a cropped bottom edge) for the fusion's
+// registration and thin-part guard.
+
+/** Mannequin drawing; `armY` is the arm / hand row as a fraction of the height (the front uses ARM_Y). */
+type MannequinDraw = (ctx: Ctx, w: number, h: number, armY?: number) => void;
+
+const ARM_Y = 0.275;
 
 const MANNEQUIN = {
   skin: '#e9b48f',
@@ -287,7 +295,7 @@ function limb(ctx: Ctx, ax: number, ay: number, bx: number, by: number, r: numbe
 }
 
 /** Front or back of the mannequin (the silhouette is symmetric, so both share it). */
-function drawMannequinFrontBack(ctx: Ctx, w: number, h: number, back: boolean): void {
+function drawMannequinFrontBack(ctx: Ctx, w: number, h: number, back: boolean, armY = ARM_Y): void {
   const s = Math.min(w, h);
   const cx = w / 2;
   const C = MANNEQUIN;
@@ -304,12 +312,12 @@ function drawMannequinFrontBack(ctx: Ctx, w: number, h: number, back: boolean): 
   // Arms straight out (T-pose) with hands.
   for (const side of [-1, 1]) {
     ctx.fillStyle = C.skin;
-    limb(ctx, cx + side * s * 0.1, h * 0.275, cx + side * s * 0.41, h * 0.275, s * 0.03, s * 0.022);
+    limb(ctx, cx + side * s * 0.1, h * armY, cx + side * s * 0.41, h * armY, s * 0.03, s * 0.022);
     ctx.fillStyle = C.shirt;
-    limb(ctx, cx + side * s * 0.1, h * 0.275, cx + side * s * 0.2, h * 0.275, s * 0.036, s * 0.033);
+    limb(ctx, cx + side * s * 0.1, h * armY, cx + side * s * 0.2, h * armY, s * 0.036, s * 0.033);
     ctx.fillStyle = C.skinShade;
     ctx.beginPath();
-    ctx.ellipse(cx + side * s * 0.435, h * 0.276, s * 0.032, s * 0.026, 0, 0, Math.PI * 2);
+    ctx.ellipse(cx + side * s * 0.435, h * (armY + 0.001), s * 0.032, s * 0.026, 0, 0, Math.PI * 2);
     ctx.fill();
   }
   // Neck and head.
@@ -373,7 +381,7 @@ function drawMannequinFrontBack(ctx: Ctx, w: number, h: number, back: boolean): 
 }
 
 /** Profile facing the image's left (the mannequin's left side: `left` view). */
-function drawMannequinProfile(ctx: Ctx, w: number, h: number): void {
+function drawMannequinProfile(ctx: Ctx, w: number, h: number, armY = ARM_Y): void {
   const s = Math.min(w, h);
   const cx = w / 2;
   const C = MANNEQUIN;
@@ -407,11 +415,11 @@ function drawMannequinProfile(ctx: Ctx, w: number, h: number): void {
   // The near arm points at the camera: the hand seen head-on (it hides the arm behind it).
   ctx.fillStyle = C.skin;
   ctx.beginPath();
-  ctx.arc(cx, h * 0.275, s * 0.036, 0, Math.PI * 2);
+  ctx.arc(cx, h * armY, s * 0.036, 0, Math.PI * 2);
   ctx.fill();
   ctx.fillStyle = C.skinShade;
   ctx.beginPath();
-  ctx.ellipse(cx, h * 0.276, s * 0.022, s * 0.026, 0, 0, Math.PI * 2);
+  ctx.ellipse(cx, h * (armY + 0.001), s * 0.022, s * 0.026, 0, 0, Math.PI * 2);
   ctx.fill();
   // Neck, head with nose (left), ear and hair at the back (right).
   ctx.fillStyle = C.skin;
@@ -442,13 +450,13 @@ function drawMannequinProfile(ctx: Ctx, w: number, h: number): void {
 const drawMannequin: Draw = (ctx, w, h) => drawMannequinFrontBack(ctx, w, h, false);
 
 /** Mirror a drawing left ↔ right. */
-function mirrored(draw: Draw): Draw {
-  return (ctx, w, h) => {
+function mirrored(draw: MannequinDraw): MannequinDraw {
+  return (ctx, w, h, armY) => {
     ctx.clearRect(0, 0, w, h);
     ctx.save();
     ctx.translate(w, 0);
     ctx.scale(-1, 1);
-    draw(ctx, w, h);
+    draw(ctx, w, h, armY);
     ctx.restore();
   };
 }
@@ -461,6 +469,53 @@ const MANNEQUIN_VIEWS: Partial<Record<SampleViewId, Draw>> = {
   },
   // The right side faces the image's right.
   right: mirrored(drawMannequinProfile),
+};
+
+/**
+ * How a hand-made view differs from the front's frame: `scale` about the image
+ * centre, `dx` / `dy` shifts (fractions of the size, + = right / down) and the
+ * arm row `armY` (the front draws its arms at ARM_Y = 0.275).
+ */
+export interface SketchPerturbation {
+  scale: number;
+  dx: number;
+  dy: number;
+  armY: number;
+}
+
+/**
+ * Draws `draw` the way an artist working without the front's frame would:
+ * scaled about the centre, shifted, arms at its own height. Content pushed
+ * past the canvas is lost, like a view cropped at an image border.
+ */
+function perturbed(draw: MannequinDraw, p: SketchPerturbation): Draw {
+  return (ctx, w, h) => {
+    ctx.clearRect(0, 0, w, h);
+    ctx.save();
+    ctx.translate(w / 2 + p.dx * w, h / 2 + p.dy * h);
+    ctx.scale(p.scale, p.scale);
+    ctx.translate(-w / 2, -h / 2);
+    draw(ctx, w, h, p.armY);
+    ctx.restore();
+  };
+}
+
+/**
+ * The reported case: back + side views drawn outside the app. Back 3 % lower,
+ * 5 % smaller, arms 3 %H lower; left 8 % larger and 6 % lower, so the feet run
+ * past the bottom border (≈ 4 %H of the figure cut off), arms 2 %H higher;
+ * right (mirrored profile) 10 % smaller, shifted right, arms 4 %H lower.
+ */
+export const SKETCH_PERTURBATIONS: Record<'back' | 'left' | 'right', SketchPerturbation> = {
+  back: { scale: 0.95, dx: 0, dy: 0.03, armY: 0.305 },
+  left: { scale: 1.08, dx: 0, dy: 0.06, armY: 0.255 },
+  right: { scale: 0.9, dx: 0.03, dy: 0, armY: 0.315 },
+};
+
+const SKETCH_VIEWS: Partial<Record<SampleViewId, Draw>> = {
+  back: perturbed((ctx, w, h, armY) => drawMannequinFrontBack(ctx, w, h, true, armY), SKETCH_PERTURBATIONS.back),
+  left: perturbed(drawMannequinProfile, SKETCH_PERTURBATIONS.left),
+  right: perturbed(mirrored(drawMannequinProfile), SKETCH_PERTURBATIONS.right),
 };
 
 export const SAMPLES: SampleSpec[] = [
@@ -500,6 +555,17 @@ export const SAMPLES: SampleSpec[] = [
     driverId: 'multiview-fusion',
     draw: drawMannequin,
     views: MANNEQUIN_VIEWS,
+  },
+  {
+    // Same front as `tpose`; the views come with an artist's own framing (SKETCH_PERTURBATIONS).
+    id: 'tpose-sketch',
+    name: { tr: 'T-poz manken (elle çizilmiş görünümler)', en: 'T-pose mannequin (hand-drawn views)' },
+    fileName: 'sample-tpose-sketch.png',
+    width: 768,
+    height: 768,
+    driverId: 'multiview-fusion',
+    draw: drawMannequin,
+    views: SKETCH_VIEWS,
   },
 ];
 

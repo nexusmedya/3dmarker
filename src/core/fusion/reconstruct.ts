@@ -2,22 +2,29 @@
  * Multi-view reconstruction: front + any of back / left / right / top /
  * bottom → closed, vertex-coloured mesh in the shared frame.
  *
- *  1. Normalise: per-view silhouette + bbox, object box W × H × D (./frame.ts).
- *  2. Soft visual hull on a voxel grid (./volume.ts).
+ *  1. Normalise: per-view silhouette + bbox (./frame.ts), registration of
+ *     every extra view to the front by its silhouette profiles (./align.ts:
+ *     scale / offset, cut edges, per-view trust), object box W × H × D.
+ *  2. Soft visual hull on a voxel grid (./volume.ts; the back silhouette is
+ *     not intersected — it mirrors the front's), then the thin-part guard
+ *     (./guard.ts) floors the parts the front shows as thin.
  *  3. Optional depth refinement: each view's monocular depth carves in front
- *     of its estimated surface (./depthCarve.ts); falls back to the hull (with
- *     a warning) when the depth model is unavailable.
+ *     of its estimated surface (./depthCarve.ts, anchored calibration, never
+ *     below the guard); falls back to the hull (with a warning) when the
+ *     depth model is unavailable.
  *  4. Gaussian-smoothed occupancy → marching cubes (./marchingCubes.ts) →
  *     Taubin smoothing → normals (./meshOps.ts); the voxel step grows when the
  *     triangle cap would be exceeded.
  *  5. Vertex colours from the views, visibility-aware (./color.ts).
- *  6. Rescale: longest side 2, centred.
+ *  6. Rescale: longest side 2, centred. `info.report` (also
+ *     geometry.userData.fusion) tells per view how it was placed and trusted.
  */
 import { BufferAttribute, BufferGeometry } from 'three';
-import type { I18nText, Mask, Progress, RGBAImage, ViewId } from '../types';
+import type { I18nText, Mask, Progress, RGBAImage, ViewId, ViewTrust } from '../types';
 import { throwIfAborted } from '../types';
 import { LocalizedError } from '../errors';
 import { yieldToPaint } from '../yield';
+import { registerViews } from './align';
 import {
   constrainsDepth,
   estimateObjectBox,
@@ -28,18 +35,22 @@ import {
 } from './frame';
 import { applyCarve, carveTargets, silhouetteDepth, type ViewDepth } from './depthCarve';
 import { colorSource, colorVerticesSteps } from './color';
+import { buildGuardSteps, GUARD_FILL, type GuardField } from './guard';
 import { marchingCubesSteps, type IsoMesh } from './marchingCubes';
 import { buildAdjacency, fitToFrame, taubinSmoothSteps, vertexNormals } from './meshOps';
 import { macrotask, runSliced, type Steps } from './steps';
-import { buildHullSteps, countSurfaceCellsSteps, createGrid, dilationRadius, downsampleSteps, gaussianBlur3DSteps, type Grid } from './volume';
+import { buildHullPlanesSteps, countSurfaceCellsSteps, createGrid, dilationRadius, downsampleSteps, gaussianBlur3DSteps, type Grid } from './volume';
 import {
   DEFAULT_FUSION_OPTIONS,
+  type AlignNote,
   type DepthSource,
   type FusionContext,
   type FusionInfo,
   type FusionOptions,
   type FusionResult,
   type FusionViewInput,
+  type ViewAlignment,
+  type ViewReport,
 } from './types';
 
 export const FUSION_VIEW_NAMES: Record<ViewId, I18nText> = {
@@ -54,6 +65,7 @@ export const FUSION_VIEW_NAMES: Record<ViewId, I18nText> = {
 export const FUSION_TEXT = {
   prepare: { tr: 'Görünümler hizalanıyor…', en: 'Aligning the views…' },
   hull: { tr: 'Görsel kabuk oyuluyor…', en: 'Carving the visual hull…' },
+  guard: { tr: 'İnce parçalar korunuyor…', en: 'Protecting thin parts…' },
   carve: { tr: 'Derinlikle oyuluyor…', en: 'Carving with depth…' },
   smoothVolume: { tr: 'Hacim yumuşatılıyor…', en: 'Smoothing the volume…' },
   surface: { tr: 'Yüzey çıkarılıyor (marching cubes)…', en: 'Extracting the surface (marching cubes)…' },
@@ -76,9 +88,37 @@ export const FUSION_TEXT = {
     tr: 'Görünümler örtüşmüyor: birleştirilen hacim boş kaldı. Tüm görünümlerin aynı nesneyi aynı duruşta gösterdiğini kontrol edin ya da "Toleranslı" kabuk modunu deneyin.',
     en: 'The views do not overlap: the fused volume is empty. Check that every view shows the same subject in the same pose, or try the "Tolerant" hull mode.',
   },
+  // Per-view registration warnings; {view} = FUSION_VIEW_NAMES[id] (see viewWarning).
+  viewCropped: {
+    tr: 'Özne {view} görünümünde kenarda kesik; eksik kısım diğer görünümlerden tamamlanıyor',
+    en: 'The subject is cut off at the edge of the {view} view; the missing part is filled from the other views',
+  },
+  viewStretched: {
+    tr: '{view} görünümü kenarda kesik ve ölçeği bulunamadı; hizalama yaklaşık',
+    en: 'The {view} view is cut off at the edge and its scale could not be found; alignment is approximate',
+  },
+  viewColorOnly: { tr: '{view} görünümü yalnızca renk için kullanıldı', en: 'The {view} view was used for colour only' },
+  viewWeak: {
+    tr: '{view} görünümü ön görünümle otomatik hizalanamadı; çerçevesi olduğu gibi kullanıldı',
+    en: 'The {view} view could not be aligned to the front automatically; its frame was used as is',
+  },
+  viewInconsistent: {
+    tr: '{view} görünümü ön görünümle tam örtüşmüyor; ince parçalar korundu',
+    en: 'The {view} view does not quite match the front; thin parts were protected',
+  },
+  viewMirrored: { tr: '{view} görünümü aynalanmış görünüyor', en: 'The {view} view looks mirrored' },
 } satisfies Record<string, I18nText>;
 
+/** A per-view warning with the view's name filled in. */
+export function viewWarning(text: I18nText, id: ViewId): I18nText {
+  const name = FUSION_VIEW_NAMES[id];
+  return { tr: text.tr.replace('{view}', name.tr), en: text.en.replace('{view}', name.en) };
+}
+
 const clamp = (v: number, lo: number, hi: number) => (Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : lo);
+
+/** Share of a view's carve held by the thin-part guard from which the view counts as inconsistent with the front. */
+export const INCONSISTENT_SHARE = 0.25;
 
 /** Options with every field defined and clamped to its documented range. */
 export function sanitizeFusionOptions(o: Partial<FusionOptions>): FusionOptions {
@@ -95,6 +135,10 @@ export function sanitizeFusionOptions(o: Partial<FusionOptions>): FusionOptions 
     smoothIterations: Math.round(clamp(num(o.smoothIterations, d.smoothIterations), 0, 100)),
     colorSharpness: clamp(num(o.colorSharpness, d.colorSharpness), 0.5, 32),
     maxTriangles: Math.round(clamp(num(o.maxTriangles, d.maxTriangles), 1000, 5_000_000)),
+    hullBack: o.hullBack === 'intersect' ? 'intersect' : o.hullBack === 'exclude' ? 'exclude' : d.hullBack,
+    calibration: o.calibration === 'envelope' ? 'envelope' : o.calibration === 'anchored' ? 'anchored' : d.calibration,
+    guard: clamp(num(o.guard, d.guard), 0, 0.15),
+    align: o.align === 'bbox' ? 'bbox' : o.align === 'auto' ? 'auto' : d.align,
   };
 }
 
@@ -160,6 +204,40 @@ function* extractCapped(field: Float32Array, grid: Grid, maxTriangles: number): 
   }
 }
 
+/**
+ * Stage 1 without the yields: the prepared views (front first, duplicates
+ * and trust 'off' dropped, empty silhouettes skipped), registered to the
+ * front. Throws noFront. Deterministic, so tests can reproduce the fusion's
+ * views (see testing.ts reconstructWithField).
+ */
+export function prepareFusionViews(inputs: FusionViewInput[], o: Pick<FusionOptions, 'align'>): { views: PreparedView[]; alignments: ViewAlignment[] } {
+  const front = inputs.find((v) => v.id === 'front');
+  const frontView = front ? prepareView(front) : null;
+  if (!frontView) throw new LocalizedError(FUSION_TEXT.noFront);
+  const views: PreparedView[] = [frontView];
+  const seen = new Set<ViewId>(['front']);
+  for (const input of inputs) {
+    if (seen.has(input.id) || input.align?.trust === 'off') continue;
+    seen.add(input.id);
+    const v = prepareView(input);
+    if (v) views.push(v);
+  }
+  const alignments = registerViews(views, { mode: o.align });
+  return { views, alignments };
+}
+
+/** Registration warnings of a view, in note order (one per code). */
+function registrationWarnings(a: ViewAlignment): I18nText[] {
+  const out: I18nText[] = [];
+  const codes = new Set(a.notes.map((n) => n.code));
+  if (codes.has('cropped')) out.push(viewWarning(FUSION_TEXT.viewCropped, a.id));
+  if (a.status === 'stretched') out.push(viewWarning(FUSION_TEXT.viewStretched, a.id));
+  if (a.status === 'weak') out.push(viewWarning(FUSION_TEXT.viewWeak, a.id));
+  if (codes.has('mirrored')) out.push(viewWarning(FUSION_TEXT.viewMirrored, a.id));
+  if (a.trust === 'color') out.push(viewWarning(FUSION_TEXT.viewColorOnly, a.id));
+  return out;
+}
+
 export async function reconstructFromViews(
   inputs: FusionViewInput[],
   options: Partial<FusionOptions>,
@@ -169,7 +247,7 @@ export async function reconstructFromViews(
   const { signal } = ctx;
   const pause = ctx.yieldControl ?? yieldToPaint;
   const warnings: I18nText[] = [];
-  // Once depth failed, every later label carries the warning (the progress line is the only channel).
+  // Once something went wrong, every later label carries the first warning (the progress line is the only channel).
   const label = (l: I18nText): I18nText => (warnings.length ? joinLabel(l, warnings[0], ' — ') : l);
   const stage = async (l: I18nText, ratio: number) => {
     throwIfAborted(signal);
@@ -187,35 +265,36 @@ export async function reconstructFromViews(
   const sliceMs = Math.max(0, ctx.sliceMs ?? 30);
   const sliced = <T>(steps: Steps<T>) => runSliced(steps, sliceMs, between);
 
-  // 1. Normalisation.
+  // 1. Normalisation and registration.
   await stage(FUSION_TEXT.prepare, 0.02);
-  const front = inputs.find((v) => v.id === 'front');
-  const frontView = front ? prepareView(front) : null;
-  if (!frontView) throw new LocalizedError(FUSION_TEXT.noFront);
-  const views: PreparedView[] = [frontView];
-  const seen = new Set<ViewId>(['front']);
-  for (const input of inputs) {
-    if (seen.has(input.id)) continue;
-    seen.add(input.id);
-    await between();
-    const v = prepareView(input);
-    if (v) views.push(v);
-  }
+  const { views, alignments } = prepareFusionViews(inputs, o);
+  await between();
   if (views.length < 2) throw new LocalizedError(FUSION_TEXT.needViews);
-  const box = estimateObjectBox(views, o.defaultDepth);
+  const shapeViews = views.filter((v) => v.trust === 'full');
+  const colorViews = views.filter((v) => v.trust !== 'off');
+  for (const a of alignments) warnings.push(...registrationWarnings(a));
+  const box = estimateObjectBox(shapeViews, o.defaultDepth);
   // Empty margin for the blur (the hull itself is clipped to the box).
   const pad = Math.ceil(3 * o.smoothness) + 3;
   const grid = createGrid(box.size, o.resolution, pad);
 
-  // 2. Visual hull.
+  // 2. Visual hull and the thin-part guard.
   await stage(FUSION_TEXT.hull, 0.06);
-  const field = await sliced(buildHullSteps(views, box, grid, o));
+  const { field, planes } = await sliced(buildHullPlanesSteps(shapeViews, box, grid, { hull: o.hull, tolerance: o.tolerance, hullBack: o.hullBack }));
+  ctx.inspect?.('hull', field, grid);
+  let guard: GuardField | null = null;
+  if (o.guard > 0) {
+    await stage(FUSION_TEXT.guard, 0.08);
+    guard = await sliced(buildGuardSteps(planes, box, grid, { delta: o.guard, rho: GUARD_FILL }));
+    guard.applyFloor(field);
+    ctx.inspect?.('guard', field, grid);
+  }
 
   // 3. Depth refinement.
   const depthFrom: Partial<Record<ViewId, DepthSource>> = {};
   const depths = new Map<ViewId, ViewDepth>();
   if (ctx.estimateDepth && o.depthStrength > 0) {
-    const candidates = views.filter((v) => v.maskSource !== 'none');
+    const candidates = shapeViews.filter((v) => v.maskSource !== 'none');
     for (let i = 0; i < candidates.length; i++) {
       const view = candidates[i];
       const name = FUSION_VIEW_NAMES[view.id];
@@ -240,17 +319,17 @@ export async function reconstructFromViews(
       } catch (e) {
         if (isAbort(e) || signal.aborted) throw e;
         // Download / backend failures repeat for every view: stop asking.
-        warnings.push(FUSION_TEXT.depthUnavailable);
-        if (e instanceof LocalizedError) warnings.push(e.i18n);
-        else if (e instanceof Error && e.message) warnings.push({ tr: e.message, en: e.message });
+        warnings.unshift(FUSION_TEXT.depthUnavailable);
+        if (e instanceof LocalizedError) warnings.splice(1, 0, e.i18n);
+        else if (e instanceof Error && e.message) warnings.splice(1, 0, { tr: e.message, en: e.message });
         ctx.onProgress({ label: label(head), ratio: r0 });
         break;
       }
     }
   }
   // Nothing measures the depth of a front/back-only set: round it like a balloon.
-  if (!constrainsDepth(views)) {
-    for (const view of views) {
+  if (!constrainsDepth(shapeViews)) {
+    for (const view of shapeViews) {
       if (depths.has(view.id)) continue;
       const crop = cropView(view, 0);
       depths.set(view.id, { depth: silhouetteDepth(crop.mask), rect: crop.rect });
@@ -259,14 +338,22 @@ export async function reconstructFromViews(
   }
   for (const v of views) depthFrom[v.id] ??= 'none';
 
+  const consistency: Partial<Record<ViewId, number>> = {};
+  const inconsistent = new Set<ViewId>();
   if (depths.size > 0 && o.depthStrength > 0) {
     await stage(FUSION_TEXT.carve, 0.62);
     // Model depth has no scale: measure it against a hull that constrains depth. The silhouette
     // balloon (and any depth of a front/back-only set) keeps the assumed near-half range.
-    const hullHasDepth = constrainsDepth(views);
-    // Every target is computed from the uncarved hull before any carving (order-independent, no copy).
-    const plans: { proj: ReturnType<typeof viewProjection>; targets: Float32Array }[] = [];
-    for (const v of views) {
+    const hullHasDepth = constrainsDepth(shapeViews);
+    let hullVoxels = 0;
+    for (let p = 0; p < field.length; p++) if (field[p] > 0.5) hullVoxels++;
+    // Every target is computed from the uncarved hull before any carving (order-independent, no copy),
+    // and so is every view's consistency: a dry run counts what the view alone would carve and what
+    // the guard would hold (voxels a later view finds already carved would otherwise drop out of its
+    // share and inflate the ratio of the last views). Only carves reaching half a voxel into a tube
+    // count as blocked: grazing the rim is discretisation, not disagreement.
+    const plans: { id: ViewId; proj: ReturnType<typeof viewProjection>; targets: Float32Array; consistency: number }[] = [];
+    for (const v of shapeViews) {
       if (!depths.has(v.id)) continue;
       const proj = viewProjection(v, box.size);
       const targets = carveTargets(field, grid, proj, v.mask, depths.get(v.id)!, {
@@ -274,20 +361,29 @@ export async function reconstructFromViews(
         fit: o.depthFit,
         halfExtent: box.size[proj.wa] / 2,
         calibrate: hullHasDepth && depthFrom[v.id] === 'model',
-        hullSlack: hullSlack(views, box.size, proj.wa, o),
+        hullSlack: hullSlack(shapeViews, box.size, proj.wa, o),
+        calibration: o.calibration,
       });
-      plans.push({ proj, targets });
+      const { carved, blocked, deep } = applyCarve(field, grid, proj, targets, guard, true);
+      plans.push({ id: v.id, proj, targets, consistency: deep / Math.max(carved + blocked, 0.005 * hullVoxels) });
       await between();
     }
-    for (const { proj, targets } of plans) {
-      applyCarve(field, grid, proj, targets);
+    for (const { id, proj, targets, consistency: c } of plans) {
+      applyCarve(field, grid, proj, targets, guard);
+      consistency[id] = c;
+      if (c >= INCONSISTENT_SHARE) {
+        inconsistent.add(id);
+        warnings.push(viewWarning(FUSION_TEXT.viewInconsistent, id));
+      }
       await between();
     }
+    ctx.inspect?.('carve', field, grid);
   }
 
   // 4. Surface.
   await stage(FUSION_TEXT.smoothVolume, 0.68);
   await sliced(gaussianBlur3DSteps(field, grid.dims, o.smoothness));
+  ctx.inspect?.('smooth', field, grid);
   await stage(FUSION_TEXT.surface, 0.74);
   const ext = await sliced(extractCapped(field, grid, o.maxTriangles));
   const { positions, indices } = ext.mesh;
@@ -301,7 +397,7 @@ export async function reconstructFromViews(
   // 5. Colour.
   await stage(FUSION_TEXT.color, 0.9);
   const sources = [];
-  for (const v of views) {
+  for (const v of colorViews) {
     sources.push(colorSource(v, viewProjection(v, box.size), ext.field, ext.grid));
     await between();
   }
@@ -310,9 +406,28 @@ export async function reconstructFromViews(
     tolerance: 2.5 * ext.grid.spacing,
   }));
 
-  // 6. Shared frame.
+  // 6. Shared frame and the report.
   await stage(FUSION_TEXT.finish, 0.97);
   fitToFrame(positions, 2);
+  const trust: Partial<Record<ViewId, ViewTrust>> = {};
+  for (const v of views) trust[v.id] = v.trust;
+  const reportViews: ViewReport[] = alignments.map((a) => {
+    const notes: AlignNote[] = a.notes.slice();
+    if (inconsistent.has(a.id)) notes.push({ code: 'inconsistent', text: { tr: 'Ön görünümle tam örtüşmüyor; ince parçalar korundu', en: 'Does not quite match the front; thin parts were protected' } });
+    return {
+      id: a.id,
+      trust: a.trust,
+      depth: depthFrom[a.id] ?? 'none',
+      status: a.status,
+      level: a.level,
+      score: a.score,
+      applied: a.applied,
+      suggested: a.suggested,
+      cut: a.cut,
+      consistency: consistency[a.id] ?? null,
+      notes,
+    };
+  });
   const info: FusionInfo = {
     views: views.map((v) => v.id),
     box: { width: box.size[0], height: box.size[1], depth: box.size[2], depthFrom: box.depthFrom },
@@ -321,6 +436,11 @@ export async function reconstructFromViews(
     depth: depthFrom,
     warnings,
     triangles: indices.length / 3,
+    alignment: alignments,
+    trust,
+    consistency,
+    guardColumns: guard ? guard.columns : 0,
+    report: { views: reportViews, warnings },
   };
   const geometry = new BufferGeometry();
   geometry.setAttribute('position', new BufferAttribute(positions, 3));
@@ -329,5 +449,6 @@ export async function reconstructFromViews(
   geometry.setIndex(new BufferAttribute(indices, 1));
   geometry.computeBoundingSphere();
   geometry.userData.multiview = info;
+  geometry.userData.fusion = info.report;
   return { geometry, info };
 }

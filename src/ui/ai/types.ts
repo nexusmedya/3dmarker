@@ -1,5 +1,5 @@
 /** Small shared types of the AI UI (the shell holds the state, these components only render it). */
-import type { RGBAImage, ViewId } from '../../core/types';
+import type { Mask, RGBAImage, ViewAlign, ViewId } from '../../core/types';
 
 export type AiJobStatus = 'idle' | 'running' | 'error';
 
@@ -9,6 +9,10 @@ export interface ViewSlotInfo {
   origin: 'upload' | 'ai';
   /** File name (uploads) or a generated name (AI). */
   name: string;
+  /** Foreground mask for the alignment overlay (null / absent = alpha, else the whole image). */
+  mask?: Mask | null;
+  /** Alignment / trust request (absent = auto, full trust). */
+  align?: ViewAlign;
 }
 
 /** The views besides the front (the front is always the source image). */

@@ -27,6 +27,7 @@ import {
   buildGltfModel,
   buildModel,
   frontView,
+  fusionReportOf,
   hasVertexColors,
   createImageTexture,
   isAbortError,
@@ -499,6 +500,23 @@ describe('runPipeline', () => {
     await expect(
       runPipeline({ source: source(image(8, 8)), bgMode: 'none', driver, params: {}, meshParams: {}, signal: new AbortController().signal, onProgress: noop }),
     ).rejects.toThrow('boom');
+  });
+});
+
+describe('fusionReportOf', () => {
+  it('finds the fusion report on a mesh geometry (first one), null elsewhere', () => {
+    const report = { views: [{ id: 'back', score: 91 }], warnings: [] };
+    const g = new BoxGeometry(1, 1, 1);
+    g.userData.fusion = report;
+    const plain = new Mesh(new BoxGeometry(1, 1, 1), new MeshBasicMaterial());
+    const group = new Group();
+    group.add(plain, new Mesh(g, new MeshBasicMaterial()));
+    expect(fusionReportOf(group)).toBe(report);
+    expect(fusionReportOf(plain)).toBeNull();
+    // Junk under the key is not a report.
+    plain.geometry.userData.fusion = { views: 'no' };
+    expect(fusionReportOf(plain)).toBeNull();
+    expect(fusionReportOf(new Group())).toBeNull();
   });
 });
 

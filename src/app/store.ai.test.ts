@@ -7,12 +7,15 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { Driver, Mask, RGBAImage } from '../core/types';
+import { DEFAULT_VIEW_ALIGN } from '../core/types';
+import type { ViewAlignment } from '../core/fusion/types';
 import type { HumanAnalysis } from '../core/human/types';
 import type { AiSettings } from '../ai/types';
 import { DEFAULT_PREP_OPTIONS } from '../ai/types';
 import { createProviderConfig, saveAiSettings } from '../ai/settings';
 import { STYLES } from '../ai/styles';
 import {
+  activeViews,
   canGenerate,
   createInitialState,
   extraViewSet,
@@ -73,8 +76,29 @@ const init = (store: KeyValueStore | null = null, session: KeyValueStore | null 
 const img = (w = 2, h = 2): RGBAImage => ({ width: w, height: h, data: new Uint8ClampedArray(w * h * 4).fill(255) });
 const src = (name = 'a.png'): SourceImage => ({ name, file: new Blob([name]), image: img() });
 const mask = (): Mask => ({ width: 2, height: 2, data: new Uint8Array([1, 1, 0, 0]) });
-const view = (name: string, origin: ViewEntry['origin'] = 'upload'): ViewEntry => ({ file: new Blob([name]), image: img(), mask: mask(), origin, name });
+const view = (name: string, origin: ViewEntry['origin'] = 'upload'): ViewEntry => ({ file: new Blob([name]), image: img(), mask: mask(), origin, name, align: DEFAULT_VIEW_ALIGN });
 const stats = { vertices: 3, triangles: 1, watertight: false };
+
+/** A registration result as useStudio's check would deliver it. */
+function check(id: ViewAlignment['id'], score = 90, over: Partial<ViewAlignment> = {}): ViewAlignment {
+  const c = { dx: 0, dy: 0, scale: 1, flipX: false };
+  return {
+    ...over,
+    id,
+    status: over.status ?? 'aligned',
+    level: score >= 80 ? 'good' : score >= 55 ? 'fair' : 'poor',
+    score,
+    confidence: 0.9,
+    applied: c,
+    suggested: c,
+    residual: { dx: 0, dy: 0, scale: 1 },
+    cut: { top: false, bottom: false, left: false, right: false },
+    fitBox: { x0: 0, y0: 0, x1: 2, y1: 2 },
+    trust: 'full',
+    notes: [{ code: 'aligned', text: { tr: 'Önle hizalı', en: 'Aligned with the front' } }],
+    guides: { rows: [], cols: [] },
+  };
+}
 
 function loaded(s: AppState = init(), source = src()): AppState {
   return reducer(s, { type: 'imageLoaded', source, mask: null, maskNote: null });
@@ -291,6 +315,107 @@ describe('AI job, prepared image and views', () => {
     expect(cleared.prepared).toBeNull();
   });
 
+  describe('alignment and trust', () => {
+    const withBack = () => reducer(loaded(), { type: 'viewSet', view: 'back', entry: view('b.png') });
+
+    it('viewAlign sanitises the patch and turns manual only for dx / dy / scale', () => {
+      let s = withBack();
+      expect(s.views.back!.align).toEqual(DEFAULT_VIEW_ALIGN);
+      s = reducer(s, { type: 'viewAlign', view: 'back', patch: { trust: 'color' } });
+      expect(s.views.back!.align).toEqual({ ...DEFAULT_VIEW_ALIGN, trust: 'color' }); // trust alone changes nothing else
+      s = reducer(s, { type: 'viewAlign', view: 'back', patch: { dy: -0.03 } });
+      expect(s.views.back!.align).toMatchObject({ mode: 'manual', dy: -0.03, dx: 0, scale: 1, trust: 'color' });
+      s = reducer(s, { type: 'viewAlign', view: 'back', patch: { dx: NaN, scale: 9, trust: 'bogus' as never } });
+      expect(s.views.back!.align).toMatchObject({ dx: 0, scale: 2, trust: 'color' }); // NaN → kept, out of range → clamped, bad trust → kept
+      s = reducer(s, { type: 'viewAlign', view: 'back', patch: { dx: -3 } });
+      expect(s.views.back!.align.dx).toBe(-0.25);
+      // Unknown views are ignored.
+      expect(reducer(s, { type: 'viewAlign', view: 'top', patch: { dx: 0.1 } })).toBe(s);
+    });
+
+    it('viewAlignAuto keeps flip and trust; viewAlignReset restores the default', () => {
+      let s = withBack();
+      s = reducer(s, { type: 'viewAlign', view: 'back', patch: { dx: 0.02, dy: -0.03, scale: 1.05, flipX: true, trust: 'color' } });
+      s = reducer(s, { type: 'viewAlignAuto', view: 'back' });
+      expect(s.views.back!.align).toEqual({ mode: 'auto', dx: 0, dy: 0, scale: 1, flipX: true, trust: 'color' });
+      s = reducer(s, { type: 'viewAlignReset', view: 'back' });
+      expect(s.views.back!.align).toEqual(DEFAULT_VIEW_ALIGN);
+      expect(s.views.back!.align).not.toBe(DEFAULT_VIEW_ALIGN);
+    });
+
+    it('viewChecked keeps only results for the current front and view image; flip / replace / new front drop them', () => {
+      let s = withBack();
+      const front = s.source!.image;
+      const back = s.views.back!.image;
+      expect(s.viewChecks).toEqual({});
+      // Stale: another front, another image.
+      expect(reducer(s, { type: 'viewChecked', view: 'back', front: img(), image: back, check: check('back') })).toBe(s);
+      expect(reducer(s, { type: 'viewChecked', view: 'back', front, image: img(), check: check('back') })).toBe(s);
+      s = reducer(s, { type: 'viewChecked', view: 'back', front, image: back, check: check('back', 77) });
+      expect(s.viewChecks.back?.score).toBe(77);
+      // dx / dy / scale / trust keep the check; a flip invalidates it.
+      s = reducer(s, { type: 'viewAlign', view: 'back', patch: { dy: 0.05, trust: 'color' } });
+      expect(s.viewChecks.back?.score).toBe(77);
+      const flipped = reducer(s, { type: 'viewAlign', view: 'back', patch: { flipX: true } });
+      expect(flipped.viewChecks.back).toBeUndefined();
+      // Reset drops it only when a flip was on.
+      expect(reducer(s, { type: 'viewAlignReset', view: 'back' }).viewChecks.back?.score).toBe(77);
+      expect(reducer(reducer(flipped, { type: 'viewChecked', view: 'back', front, image: back, check: check('back') }), { type: 'viewAlignReset', view: 'back' }).viewChecks.back).toBeUndefined();
+      // A check made for a manual placement is stale once the view is automatic again (auto / reset); an automatic one stays.
+      const manual = reducer(s, { type: 'viewChecked', view: 'back', front, image: back, check: check('back', 61, { status: 'manual' }) });
+      expect(reducer(manual, { type: 'viewAlignAuto', view: 'back' }).viewChecks.back).toBeUndefined();
+      expect(reducer(manual, { type: 'viewAlignReset', view: 'back' }).viewChecks.back).toBeUndefined();
+      expect(reducer(s, { type: 'viewAlignAuto', view: 'back' }).viewChecks.back?.score).toBe(77);
+      // Replacing or clearing the view drops its check; other checks stay.
+      s = reducer(s, { type: 'viewSet', view: 'left', entry: view('l.png') });
+      s = reducer(s, { type: 'viewChecked', view: 'left', front, image: s.views.left!.image, check: check('left') });
+      expect(Object.keys(s.viewChecks).sort()).toEqual(['back', 'left']);
+      expect(reducer(s, { type: 'viewSet', view: 'back', entry: view('b2.png') }).viewChecks).toEqual({ left: s.viewChecks.left });
+      expect(reducer(s, { type: 'viewClear', view: 'back' }).viewChecks).toEqual({ left: s.viewChecks.left });
+      // A new front (image, accepted preparation, revert) clears every check.
+      expect(loaded(s, src('new.png')).viewChecks).toEqual({});
+      expect(reducer(s, { type: 'clearImage' }).viewChecks).toEqual({});
+      const prepared = reducer(reducer(s, { type: 'prepReady', prepared: src('p.png') }), { type: 'prepAccept', mask: null, maskNote: null });
+      expect(prepared.viewChecks).toEqual({});
+      expect(reducer(prepared, { type: 'revertOriginal', mask: null, maskNote: null }).viewChecks).toEqual({});
+      expect(reducer(s, { type: 'imageLoading' }).viewChecks).toBe(s.viewChecks);
+    });
+
+    it('extraViewSet carries the alignment and drops views switched off; Generate treats all-off as missing', () => {
+      let s = withBack();
+      s = reducer(s, { type: 'viewSet', view: 'left', entry: view('l.png') });
+      s = reducer(s, { type: 'viewAlign', view: 'back', patch: { dy: 0.03, trust: 'color' } });
+      let set = extraViewSet(s.views);
+      expect(set.back?.align).toEqual(s.views.back!.align);
+      expect(set.left?.align).toEqual(DEFAULT_VIEW_ALIGN);
+      s = reducer(s, { type: 'viewAlign', view: 'left', patch: { trust: 'off' } });
+      set = extraViewSet(s.views);
+      expect(Object.keys(set)).toEqual(['back']);
+      expect(presentViews(s.views)).toEqual(['back', 'left']);
+      expect(activeViews(s.views)).toEqual(['back']);
+      expect(canGenerate(s, null, fusion)).toBe(true);
+      expect(generateBlock(s, null, needsSides)).toEqual({ kind: 'views', missing: ['left', 'right'] }); // an off view does not count
+      s = reducer(s, { type: 'viewAlign', view: 'back', patch: { trust: 'off' } });
+      expect(generateBlock(s, null, fusion)).toEqual({ kind: 'views', missing: [] });
+      s = reducer(s, { type: 'viewAlign', view: 'back', patch: { trust: 'full' } });
+      expect(canGenerate(s, null, fusion)).toBe(true);
+    });
+
+    it('stores the fusion report of a finished job', () => {
+      const s = loaded();
+      const report = { views: [], warnings: [] };
+      const done = reducer(reducer(s, { type: 'jobStart' }), {
+        type: 'jobDone',
+        result: { driverId: 'fusion', kind: 'geometry', stats, depthPreview: null, elapsedMs: 1, sourceName: 'a.png', fusion: report },
+        source: s.source!,
+        bgMode: 'auto',
+        inputMask: null,
+      });
+      expect(done.result?.fusion).toBe(report);
+      expect(init().viewChecks).toEqual({});
+    });
+  });
+
   it('human analysis: results for an image that is no longer the front are dropped', () => {
     const a = src('a.png');
     let s = loaded(init(), a);
@@ -310,7 +435,7 @@ describe('AI job, prepared image and views', () => {
 });
 
 describe('model edit flags', () => {
-  const result = { driverId: 'plain', kind: 'depth' as const, stats, depthPreview: null, elapsedMs: 1, sourceName: 'a.png' };
+  const result = { driverId: 'plain', kind: 'depth' as const, stats, depthPreview: null, elapsedMs: 1, sourceName: 'a.png', fusion: null };
 
   it('sculpt edits pause re-meshing until discarded or a new model arrives; rigging does too', () => {
     let s: AppState = { ...loaded(), result };

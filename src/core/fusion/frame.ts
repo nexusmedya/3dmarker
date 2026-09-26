@@ -24,16 +24,25 @@
  *   u = cx + su · p[ua] · (x1 − x0) / size[ua]      cx = (x0 + x1) / 2
  *   v = cy + sv · p[va] · (y1 − y0) / size[va]      cy = (y0 + y1) / 2
  *
+ * Registration: `fitBox` replaces the bbox in that mapping. It starts as the
+ * bbox; registerViews (./align.ts) refits it to the front by the silhouette
+ * profiles along the axes a view shares with the front (isotropic scale on
+ * those axes, offsets), so a view drawn at another scale, shifted, or cut at
+ * an image edge (feet / hair outside the frame) still lands where the front
+ * says the subject is. The axis a view does not share (its depth) keeps the
+ * bbox extent. Rows / columns past a cut edge are unknown to the hull.
+ *
  * Box size: W, H = the front bbox. D (in the same units) = the side views'
- * bbox aspect times H (heights matched to the front), else the top / bottom
+ * fitBox aspect times H (heights matched to the front), else the top / bottom
  * views' aspect times W, else defaultDepth · W. The orthographic silhouette of
  * a rigid object spans its full extent along both image axes, so the mapping
  * is exact for consistent views.
  */
-import type { Mask, RGBAImage, ViewId } from '../types';
+import type { Mask, RGBAImage, ViewAlign, ViewId, ViewTrust } from '../types';
+import { DEFAULT_VIEW_ALIGN, sanitizeViewAlign } from '../types';
 import { hasMeaningfulAlpha, autoMaskFromBorder, removeSmallComponents } from '../image/autoMask';
-import { maskArea, maskFromAlpha, resizeMask } from '../image/ops';
-import type { Axis, FusionViewInput, Sign, ViewFrame } from './types';
+import { maskArea, maskFromAlpha, mirrorMask, mirrorRGBA, resizeMask } from '../image/ops';
+import type { AlignStatus, Axis, CutFlags, FusionViewInput, Sign, ViewFrame } from './types';
 
 const X: Axis = 0, Y: Axis = 1, Z: Axis = 2;
 const f = (axis: Axis, sign: Sign) => ({ axis, sign });
@@ -57,6 +66,11 @@ export interface PixelBox {
 
 export type MaskSource = 'given' | 'alpha' | 'border' | 'none';
 
+export const NO_CUT: CutFlags = { top: false, bottom: false, left: false, right: false };
+
+/** Border row / column foreground share of the bbox side that flags a cut edge. */
+export const CUT_MIN_FRACTION = 0.02;
+
 export interface PreparedView {
   id: ViewId;
   frame: ViewFrame;
@@ -69,6 +83,16 @@ export interface PreparedView {
   mask: Mask;
   maskSource: MaskSource;
   bbox: PixelBox;
+  /** Resolved request (DEFAULT_VIEW_ALIGN when absent); flipX is already applied to image and mask. */
+  align: ViewAlign;
+  /** The silhouette touches this image edge: ≥ max(2, 0.02·bbox side) foreground pixels on the border row / column. */
+  cut: CutFlags;
+  /** Pixel rectangle mapped onto the object-box face: = bbox until registerViews sets it. */
+  fitBox: PixelBox;
+  /** 'bbox' until registerViews. */
+  registration: AlignStatus;
+  /** Effective trust (the request; registerViews may demote to 'color'). */
+  trust: ViewTrust;
 }
 
 /** Foreground mask of a view: given → alpha → border flood fill → whole image. */
@@ -104,12 +128,35 @@ export function maskBBox(mask: Mask): PixelBox | null {
   return x1 < 0 ? null : { x0, y0, x1: x1 + 1, y1: y1 + 1 };
 }
 
+/** Which image edges the silhouette is cut off at (enough foreground on the border row / column). */
+export function cutFlags(mask: Mask, bbox: PixelBox): CutFlags {
+  const { width: w, height: h, data } = mask;
+  const count = (start: number, n: number, stride: number) => {
+    let c = 0;
+    for (let i = 0, p = start; i < n; i++, p += stride) c += data[p];
+    return c;
+  };
+  const rowMin = Math.max(2, CUT_MIN_FRACTION * (bbox.x1 - bbox.x0));
+  const colMin = Math.max(2, CUT_MIN_FRACTION * (bbox.y1 - bbox.y0));
+  return {
+    top: bbox.y0 === 0 && count(0, w, 1) >= rowMin,
+    bottom: bbox.y1 === h && count((h - 1) * w, w, 1) >= rowMin,
+    left: bbox.x0 === 0 && count(0, h, w) >= colMin,
+    right: bbox.x1 === w && count(w - 1, h, w) >= colMin,
+  };
+}
+
 /**
  * Resolve, clean (drop specks that would stretch the bbox) and measure a
- * view. Null when its silhouette is empty.
+ * view. Null when its silhouette is empty. A flipX request mirrors the image
+ * and the resolved mask first.
  */
 export function prepareView(input: FusionViewInput): PreparedView | null {
-  const { mask: raw, source } = resolveViewMask(input.image, input.mask);
+  const align = input.id === 'front' ? DEFAULT_VIEW_ALIGN : sanitizeViewAlign(input.align);
+  const resolved = resolveViewMask(input.image, input.mask);
+  const image = align.flipX ? mirrorRGBA(input.image) : input.image;
+  const raw = align.flipX ? mirrorMask(resolved.mask) : resolved.mask;
+  const source = resolved.source;
   const { width: w, height: h } = raw;
   const data = raw.data.slice();
   const area = maskArea(raw);
@@ -127,7 +174,19 @@ export function prepareView(input: FusionViewInput): PreparedView | null {
     bbox = maskBBox(raw);
   }
   if (!bbox) return null;
-  return { id: input.id, frame: VIEW_FRAMES[input.id], image: input.image, mask, maskSource: source, bbox };
+  return {
+    id: input.id,
+    frame: VIEW_FRAMES[input.id],
+    image,
+    mask,
+    maskSource: source,
+    bbox,
+    align,
+    cut: source === 'none' ? { ...NO_CUT } : cutFlags(mask, bbox),
+    fitBox: { ...bbox },
+    registration: 'bbox',
+    trust: input.id === 'front' ? 'full' : align.trust,
+  };
 }
 
 export interface ObjectBox {
@@ -139,29 +198,40 @@ export interface ObjectBox {
 const bw = (b: PixelBox) => b.x1 - b.x0;
 const bh = (b: PixelBox) => b.y1 - b.y0;
 
-/** Object box from the views' silhouette extents (see the header). `views` must include the front. */
+/**
+ * Object box from the views' silhouette extents (see the header). `views` must
+ * include the front. D comes from the fitBox of trusted ('full'), registered
+ * (not 'stretched') side / cap views with a real silhouette.
+ */
 export function estimateObjectBox(views: PreparedView[], defaultDepth: number): ObjectBox {
   const front = views.find((v) => v.id === 'front');
   if (!front) throw new Error('estimateObjectBox: the front view is required');
   const W = bw(front.bbox), H = bh(front.bbox);
-  // Views without a real silhouette (whole image) say nothing about proportions.
-  const usable = (ids: ViewId[]) => views.filter((v) => ids.includes(v.id) && v.maskSource !== 'none');
+  // Views without a real silhouette (whole image) say nothing about proportions; a view whose
+  // cut edge could not be registered is stretched along the shared axis and overstates D by the cut
+  // share — still far closer than the default, so it is used only when no registered view exists.
+  const trusted = (ids: ViewId[]) => views.filter((v) => ids.includes(v.id) && v.maskSource !== 'none' && v.trust === 'full');
+  const usable = (ids: ViewId[]) => {
+    const all = trusted(ids);
+    const registered = all.filter((v) => v.registration !== 'stretched');
+    return registered.length ? registered : all;
+  };
   const sides = usable(['left', 'right']);
   if (sides.length) {
-    const D = sides.reduce((s, v) => s + (bw(v.bbox) / bh(v.bbox)) * H, 0) / sides.length;
+    const D = sides.reduce((s, v) => s + (bw(v.fitBox) / bh(v.fitBox)) * H, 0) / sides.length;
     return { size: [W, H, D], depthFrom: 'side' };
   }
   const caps = usable(['top', 'bottom']);
   if (caps.length) {
-    const D = caps.reduce((s, v) => s + (bh(v.bbox) / bw(v.bbox)) * W, 0) / caps.length;
+    const D = caps.reduce((s, v) => s + (bh(v.fitBox) / bw(v.fitBox)) * W, 0) / caps.length;
     return { size: [W, H, D], depthFrom: 'top-bottom' };
   }
   return { size: [W, H, Math.max(1e-3, defaultDepth) * W], depthFrom: 'default' };
 }
 
-/** True when some view constrains the object's Z extent (sides / top / bottom). */
+/** True when some trusted view constrains the object's Z extent (sides / top / bottom). */
 export function constrainsDepth(views: PreparedView[]): boolean {
-  return views.some((v) => v.id !== 'front' && v.id !== 'back');
+  return views.some((v) => v.id !== 'front' && v.id !== 'back' && v.trust === 'full');
 }
 
 /**
@@ -180,16 +250,17 @@ export interface ViewProjection {
   ws: Sign;
 }
 
+/** Projection built from the view's fitBox (= its bbox until registration). */
 export function viewProjection(view: PreparedView, size: readonly [number, number, number]): ViewProjection {
-  const { frame, bbox } = view;
+  const { frame, fitBox } = view;
   return {
     ua: frame.u.axis,
     va: frame.v.axis,
     wa: frame.w.axis,
-    su: (frame.u.sign * bw(bbox)) / size[frame.u.axis],
-    ou: (bbox.x0 + bbox.x1) / 2,
-    sv: (frame.v.sign * bh(bbox)) / size[frame.v.axis],
-    ov: (bbox.y0 + bbox.y1) / 2,
+    su: (frame.u.sign * bw(fitBox)) / size[frame.u.axis],
+    ou: (fitBox.x0 + fitBox.x1) / 2,
+    sv: (frame.v.sign * bh(fitBox)) / size[frame.v.axis],
+    ov: (fitBox.y0 + fitBox.y1) / 2,
     ws: frame.w.sign,
   };
 }

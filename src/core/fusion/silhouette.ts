@@ -5,6 +5,7 @@
  */
 import type { Mask, RGBAImage } from '../types';
 import { distanceTransform } from '../image/distance';
+import type { CutFlags } from './types';
 
 export class SummedArea {
   readonly width: number;
@@ -41,12 +42,25 @@ export class SummedArea {
     return a + fx * (b - a) + fy * (c - a) + fx * fy * (d - b - c + a);
   }
 
-  /** Mean mask value over [x0, x1] × [y0, y1]; parts outside the image count as background. */
-  coverage(x0: number, y0: number, x1: number, y1: number): number {
+  /**
+   * Mean mask value over [x0, x1] × [y0, y1]. Parts outside the image count as
+   * background, except beyond an edge flagged in `unknown` (the silhouette is
+   * cut off there): those count as foreground, so the hull does not carve at
+   * a crop line.
+   */
+  coverage(x0: number, y0: number, x1: number, y1: number, unknown?: CutFlags): number {
     const area = (x1 - x0) * (y1 - y0);
     if (!(area > 0)) return 0;
-    const s = this.integral(x1, y1) - this.integral(x0, y1) - this.integral(x1, y0) + this.integral(x0, y0);
-    const c = s / area;
+    let kx0 = x0, ky0 = y0, kx1 = x1, ky1 = y1;
+    if (unknown) {
+      if (unknown.left) kx0 = Math.max(x0, 0);
+      if (unknown.right) kx1 = Math.min(x1, this.width);
+      if (unknown.top) ky0 = Math.max(y0, 0);
+      if (unknown.bottom) ky1 = Math.min(y1, this.height);
+    }
+    const known = Math.max(0, kx1 - kx0) * Math.max(0, ky1 - ky0);
+    const s = known > 0 ? this.integral(kx1, ky1) - this.integral(kx0, ky1) - this.integral(kx1, ky0) + this.integral(kx0, ky0) : 0;
+    const c = (s + (area - known)) / area;
     return c <= 0 ? 0 : c >= 1 ? 1 : c;
   }
 }

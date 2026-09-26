@@ -66,6 +66,23 @@ export const IconColumns = (p: IconProps) => (
 export const IconBan = (p: IconProps) => (
   <Icon {...p}><circle cx="12" cy="12" r="8" /><path d="m6.5 6.5 11 11" /></Icon>
 );
+/** Crosshair: align a view to the front. */
+export const IconAlign = (p: IconProps) => (
+  <Icon {...p}><circle cx="12" cy="12" r="6" /><path d="M12 2v4M12 18v4M2 12h4M18 12h4" /><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none" /></Icon>
+);
+export const IconCopy = (p: IconProps) => (
+  <Icon {...p}><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15V6a2 2 0 0 1 2-2h9" /></Icon>
+);
+/** Consistency badge marks: check / tilde / cross. */
+export const IconCheckSmall = (p: IconProps) => (
+  <Icon {...p}><path d="m5 12.5 4.5 4.5L19 7.5" /></Icon>
+);
+export const IconTilde = (p: IconProps) => (
+  <Icon {...p}><path d="M4 13.5c2-3.5 4.5-3.5 6.5 0s4.5 3.5 6.5 0M4 13.5" /><path d="M17 13.5c1-1.8 2-2.6 3-2.5" /></Icon>
+);
+export const IconCross = (p: IconProps) => (
+  <Icon {...p}><path d="m6 6 12 12M18 6 6 18" /></Icon>
+);
 
 /** Short neutral monograms and hues per provider kind (no brand logos). */
 const KIND_MARKS: Record<ProviderKindId, { text: string; hue: number }> = {

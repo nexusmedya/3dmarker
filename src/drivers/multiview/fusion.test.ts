@@ -89,9 +89,13 @@ describe('MULTIVIEW_DRIVERS', () => {
         for (const o of p.options) expect(o.label.tr && o.label.en).toBeTruthy();
       }
     }
-    expect(keys).toEqual(expect.arrayContaining(['resolution', 'hull', 'tolerance', 'depthRefine', 'depthStrength', 'defaultDepth', 'smoothness', 'smoothIterations', 'colorSharpness', 'maxTriangles']));
+    expect(keys).toEqual(expect.arrayContaining(['resolution', 'hull', 'tolerance', 'align', 'guard', 'depthRefine', 'depthStrength', 'defaultDepth', 'smoothness', 'smoothIterations', 'colorSharpness', 'maxTriangles']));
     const res = driver.params.find((p) => p.key === 'resolution');
     expect(res).toMatchObject({ min: 64, max: 256, default: 144 });
+    expect(driver.params.find((p) => p.key === 'guard')).toMatchObject({ kind: 'number', min: 0, max: 15, default: 6 });
+    expect(driver.params.find((p) => p.key === 'align')).toMatchObject({ kind: 'select', default: 'auto' });
+    expect(driver.description.tr).toContain('İnce parçalar');
+    expect(driver.description.en).toContain('Thin parts');
   });
 });
 
@@ -112,6 +116,11 @@ describe('multiview-fusion driver', () => {
     expect(job.image.height % 14).toBe(0);
     expect(r.geometry.userData.multiview.depth).toEqual({ front: 'model', back: 'model', left: 'model' });
     expect(inp.progress.some((p) => p.label.en.startsWith('Depth: left (3/3) · Estimating depth (WASM)'))).toBe(true);
+    // The consistency report travels with the geometry for the 3D step (one entry per contributing view).
+    const report = r.geometry.userData.fusion;
+    expect(report.views.length).toBe(r.geometry.userData.multiview.views.length);
+    expect(report.views.map((v: { id: string }) => v.id)).toEqual(r.geometry.userData.multiview.views);
+    expect(Array.isArray(report.warnings)).toBe(true);
   });
 
   it('uses the selected depth model and skips depth when refinement is off', async () => {
@@ -150,20 +159,34 @@ describe('multiview-fusion driver', () => {
 });
 
 describe('driver helpers', () => {
-  it('maps params to fusion options (tolerance in percent)', () => {
-    const o = fusionOptionsFromParams({ ...defaultParams(driver.params), tolerance: 4, hull: 'strict', depthFit: 'ray' });
+  it('maps params to fusion options (tolerance and guard in percent)', () => {
+    const o = fusionOptionsFromParams({ ...defaultParams(driver.params), tolerance: 4, hull: 'strict', depthFit: 'ray', guard: 6, align: 'bbox' });
     expect(o.tolerance).toBeCloseTo(0.04);
     expect(o.hull).toBe('strict');
     expect(o.depthFit).toBe('ray');
     expect(o.resolution).toBe(144);
+    expect(o.guard).toBeCloseTo(0.06);
+    expect(o.align).toBe('bbox');
     expect(fusionOptionsFromParams({}).resolution).toBeUndefined();
+    expect(fusionOptionsFromParams({}).guard).toBeUndefined();
+    expect(fusionOptionsFromParams({}).align).toBe('auto');
+    expect(fusionOptionsFromParams({ guard: 0 }).guard).toBe(0);
+    // The back-hull and calibration modes are not params (the core's robust defaults apply).
+    expect('hullBack' in fusionOptionsFromParams({})).toBe(false);
+    expect('calibration' in fusionOptionsFromParams({})).toBe(false);
   });
 
-  it('takes the front from the source image and every other view from the set', () => {
-    const inp = input(['left', 'top']);
+  it('takes the front from the source image and every other view from the set, with its alignment; off views are skipped', () => {
+    const inp = input(['left', 'top', 'back']);
     inp.views.front = { id: 'front', image: inp.image, mask: null, file: new Blob(), origin: 'source' };
+    const align = { mode: 'manual' as const, dx: 0.02, dy: -0.03, scale: 1.05, flipX: false, trust: 'color' as const };
+    inp.views.left!.align = align;
+    inp.views.back!.align = { ...align, trust: 'off' };
     const views = fusionInputs(inp);
     expect(views.map((v) => v.id)).toEqual(['front', 'left', 'top']);
     expect(views[0].mask).toBe(inp.mask);
+    expect(views[0].align).toBeUndefined();
+    expect(views[1].align).toBe(align);
+    expect(views[2].align).toBeUndefined();
   });
 });

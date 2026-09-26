@@ -5,7 +5,10 @@
  * further by the in-browser depth model run on every view (Depth Anything V2
  * in the ML worker), then marching cubes + Taubin smoothing
  * (src/core/fusion). Without the depth model (download failure, no Worker)
- * it falls back to the silhouette hull with a warning.
+ * it falls back to the silhouette hull with a warning. Hand-made views are
+ * registered to the front by their silhouette profiles, thin parts (arms)
+ * are guarded against inconsistent views, and each view's ViewAlign (manual
+ * offset / scale / flip, trust) travels with it; views switched off are skipped.
  */
 import type { Driver, DriverInput, I18nText, ParamSpec, ParamValues } from '../../core/types';
 import { throwIfAborted } from '../../core/types';
@@ -46,8 +49,8 @@ export const FUSION_PARAMS: ParamSpec[] = [
     key: 'hull',
     label: { tr: 'Kabuk modu', en: 'Hull mode' },
     hint: {
-      tr: 'Toleranslı: ek görünümlerin siluetleri biraz genişletilir, yapay zekânın ürettiği hafif kaymış görünümler nesneyi oymaz. Katı: hizalı fotoğraflar için',
-      en: 'Tolerant: extra views\' silhouettes are widened a little so slightly misaligned AI views do not carve the object away. Strict: for aligned photos',
+      tr: 'Toleranslı: yan/üst/alt görünüm siluetleri biraz genişletilir, yapay zekânın ürettiği hafif kaymış görünümler nesneyi oymaz (arka siluet gövdeyi oymaz; ön görünümün aynasıdır). Katı: hizalı fotoğraflar için',
+      en: 'Tolerant: the side / top / bottom silhouettes are widened a little so slightly misaligned AI views do not carve the object away (the back silhouette never carves; it mirrors the front). Strict: for aligned photos',
     },
     default: DEFAULT_FUSION_OPTIONS.hull,
     options: [
@@ -67,6 +70,33 @@ export const FUSION_PARAMS: ParamSpec[] = [
     max: 10,
     step: 0.5,
     default: pct(DEFAULT_FUSION_OPTIONS.tolerance),
+  },
+  {
+    kind: 'select',
+    key: 'align',
+    label: { tr: 'Görünüm hizalama', en: 'View alignment' },
+    hint: {
+      tr: 'Ek görünümler ön görünüme siluet profilleriyle hizalanır: farklı ölçek, kayma ve kenarda kesik çerçeveler düzelir',
+      en: 'Extra views are aligned to the front by their silhouette profiles: different scale, offset and cropped framing are corrected',
+    },
+    default: 'auto',
+    options: [
+      { value: 'auto', label: { tr: 'Otomatik (siluet profilleri)', en: 'Automatic (silhouette profiles)' } },
+      { value: 'bbox', label: { tr: 'Yalnız çerçeve', en: 'Frame only' } },
+    ],
+  },
+  {
+    kind: 'number',
+    key: 'guard',
+    label: { tr: 'İnce parça koruması (%)', en: 'Thin-part guard (%)' },
+    hint: {
+      tr: 'Ön görünümde ince olan parçalar (kollar, bacaklar) diğer görünümler uyuşmasa da bu kalınlığa kadar korunur; 0 = kapalı',
+      en: 'Parts that are thin in the front view (arms, legs) are kept even where other views disagree, up to this share of the size; 0 = off',
+    },
+    min: 0,
+    max: 15,
+    step: 1,
+    default: 6,
   },
   {
     kind: 'boolean',
@@ -170,14 +200,20 @@ export const FUSION_PARAMS: ParamSpec[] = [
   },
 ];
 
-/** Driver params → fusion options (the tolerance param is in percent). */
+/**
+ * Driver params → fusion options (tolerance and guard are in percent). The
+ * back-hull and calibration modes are options only (defaults: robust), not params.
+ */
 export function fusionOptionsFromParams(p: ParamValues): Partial<FusionOptions> {
   const num = (k: string) => (typeof p[k] === 'number' ? (p[k] as number) : undefined);
   const tol = num('tolerance');
+  const guard = num('guard');
   return {
     resolution: num('resolution'),
     hull: p.hull === 'strict' ? 'strict' : 'tolerant',
     tolerance: tol === undefined ? undefined : tol / 100,
+    align: p.align === 'bbox' ? 'bbox' : 'auto',
+    guard: guard === undefined ? undefined : guard / 100,
     defaultDepth: num('defaultDepth'),
     depthStrength: num('depthStrength'),
     depthFit: p.depthFit === 'ray' ? 'ray' : 'object',
@@ -211,11 +247,15 @@ function depthSpec(id: unknown): DepthModelSpec {
   return DEPTH_MODELS.find((s) => s.id === id) ?? DEPTH_MODELS.find((s) => s.id === DEFAULT_DEPTH_MODEL) ?? DEPTH_MODEL_SPECS[0];
 }
 
-/** Front (the source image and its resolved mask) plus every extra view. */
+/**
+ * Front (the source image and its resolved mask) plus every extra view with
+ * its alignment / trust request; views switched off in the Views panel are left out.
+ */
 export function fusionInputs(input: Pick<DriverInput, 'image' | 'mask' | 'views'>): FusionViewInput[] {
   const out: FusionViewInput[] = [{ id: 'front', image: input.image, mask: input.mask }];
   for (const v of Object.values(input.views)) {
-    if (v && v.id !== 'front') out.push({ id: v.id, image: v.image, mask: v.mask });
+    if (!v || v.id === 'front' || v.align?.trust === 'off') continue;
+    out.push({ id: v.id, image: v.image, mask: v.mask, align: v.align });
   }
   return out;
 }
@@ -225,9 +265,11 @@ export const multiviewFusionDriver: Driver = {
   name: { tr: 'Çok görünümlü birleştirme (tam 3B)', en: 'Multi-view fusion (full 3D)' },
   description: {
     tr: 'Ön görünümü arka / sol / sağ / üst / alt görünümlerle birleştirip kapalı, renkli tam 3B model üretir: siluetlerden görsel kabuk, '
-      + 'ardından her görünümde tarayıcıda derinlik tahminiyle oyma. Görünümleri yükleyin ya da yapay zekâ ile üretin; tamamen tarayıcıda çalışır.',
+      + 'ardından her görünümde tarayıcıda derinlik tahminiyle oyma. Görünümleri yükleyin ya da yapay zekâ ile üretin; tamamen tarayıcıda çalışır. '
+      + 'İnce parçalar (kollar) korunur; kesik / kaymış görünümler otomatik hizalanır.',
     en: 'Fuses the front with the back / left / right / top / bottom views into a closed, coloured full 3D model: a visual hull from the '
-      + 'silhouettes, then carving with in-browser depth estimation on every view. Upload the views or generate them with AI; runs entirely in the browser.',
+      + 'silhouettes, then carving with in-browser depth estimation on every view. Upload the views or generate them with AI; runs entirely in the browser. '
+      + 'Thin parts (arms) are protected; cropped or shifted views are aligned automatically.',
   },
   category: 'multiview',
   badges: ['multi-view', 'full-3d', 'closed-mesh', 'download'],
@@ -240,11 +282,13 @@ export const multiviewFusionDriver: Driver = {
     const { params, signal, onProgress } = input;
     throwIfAborted(signal);
     const estimateDepth = params.depthRefine === false ? null : createWorkerDepthEstimator(depthSpec(params.depthModel));
-    const { geometry } = await reconstructFromViews(fusionInputs(input), fusionOptionsFromParams(params), {
+    const { geometry, info } = await reconstructFromViews(fusionInputs(input), fusionOptionsFromParams(params), {
       signal,
       onProgress,
       estimateDepth,
     });
+    // The consistency report the 3D step shows (reconstruct sets it too; kept in step here).
+    if (info.report) geometry.userData.fusion ??= info.report;
     return { kind: 'geometry', geometry };
   },
 };

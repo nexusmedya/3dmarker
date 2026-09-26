@@ -6,7 +6,9 @@
 > transparent background) → **3** the other views (back / left / right / top / bottom), uploaded or AI-generated →
 > **4** a *driver* turns them into a mesh: in-browser depth models (Depth Anything V2, MiDaS; faces, noses, lips,
 > ears, hands and fingers get extra relief from MediaPipe landmarks), instant heuristics, **multi-view fusion**
-> (a closed, vertex-coloured full-3D mesh from several views, entirely in the browser) or cloud models (Tripo3D,
+> (a closed, vertex-coloured full-3D mesh from several views, entirely in the browser; hand-made views are registered
+> to the front by their silhouette profiles, cropped edges are detected and thin parts such as T-pose arms are
+> guarded, with a per-view consistency badge, an Align panel, trust modes and a "copy prompt") or cloud models (Tripo3D,
 > Tripo multi-view, any image-to-3D model of a provider you added) → **5** Blender-style sculpting on the mesh and a
 > depth-map painter → **6** automatic humanoid rig (Mixamo bone names), 45 built-in animations, BVH / FBX / GLB
 > import, animated GLB export (OBJ / STL / PLY too). AI providers are a dynamic list (OpenAI, Gemini, Stability,
@@ -34,6 +36,9 @@ Stüdyo altı adımdan oluşur (sol paneldeki numaralı sekmeler; klavyeyle ←/
 - Yapay zekâ derinlik modelleri (Depth Anything V2, MiDaS) ve insan algılama (MediaPipe) **kullanıcının tarayıcısında** çalışır; sunucuya görsel gitmez.
 - **İnsan detayı:** yüz (478 nokta), eller (21 nokta) ve vücut (33 nokta) algılanır; burun, göz çukurları, dudaklar, çene, kulaklar, parmaklar ve kollar derinlik haritasına ek kabartma olarak eklenir — yüzler artık dümdüz çıkmaz.
 - **Çok görünümlü füzyon** (`multiview-fusion`): ön + diğer görünümlerden kapalı (watertight), köşe renkli tam 3B mesh — tamamen tarayıcıda.
+  Elle yüklenen / başka araçta üretilen görünümler ön görünüme **otomatik hizalanır** (ölçek, kayma, kenarda kesik çerçeve),
+  ince parçalar (T-pozdaki kollar) korunur; her görünüm için **tutarlılık rozeti**, **Hizala** paneli, güven modu
+  ("Şekil + renk" / "Yalnız renk" / "Kapalı") ve **İstemi kopyala** vardır.
 - **Yapay zekâ sağlayıcıları** dinamik bir listedir: istediğiniz kadar sağlayıcı / anahtar / model ekleyin (OpenAI, Google Gemini, Stability AI, Replicate, fal.ai, Tripo3D, OpenAI uyumlu, özel HTTP). Anahtarlar tarayıcıda kalır ya da sunucuda tutulur.
 - Arayüz Türkçe ve İngilizce; açık/koyu tema; ayarlar tarayıcıda saklanır (gizli anahtarlar yalnızca "hatırla" açıksa).
 
@@ -105,7 +110,7 @@ Stüdyo altı adımdan oluşur (sol paneldeki numaralı sekmeler; klavyeyle ←/
 | Siluet şişirme (`silhouette-inflate`) | Sezgisel | derinlik (balon profili) → çift yüz | evet | yok | anında (~0.5 s) | Maskotlar, karakterler, çıkartmalar, logolar (saydam PNG) | Siluet gerekir |
 | Siluet kalıplama / ekstrüzyon (`silhouette-extrude`) | Sezgisel | geometri (düz + pah) | evet | yok | anında | Logolar, ikonlar, yazılar, 3B baskı | Siluet gerekir |
 | Parlaklık haritası (`luminance-heightmap`) | Sezgisel | derinlik (parlaklıktan) | solid/double | yok | anında | Kabartma, litofan, doku, desen | Gerçek derinlik değil |
-| **Çok görünümlü füzyon** (`multiview-fusion`) | Çok görünüm, tarayıcı | geometri, köşe renkli, **tam 3B** | evet | ~50 MB (derinlik iyileştirme; isteğe bağlı) | 1–3 s (144 voksel) | Ön + arka/yan görünümleri olan karakterler, nesneler | Ön + en az 1 görünüm |
+| **Çok görünümlü füzyon** (`multiview-fusion`) | Çok görünüm, tarayıcı | geometri, köşe renkli, **tam 3B** | evet | ~50 MB (derinlik iyileştirme; isteğe bağlı) | 1–3 s (144 voksel) | Ön + arka/yan görünümleri olan karakterler, nesneler; elle çizilmiş / dış araçta üretilen görünümler hizalanır | Ön + en az 1 görünüm ("Şekil + renk" güveniyle) |
 | Tripo3D (`tripo3d-cloud`) | Bulut API | GLB (tam 3B, dokulu) | evet | yok (sunucuda) | 1–3 dk | Gerçekçi, arkası da olan tam model | API anahtarı + kredi; sunucu gerekir |
 | Tripo3D çok görünüm (`tripo3d-multiview`) | Bulut API | GLB | evet | yok | 1–3 dk | Ön + sol/arka/sağ görünümlerden gerçekçi model | Sunucu gerekir; üst/alt yok sayılır |
 | AI sağlayıcı ile 3D (`ai-provider-3d`) | Bulut API | GLB | modele bağlı | yok | modele bağlı | Eklediğiniz fal / Replicate / Stability / Tripo image-to-3D veya multi-view modeli | Görünümler varsa çok görünümlü model tercih edilir |
@@ -123,6 +128,8 @@ Model heykelle düzenlendiyse, heykel modu açıksa ya da iskelet eklendiyse can
 - **Fotoğraf / portre** → Depth Anything V2 Small (insan detayı açık: yüz ve eller kabartmalı).
 - **Her yönü olan karakter / nesne** → 3. adımda görünümleri ekleyin (yükleyin ya da AI ile üretin) → Çok görünümlü füzyon.
   Örnek: "T-poz manken" örneği arka/sol/sağ görünümleriyle gelir; çevrimdışı tam 3B + iskelet + animasyon denemesi için idealdir.
+  "T-poz manken (elle çizilmiş görünümler)" örneği aynı ön görseli, bir sanatçının kendi ölçeği / kayması / kol yüksekliğiyle
+  çizdiği ve altı kesik bir sol görünümle birlikte verir: hizalama, kesik kenar tanıma ve ince parça korumasının canlı gösterimi.
 - **Gerçekçi, dokulu tam model** → Tripo3D / Tripo3D çok görünüm (sunucu) ya da AI sağlayıcı ile 3D (fal.ai tarayıcıdan da çalışır).
 
 ## Yapay zekâ sağlayıcıları
@@ -187,11 +194,55 @@ seçilebilir (görsel düzenleme, arka plan kaldırma, görselden 3B, çok gör�
    AI hazırlığı kabul edildiğinde (ya da orijinale dönüldüğünde) eski ön görselden AI ile üretilen görünümler kaldırılır;
    yüklenen görünümler kalır. Seçili sürücü görünümleri kullanmıyorsa 3. ve 4. adımda füzyona geçiş önerilir.
 3. **4 3D:** `multiview-fusion` (tarayıcıda), `tripo3d-multiview` ya da `ai-provider-3d` seçin.
-   Füzyon: her görünümün siluet kutusu nesne kutusunun ilgili yüzüne hizalanır (farklı ölçek/çerçeve tolere edilir), yumuşak
-   görsel gövde voksel ızgarada kesişir, isteğe bağlı olarak her görünümde Depth Anything ile oyulur (model inemezse siluet
-   gövdesine düşer ve uyarır), marching cubes + Taubin yumuşatma ile kapalı mesh, görünürlük kontrollü köşe renkleri.
-   Parametreler: voksel çözünürlüğü (64–256), gövde toleransı, derinlik iyileştirme / modeli / gücü, yumuşatma, renk keskinliği,
-   üçgen sınırı.
+   Füzyon (`src/core/fusion`): (1) her görünümün silueti ve çerçevesi çıkarılır, ek görünümler ön görünüme **siluet profilleriyle
+   hizalanır** (`align.ts`, aşağıda); (2) yumuşak görsel gövde voksel ızgarada kesişir — **arka siluet gövdeyi oymaz** (ön görünümün
+   aynasıdır; yalnızca yan / üst / alt görünümler derinliği sınırlar) — ve **ince parça koruması** (`guard.ts`) ön görünümde ince olan
+   kolları / bacakları diğer görünümler uyuşmasa da yerinde tutar; (3) isteğe bağlı olarak her görünümde Depth Anything ile oyma
+   (model inemezse siluet gövdesine düşer ve uyarır; derinlik ölçeği sabit noktalı, sağlam bir medyanla kalibre edilir, oyma asla
+   korumanın altına inmez); (4) marching cubes + Taubin yumuşatma ile kapalı mesh, görünürlük kontrollü köşe renkleri.
+   Parametreler: voksel çözünürlüğü (64–256), kabuk modu + gövde toleransı, **görünüm hizalama** (Otomatik = siluet profilleri /
+   Yalnız çerçeve = eski bbox davranışı), **ince parça koruması (%)** (0–15, varsayılan 6; ön görselin uzun kenarının bu yüzdesinden
+   ince parçalar korunur, 0 = kapalı), derinlik iyileştirme / modeli / gücü, yumuşatma, renk keskinliği, üçgen sınırı.
+   Geliştiriciler için `FusionOptions.hullBack` / `calibration` (arayüzde yok) ve `LEGACY_FUSION_OPTIONS` eski davranışı bire bir
+   yeniden üretir (regresyon testleri bunu kullanır).
+
+### Elle eklenen görünümler: hizalama, tutarlılık, güven, istem
+
+Başka bir araçta çizilen / üretilen görünümler ön görselle aynı çerçeveyi neredeyse hiç paylaşmaz: birkaç yüzde ölçek ya da
+kayma farkı, yan görünümdeki kol diskini ön görünümün kol satırlarından uzaklaştırır ve gövde **kesişimi** ince kolları siler
+(kol kalınlığı boyun %4–6'sı iken eski tolerans %2 idi). Bu yüzden füzyon artık çerçeveye değil içeriğe göre çalışır:
+
+- **Otomatik hizalama:** her ek görünümün satır / sütun profilleri (satır başına ön plan piksel sayısı) ön görünümünkiyle
+  paylaştığı eksenlerde eşlenir — arka: satırlar + aynalanmış sütunlar; sol / sağ: satırlar; üst / alt: sütunlar. Ölçek
+  (ln k ∈ ±0.37) ve kayma (±%30) aranır, kaba ızgara → yerel tepeler → budanmış ince arama (en kötü %20 bölme atılır, kolları
+  farklı yükseklikte olan bir arka görünüm kaymayı sürüklemez). Arka görünümde tek bir içerik ölçeği kullanılır (izotropi).
+  Eşleşme zayıfsa ya da siluet düzse (küre, kutu) çerçeve olduğu gibi kalır ("Önle eşleştirilemedi" / "Hizalanacak ayrıntı yok").
+- **Kenarda kesik görünümler:** siluet görsel kenarına değiyorsa (kenar satırında bbox kenarının ≥ %2'si kadar ön plan) o kenar
+  "bilinmiyor" sayılır: gövde orada oymaz, eksik kısım diğer görünümlerden tamamlanır. Ölçek profil eşleşmesinden, o da yoksa
+  arka için ön görünümün en-boy oranından, yan görünüm için tepe–boyun mesafesinden bulunur; hiçbiri yoksa "ölçeği bulunamadı;
+  hizalama yaklaşık" uyarısıyla çerçeve kullanılır. Paylaşılan eksenin **iki ucu da** kesik ve profil eşleşmesi de yoksa görünüm
+  kendiliğinden "Yalnız renk"e düşer.
+- **Tutarlılık rozeti** (Görünümler adımı, her dolu yuva): 0–100 puan + iyi / orta / zayıf simgesi (renk tek başına anlam
+  taşımaz), üzerine gelince açıklama ("Otomatik hizalandı: %1.5 yukarı, ölçek 0.97", "Alt kenarda kesik (ayaklar?)", "Aynalanmış
+  görünüyor"…). Ön kontrol, füzyonun hizalama kodunu görsel değişince (ve bir kaydırıcı düzenlemesinden 250 ms sonra) doğrudan
+  çağırır; oluşturmadan sonraki **birleştirme raporu** (3D adımı: görünüm başına puan, seviye, güven, tutarlılık, uyarılar) esas
+  sonuçtur. Derinlik yolunda ek olarak görünüm başına *tutarlılık payı* ölçülür: bir görünümün oyacağı hacmin korumanın tuttuğu
+  payı %25'i aşarsa "ön görünümle tam örtüşmüyor; ince parçalar korundu" uyarısı verilir.
+- **Hizala paneli** (yuvadaki hizalama düğmesi): üst üste bindirme önizlemesi (gri: önden beklenen — arka için ön siluetin aynası,
+  yanlar için uzunluk çizgileri ve kesikli işaret satırları; renkli: bu görünüm; kırmızı tarama: kesik kenar), **Dikey / Yatay kayma**
+  (±%20; yan görünümlerde yatay kayma yoktur, üst / alt görünümlerde dikey kayma yoktur) ve **Ölçek** (%70–140) kaydırıcı + sayı
+  kutusu, **Yatay aynala**, **Otomatik hizala** (kayıtlı sonuca dön) ve **Sıfırla**. Herhangi bir kayma / ölçek düzenlemesi görünümü
+  "elle" moduna alır; rozet çekirdek yeniden çalışmadan anında yeniden puanlanır. Esc paneli kapatır ve odağı düğmeye verir.
+- **Güven modları** ("Bu görünüm ne için kullanılsın"): **Şekil + renk** (varsayılan; gövdeyi sınırlar, derinlikle oyar, renk verir),
+  **Yalnız renk** (gövdeye dokunmaz, yalnızca köşe renklerine katkı verir — kolları kaybettiren bir yan görünüm için hızlı çözüm),
+  **Kapalı** (füzyona hiç girmez; bulut çok görünüm sürücülerine de yüklenmez). Tüm ek görünümler kapalıysa "3D Oluştur" görünüm
+  gerekçesiyle engellenir.
+- **İstemi kopyala** (ön görsel varken her yuvada): ön görselin **ölçülen çerçevesiyle** — figürün görsel yüksekliğine oranı,
+  en dar kenar boşluğu, çıktı boyutu (`768 × 768 px` gibi), T-pozda kolların yükseklik bandı — İngilizce bir istem üretir
+  (kamera: ortografik, 90° / 180°; üst / alt için "tam yukarıdan / aşağıdan"), panoya yazar ve iki dilde bildirir. Pano reddederse
+  aynı metin salt okunur bir kutuda "Tümünü seç" ile görünür. Yuvanın altındaki **"Görünümleri tutarlı yapmak için"** rehberi
+  kuralları özetler (aynı yükseklik / ölçek, hiçbir şey kesilmesin, ortografik kamera, aynı poz, kollar kaybolursa Hizala ya da
+  "Yalnız renk").
 
 ## İnsan detayı (yüz, burun, kulak, dudak, el, parmak)
 
@@ -353,6 +404,14 @@ görünüm için farklı bir karakter silueti çizer), Tripo API'si sahte yanıt
   stil + T-poz + tam gövde istemleri, görünüm üret / yükle / temizle, köşe renkli kapalı füzyon, MediaPipe erişilemezken insan
   detayı, heykel darbeleri + geri al, derinlik editörü, T-poz mankeninde otomatik rig + 3 animasyonun mesh'i deforme etmesi +
   BVH içe aktarma + animasyonlu GLB, 375 px'de tüm adımlar iki dilde.
+- `fusion-robust.spec.ts` — elle çizilmiş görünümler (5. örnek): tutarlılık rozetleri ve kesik kenar bayrağı, füzyonun kollarını
+  ve gövde oranlarını tutarlı örnekle karşılaştırma (`fusion-robust-arms.png`), Hizala paneli (kaydırıcı → yeniden puanlama, Otomatik
+  hizala / Sıfırla, Esc ile odak), güven modları (yalnız renk → rapor çipi; hepsi kapalı → Oluştur engeli), İstemi kopyala (pano +
+  yedek metin kutusu), birleştirme raporu, 375 px'de yatay taşma yok.
+
+Saf mantık tarafında `src/core/fusion/*.test.ts` hizalamayı (ölçek / kayma / kesik senaryoları, sanatçı gürültüsü, ayna, düz siluet),
+korumayı, derinlik kalibrasyonunu ve `reconstruct`'ı prosedürel T-poz fikstürleriyle (`testing.ts`: analitik doğruluk hacmi, kol /
+bacak / gövde ölçümleri) sınar; `LEGACY_FUSION_OPTIONS` ile eski çıktı bire bir yeniden üretilir.
 
 ## Yeni bir sürücü eklemek
 
@@ -407,10 +466,12 @@ anahtarlar sunucuda kalır.
 src/
   core/            sözleşmeler (types, errors, yield), görüntü işleme (image/), mesh kurucu ve istatistik (mesh/),
                    dışa aktarım (export/, deri + animasyonlu GLB), AI arka plan kaldırma (preprocess/),
-                   fusion/ (çok görünümlü füzyon: hizalama, görsel gövde, derinlik oyma, marching cubes, renk),
+                   fusion/ (çok görünümlü füzyon: çerçeve + kesik kenarlar (frame), profil hizalama (align), görsel gövde (volume),
+                   ince parça koruması (guard), derinlik oyma (depthCarve), marching cubes, renk, rapor (reconstruct)),
                    human/ (MediaPipe algılama, yüz/el/vücut kabartması, işaret noktası kaplaması)
   ai/              sağlayıcı kayıtları (kinds, settings), adaptörler (adapters/), taşıma (transport: doğrudan / vekil),
-                   60 stil (styles), istemler (prompts), iş akışı (generate: ön görsel, görünümler, saydamlık)
+                   60 stil (styles), istemler (prompts), kullanıcı görünüm istemi (viewPrompts: "İstemi kopyala"),
+                   iş akışı (generate: ön görsel, görünümler, saydamlık)
   drivers/         ml/ (transformers.js depth + worker istemcisi + insan detayı), heuristic/ (inflate, extrude, luminance),
                    multiview/ (füzyon), cloud/ (tripo, tripo çok görünüm, AI sağlayıcı ile 3D)
   sculpt/          heykel oturumu, fırçalar, BVH, geçmiş; derinlik fırçaları ve derinlik çizimi
@@ -433,7 +494,21 @@ tests/e2e/         Playwright uçtan uca testleri (+ png.ts: sahte AI çıktıla
   görünümlerde gövdeyle örtüştüğü için derinlemesine kalınlaşabilir ve (fotometrik tutarlılık adımı olmadığından) bu hayalet
   hacme yan görünüm renkleri taşabilir. Derinlik ölçeği yan / üst / alt görünüm varsa siluet gövdesine göre kalibre edilir;
   profil bilgisi vermeyen bir görünüm oymaz. İş ana iş parçacığında dilimler hâlinde yapılır (~30 ms'de bir yol verir, en uzun
-  duraklama ~70 ms; İptal aşama ortasında etkili olur); ayrı bir Worker'a taşınmadı.
+  duraklama ~70 ms; İptal aşama ortasında etkili olur); ayrı bir Worker'a taşınmadı. Hizalama 144 vokselde ~0.1 s ekler
+  (4 × 1024² görünüm için 60–80 ms).
+- **Hizalama ve tutarlılık kontrolü:** hizalama, paylaşılan eksenlerdeki 1B siluet profilleriyle çalışır: ölçek, kayma ve kesik
+  çerçeveyi düzeltir, **içerik farkını düzeltmez** — A-poz ile T-poz farkı, farklı kıyafet ya da yan görünümde kolun başka
+  yükseklikte çizilmesi (yan siluet kol yüksekliğini doğrulayamaz; rozet bunu "Yan görünüm kol yüksekliğini doğrulayamaz" notuyla
+  söyler). Böyle durumlarda ince parça koruması kolları tutar, ama yanlış yerde bir kol diski gövdeyi girintileyebilir; çözüm aynı
+  poz, "Yalnız renk" ya da elle hizalama. Paylaşılan eksenin iki ucu da kesik ve profil eşleşmesi yoksa görünüm yalnız renk için
+  kullanılır. **Yanlış yuvaya konan içerik** (ör. ön görselin yan yuvaya yüklenmesi) siluet yolunda yakalanmaz ve iyi puan alabilir
+  (derinlik yolunda tutarlılık uyarısı çıkar); düz / ayrıntısız görünümler (küre, tek renk leke) "Hizalanacak ayrıntı yok" notuna
+  rağmen yüksek puan alabilir — puan yalnızca görünümün kenarlarının ön görünümle açıklanabilirliğini ölçer. Ayna algısı (arka
+  görünüm ters yüklenmiş) yalnızca ön siluet belirgin ölçüde asimetrikse çalışır. Kesik kenar tanıma kenara değme sezgisine
+  dayanır (kenar satırında ≥ 2 px ve bbox kenarının ≥ %2'si). Ön kontrol rozeti 1. adımdaki önizleme maskesini kullanır; esas
+  değerler oluşturmadan sonraki birleştirme raporundadır. Elle hizalama sınırları: kayma ±%20 (çekirdek ±%25), ölçek %70–140
+  (çekirdek 0.5–2). Tek ekseni kesik bir arka görünümde önizleme, kesik olmayan ekseni de aynı ölçekle gösterir (çekirdek o eksende
+  kendi genişliğini kullanır). Yan ve üst / alt görünümler arasında Z ekseninde hizalama yapılmaz.
 - **AI görünümleri tutarlılığı:** Görüntü modelleri arka/yan görünümleri "hayal eder"; ölçek ve çerçeve farkları füzyonda
   hizalanır ama anatomi/kıyafet tutarsızlıkları mesh'e yansır. Görünümleri elle düzeltmek (yeniden üret / yükle) mümkündür.
 - **İnsan detayı:** İlk kullanımda ~20 MB MediaPipe modeli indirilir (görselde insan olmasa da; parametreden kapatılabilir).

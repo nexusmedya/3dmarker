@@ -81,7 +81,7 @@ export function aiModelParamsFrom(p: DriverInput['params']): AiModelParams {
 
 /** Views besides the front that the input carries. */
 export function extraViewIds(input: Pick<DriverInput, 'views'>): ViewId[] {
-  return VIEW_IDS.filter((v) => v !== 'front' && input.views[v]?.file);
+  return VIEW_IDS.filter((v) => v !== 'front' && input.views[v]?.file && input.views[v]?.align?.trust !== 'off');
 }
 
 /** The provider (and capability) to use: multi-view when wanted and offered, else single-image. */

@@ -5,18 +5,23 @@
  * AI side: provider settings (persisted, published to drivers through
  * setCurrentAiSettings), the server probe, human analysis of the front image,
  * one AI job at a time (front preparation or view generation), the extra
- * views, and the sculpt / depth-edit / rig hooks of the model on screen.
+ * views with their pre-run consistency checks, alignment and "copy prompt",
+ * and the sculpt / depth-edit / rig hooks of the model on screen.
  */
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { Mesh, Object3D } from 'three';
-import type { DepthMap, Driver, Lang, Mask, ParamValue, Progress, RGBAImage, ViewId } from '../core/types';
-import { AbortError, defaultParams, throwIfAborted } from '../core/types';
+import type { DepthMap, Driver, Lang, Mask, ParamValue, Progress, RGBAImage, ViewAlign, ViewId } from '../core/types';
+import { AbortError, DEFAULT_VIEW_ALIGN, defaultParams, throwIfAborted } from '../core/types';
 import type { MeshStats } from '../core/mesh/stats';
 import { depthToRGBA } from '../core/image/ops';
 import { analyzeHuman } from '../core/human/analyze';
 import type { HumanAnalysis } from '../core/human/types';
+import { prepareView, type PreparedView } from '../core/fusion/frame';
+import { ALIGN_TEXT, alignView } from '../core/fusion/align';
+import type { ViewAlignment } from '../core/fusion/types';
 import { DEFAULT_DRIVER_ID, DRIVERS, getDriver } from '../drivers';
 import type { AiSettings, PrepOptions, ProviderConfig } from '../ai/types';
+import { buildUserViewPrompt, measureFrontFraming } from '../ai/viewPrompts';
 import {
   AI_KEYS_KEY,
   AI_SETTINGS_KEY,
@@ -31,11 +36,12 @@ import {
   setCurrentAiSettings,
   usableProviders,
 } from '../ai/settings';
-import { prepNeeded } from '../ai/prompts';
+import { isHumanoid, prepNeeded } from '../ai/prompts';
 import { generateViewImage, prepareFrontImage } from '../ai/generate';
 import {
   buildDepthModel,
   createImageTexture,
+  fusionReportOf,
   isAbortError,
   meshKeyOf,
   opaqueTextureImage,
@@ -77,6 +83,8 @@ import { useAvailability } from './useAvailability';
 
 /** Delay before re-meshing after a mesh slider moves. */
 export const REMESH_DEBOUNCE_MS = 150;
+/** A view's consistency check is redone this long after its alignment request last changed. */
+export const CHECK_REFRESH_MS = 250;
 
 /** OS colour-scheme preference (used until the user picks a theme). */
 function prefersLightScheme(): boolean {
@@ -110,7 +118,30 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 export async function decodeView(file: Blob, name: string, origin: ViewEntry['origin']): Promise<ViewEntry> {
   const src = await prepareSource(file, name);
   const { mask } = quickMask(src.image, 'border');
-  return { file, image: src.image, mask, origin, name };
+  return { file, image: src.image, mask, origin, name, align: DEFAULT_VIEW_ALIGN };
+}
+
+/**
+ * Placeholder registration for a view that could not be checked (an empty
+ * silhouette or a failure): 'weak', identity, so the check is not retried in a loop.
+ */
+export function weakAlignment(view: OtherViewId, image: RGBAImage, align: ViewAlign): ViewAlignment {
+  const identity = { dx: 0, dy: 0, scale: 1, flipX: align.flipX };
+  return {
+    id: view,
+    status: 'weak',
+    level: 'poor',
+    score: 0,
+    confidence: 0,
+    applied: identity,
+    suggested: identity,
+    residual: { dx: 0, dy: 0, scale: 1 },
+    cut: { top: false, bottom: false, left: false, right: false },
+    fitBox: { x0: 0, y0: 0, x1: image.width, y1: image.height },
+    trust: align.trust,
+    notes: [{ code: 'weak', text: ALIGN_TEXT.weak }],
+    guides: { rows: [], cols: [] },
+  };
 }
 
 /** "cat.png" → "cat-ai.png" (prepared front) / "cat-back.png" (a generated view). */
@@ -208,6 +239,10 @@ export function useStudio() {
   const viewDecodes = useRef(0);
   /** Uploaded views whose AI background removal could not start yet (another job ran). */
   const bgPending = useRef(new Map<OtherViewId, ViewEntry>());
+  /** The front prepared for the view consistency checks (one prepareView per front image / mask). */
+  const frontPrepRef = useRef<{ image: RGBAImage; mask: Mask | null; prepared: PreparedView | null } | null>(null);
+  /** The alignment request each view's check was computed for (by identity; the reducer makes a new one per edit). */
+  const checkedFor = useRef<Partial<Record<OtherViewId, ViewAlign>>>({});
   const stateRef = useRef(state);
   stateRef.current = state;
   const modelRef = useRef(model);
@@ -498,6 +533,7 @@ export function useStudio() {
           depthPreview: built.depth ? depthToRGBA(built.depth, built.mask) : null,
           elapsedMs: performance.now() - t0,
           sourceName: source.name,
+          fusion: fusionReportOf(built.object),
         },
         source,
         bgMode,
@@ -735,6 +771,88 @@ export function useStudio() {
     dispatch({ type: 'viewClear', view });
   }, []);
 
+  // ---------------------------------------------------------------- view consistency checks
+
+  /**
+   * Pre-run check of every extra view against the front: a direct call to
+   * the fusion's registration (prepareView + alignView, a few ms per view),
+   * one view per tick, after the render that showed the "checking" badge.
+   * It uses the preview mask (in the 'ai' background mode possibly null → the
+   * alpha channel, a plain border or the whole image); the fusion's own
+   * report after a run is authoritative. A view that cannot be checked gets
+   * a synthetic 'weak' result so it is not retried in a loop.
+   *
+   * A view whose request changed since its check (a manual offset / scale,
+   * a trust) is checked again once the edits settle (CHECK_REFRESH_MS): the
+   * badge re-scores the manual values live meanwhile, but only the core knows
+   * the confidence at the new placement, so this is what the fusion's report
+   * will say. Views without a check come first.
+   */
+  useEffect(() => {
+    if (state.loadingImage || !frontImage) return;
+    const active = (v: OtherViewId) => {
+      const e = state.views[v];
+      return !!e && e.align.trust !== 'off';
+    };
+    const missing = OTHER_VIEWS.find((v) => active(v) && !state.viewChecks[v]);
+    const pending = missing ?? OTHER_VIEWS.find((v) => active(v) && checkedFor.current[v] !== state.views[v]!.align);
+    if (!pending) return;
+    const entry = state.views[pending]!;
+    const mask = state.mask;
+    const id = window.setTimeout(
+      () => {
+        let check: ViewAlignment;
+        try {
+          let fp = frontPrepRef.current;
+          if (!fp || fp.image !== frontImage || fp.mask !== mask) {
+            fp = { image: frontImage, mask, prepared: prepareView({ id: 'front', image: frontImage, mask }) };
+            frontPrepRef.current = fp;
+          }
+          const view = prepareView({ id: pending, image: entry.image, mask: entry.mask, align: entry.align });
+          check = fp.prepared && view ? alignView(fp.prepared, view, { mode: 'auto' }) : weakAlignment(pending, entry.image, entry.align);
+        } catch (e) {
+          console.warn('[align]', e);
+          check = weakAlignment(pending, entry.image, entry.align);
+        }
+        checkedFor.current[pending] = entry.align;
+        dispatch({ type: 'viewChecked', view: pending, front: frontImage, image: entry.image, check });
+      },
+      missing ? 0 : CHECK_REFRESH_MS,
+    );
+    return () => window.clearTimeout(id);
+  }, [frontImage, state.mask, state.views, state.viewChecks, state.loadingImage]);
+
+  const setViewAlign = useCallback((view: OtherViewId, patch: Partial<ViewAlign>) => dispatch({ type: 'viewAlign', view, patch }), []);
+  const autoAlignView = useCallback((view: OtherViewId) => dispatch({ type: 'viewAlignAuto', view }), []);
+  const resetViewAlign = useCallback((view: OtherViewId) => dispatch({ type: 'viewAlignReset', view }), []);
+
+  /** English prompt for drawing `view` with the front's exact framing (null without a front). */
+  const viewPromptText = useCallback((view: OtherViewId): string | null => {
+    const s = stateRef.current;
+    if (!s.source) return null;
+    const analysis = s.human && s.human.image === s.source.image && s.human.analysis !== 'analyzing' ? s.human.analysis : null;
+    const isHuman = analysis ? analysis.isHuman || isHumanoid(s.prep, { isHuman: false }) : isHumanoid(s.prep, { isHuman: false });
+    const tPose = s.frontPrep?.tPose ?? s.prep.tPose;
+    return buildUserViewPrompt(view, { front: measureFrontFraming(s.source.image, s.mask), isHuman, tPose });
+  }, []);
+
+  /** Copies the view prompt to the clipboard; false when there is none or the clipboard refused. */
+  const copyViewPrompt = useCallback(
+    async (view: OtherViewId): Promise<boolean> => {
+      const text = viewPromptText(view);
+      if (!text) return false;
+      try {
+        const clipboard = typeof navigator !== 'undefined' ? navigator.clipboard : undefined;
+        if (!clipboard?.writeText) return false;
+        await clipboard.writeText(text);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [viewPromptText],
+  );
+
   const acceptPrepared = useCallback(() => {
     const s = stateRef.current;
     if (!s.prepared || !s.source || jobRef.current || aiJobRef.current || loadingRef.current) return;
@@ -906,6 +1024,11 @@ export function useStudio() {
       generateMissing,
       uploadView,
       clearView,
+      setViewAlign,
+      autoAlignView,
+      resetViewAlign,
+      viewPromptText,
+      copyViewPrompt,
       detectHuman,
       // Model edits
       onSculptEdited,
@@ -933,6 +1056,11 @@ export function useStudio() {
       generateMissing,
       uploadView,
       clearView,
+      setViewAlign,
+      autoAlignView,
+      resetViewAlign,
+      viewPromptText,
+      copyViewPrompt,
       detectHuman,
       onSculptEdited,
       onSculptSession,

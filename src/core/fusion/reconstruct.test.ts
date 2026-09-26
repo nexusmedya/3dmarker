@@ -5,9 +5,29 @@ import { AbortError } from '../types';
 import { LocalizedError } from '../errors';
 import { computeMeshStats } from '../mesh/stats';
 import { distanceTransform } from '../image/distance';
-import { FUSION_TEXT, reconstructFromViews, sanitizeFusionOptions } from './reconstruct';
-import type { DepthEstimator, FusionContext, FusionOptions, FusionViewInput } from './types';
-import { box, cylinderY, fakeDepthEstimator, renderView, renderViews, sphere, VIEW_COLORS, type Solid } from './testing';
+import { estimateObjectBox, viewProjection } from './frame';
+import { FUSION_TEXT, reconstructFromViews, sanitizeFusionOptions, viewWarning } from './reconstruct';
+import { LEGACY_FUSION_OPTIONS, type DepthEstimator, type FusionContext, type FusionOptions, type FusionViewInput } from './types';
+import {
+  box,
+  characterTruth,
+  containsPoint,
+  cylinderX,
+  cylinderY,
+  fakeDepthEstimator,
+  fieldIoU,
+  independentArtistViews,
+  measureField,
+  reconstructWithField,
+  renderCharacterViews,
+  renderView,
+  renderViews,
+  sphere,
+  VIEW_COLORS,
+  type CharacterViews,
+  type Solid,
+  type ViewPerturbation,
+} from './testing';
 
 const ALL: ViewId[] = ['front', 'back', 'left', 'right', 'top', 'bottom'];
 
@@ -253,7 +273,8 @@ describe('reconstructFromViews: view conventions', () => {
       const r = renderView(solid, id, { width: 120, height: 120, scale: 50 });
       return { id, image: r.image, mask: null };
     });
-    const { geometry: g } = await reconstructFromViews(inputs, { hull: 'strict', resolution: 64 }, ctx());
+    // The back's silhouette only carves with hullBack: 'intersect' (excluded by default: it mirrors the front).
+    const { geometry: g } = await reconstructFromViews(inputs, { hull: 'strict', resolution: 64, hullBack: 'intersect' }, ctx());
     expect(computeMeshStats(g).watertight).toBe(true);
     expect(inside(g, IN)).toBe(true);
     expect(inside(g, [0, -0.8, 0])).toBe(true);
@@ -369,7 +390,9 @@ describe('reconstructFromViews: robustness', () => {
       { id: 'front', image: front.image, mask: null },
       { id: 'back', image: b.image, mask: null },
     ];
-    const opts = { resolution: 72, defaultDepth: 1 };
+    // The dilation mechanism is what is tested: the back has to enter the hull (hullBack: 'intersect'),
+    // which the default 'exclude' (the back mirrors the front) never lets it do.
+    const opts: Partial<FusionOptions> = { resolution: 72, defaultDepth: 1, hullBack: 'intersect' };
     const ref = volume((await reconstructFromViews(inputs(aligned), { ...opts, hull: 'strict' }, ctx())).geometry);
     const strict = volume((await reconstructFromViews(inputs(back), { ...opts, hull: 'strict' }, ctx())).geometry);
     const tolerant = volume((await reconstructFromViews(inputs(back), { ...opts, hull: 'tolerant', tolerance: 0.06 }, ctx())).geometry);
@@ -470,14 +493,16 @@ describe('reconstructFromViews: robustness', () => {
     const front = renderView(s, 'front');
     await expect(reconstructFromViews([{ id: 'front', image: front.image, mask: null }], {}, ctx())).rejects.toMatchObject({ i18n: FUSION_TEXT.needViews });
     // Front: blobs at world (−X, +Y) and (+X, −Y); back (mirrored): at world (+X, +Y) and (−X, −Y).
+    // The back only carves with hullBack: 'intersect'; by default it mirrors the front and is excluded.
     const blobs: Solid = [box([-1, 0.6, -0.2], [-0.6, 1, 0.2]), box([0.6, -1, -0.2], [1, -0.6, 0.2])];
     const f = renderView(blobs, 'front', { width: 96, height: 96, scale: 40 });
     const b = renderView(blobs, 'front', { width: 96, height: 96, scale: 40 }); // same picture used as the back
     await expect(reconstructFromViews(
       [{ id: 'front', image: f.image, mask: null }, { id: 'back', image: b.image, mask: null }],
-      { hull: 'strict' },
+      { hull: 'strict', hullBack: 'intersect', align: 'bbox' },
       ctx(),
     )).rejects.toMatchObject({ i18n: FUSION_TEXT.empty });
+
   });
 
   it('accepts explicit masks and opaque images on a plain background', async () => {
@@ -513,5 +538,264 @@ describe('sanitizeFusionOptions', () => {
     expect(o.hull).toBe('tolerant');
     expect(o.smoothIterations).toBe(3);
     expect(sanitizeFusionOptions({ resolution: NaN }).resolution).toBe(144);
+    const d = sanitizeFusionOptions({});
+    expect([d.hullBack, d.calibration, d.guard, d.align]).toEqual(['exclude', 'anchored', 0.06, 'auto']);
+    const n = sanitizeFusionOptions({ hullBack: 'x' as never, calibration: 'envelope', guard: 0.9, align: 'bbox' });
+    expect([n.hullBack, n.calibration, n.guard, n.align]).toEqual(['exclude', 'envelope', 0.15, 'bbox']);
+    expect(sanitizeFusionOptions({ guard: -1 }).guard).toBe(0);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Robust fusion of hand-made views: views drawn with their own framing,
+// crops and proportions (src/core/fusion/testing.ts character fixtures),
+// measured on the voxel grid against the analytic truth of the front's figure.
+
+describe('robust fusion of hand-made views (integration)', () => {
+  const V4: ViewId[] = ['front', 'back', 'left', 'right'];
+  const SIZE = 512;
+  type Fused = Awaited<ReturnType<typeof fuse>>;
+  async function fuse(set: CharacterViews, opts: Partial<FusionOptions> = {}, depth = false) {
+    const r = await reconstructWithField(set.inputs, opts, { estimateDepth: depth ? fakeDepthEstimator(set.renders) : null });
+    const box = estimateObjectBox(r.views.filter((v) => v.trust === 'full'), sanitizeFusionOptions(opts).defaultDepth);
+    const m = measureField(r.field, r.grid, characterTruth(set, r.views[0], box, r.grid));
+    return { ...r, m };
+  }
+  const others = (p: ViewPerturbation, views: ViewId[] = V4) => Object.fromEntries(views.filter((v) => v !== 'front').map((v) => [v, p]));
+  const consistent = () => renderCharacterViews(V4, { size: SIZE });
+  const REPORTED = { back: { dy: 0.03, scale: 0.95, proportions: { armHeight: -0.03 } }, left: { dy: 0.03, scale: 0.95, proportions: { armHeight: -0.03 } } };
+  const memo = new Map<string, Promise<Fused>>();
+  const cached = (key: string, make: () => Promise<Fused>) => {
+    if (!memo.has(key)) memo.set(key, make());
+    return memo.get(key)!;
+  };
+  const A1 = () => cached('a1', () => fuse(consistent()));
+  const A1_LEGACY = () => cached('a1-legacy', () => fuse(consistent(), LEGACY_FUSION_OPTIONS));
+  const D1 = () => cached('d1', () => fuse(consistent(), {}, true));
+  const warningsOf = (r: Fused) => r.info.warnings.map((w) => w.en);
+  const sane = (r: Fused) => {
+    expect(computeMeshStats(r.geometry).watertight).toBe(true);
+    expect(r.info.report.views.length).toBe(r.info.views.length);
+    expect(r.geometry.userData.fusion).toBe(r.info.report);
+    expect(r.geometry.userData.multiview).toBe(r.info);
+  };
+
+  it('A1: keeps a consistent set as it was, with the guard armed but idle', async () => {
+    const r = await A1(), legacy = await A1_LEGACY();
+    sane(r);
+    for (const k of ['arm', 'leg', 'torso', 'head'] as const) expect(r.m[k]).toBeGreaterThanOrEqual(0.99);
+    expect(fieldIoU(r.field, legacy.field)).toBeGreaterThanOrEqual(0.99);
+    expect(r.info.guardColumns).toBeGreaterThan(0);
+    expect(r.info.warnings).toEqual([]);
+    expect(r.info.alignment.map((a) => a.status)).toEqual(['bbox', 'aligned', 'aligned', 'aligned']);
+    expect(r.info.alignment.every((a) => a.score >= 90)).toBe(true);
+    expect(r.info.report.views.map((v) => v.trust)).toEqual(['full', 'full', 'full', 'full']);
+    // Legacy options switch every new mechanism off.
+    expect(legacy.info.alignment.every((a) => a.status === 'bbox')).toBe(true);
+    expect(legacy.info.guardColumns).toBe(0);
+    const strict = await fuse(consistent(), { hull: 'strict' }), strictLegacy = await fuse(consistent(), { ...LEGACY_FUSION_OPTIONS, hull: 'strict' });
+    expect(fieldIoU(strict.field, strictLegacy.field)).toBeGreaterThanOrEqual(0.99);
+  }, 60000);
+
+  it('A2: knee-up back and side views keep the arms, the shoulders and the chest depth', async () => {
+    const r = await fuse(renderCharacterViews(V4, { size: SIZE, perturb: others({ cropBottom: 0.28 }) }));
+    const a1 = await A1();
+    sane(r);
+    expect(r.m.arm).toBeGreaterThanOrEqual(0.95);
+    expect(Math.abs(r.m.widths[0] - a1.m.widths[0])).toBeLessThanOrEqual(0.02);
+    expect(r.m.depths[0]).toBeLessThanOrEqual(0.16); // legacy: 0.21
+    for (const id of ['back', 'left', 'right']) expect(warningsOf(r)).toContain(viewWarning(FUSION_TEXT.viewCropped, id as ViewId).en);
+    expect(r.info.alignment.slice(1).every((a) => a.cut.bottom && a.status === 'aligned')).toBe(true);
+  }, 30000);
+
+  it('A3 / A6: lowered arms in the back, cut heads everywhere', async () => {
+    const a3 = await fuse(renderCharacterViews(V4, { size: SIZE, perturb: { back: { proportions: { armHeight: -0.06 } } } }));
+    expect(a3.m.arm).toBeGreaterThanOrEqual(0.98);
+    const a6 = await fuse(renderCharacterViews(V4, { size: SIZE, perturb: others({ cropTop: 0.08 }) }));
+    sane(a6);
+    expect(a6.m.arm).toBeGreaterThanOrEqual(0.95);
+    expect(a6.info.alignment.slice(1).every((a) => a.cut.top)).toBe(true);
+  }, 30000);
+
+  it.each([[1], [2], [3], [4], [5]])('A4: independent artists ±8 % seed %s keep their arms and at least the legacy IoU', async (seed) => {
+    const r = await fuse(independentArtistViews(V4, seed, { size: SIZE }));
+    const legacy = await fuse(independentArtistViews(V4, seed, { size: SIZE }), LEGACY_FUSION_OPTIONS);
+    expect(r.m.arm).toBeGreaterThanOrEqual(0.98);
+    expect(r.m.iou).toBeGreaterThanOrEqual(legacy.m.iou - 0.02);
+  }, 30000);
+
+  it('A5: the reported case (back + left, and + a shifted, scaled, cropped right)', async () => {
+    const a = await fuse(renderCharacterViews(['front', 'back', 'left'], { size: SIZE, perturb: REPORTED }));
+    const b = await fuse(renderCharacterViews(V4, { size: SIZE, perturb: { ...REPORTED, right: { dx: 0.03, scale: 1.05, cropBottom: 0.05 } } }));
+    for (const r of [a, b]) {
+      sane(r);
+      expect(r.m.arm).toBeGreaterThanOrEqual(0.98);
+      expect(r.m.leg).toBeGreaterThanOrEqual(0.98);
+      expect(r.m.torso).toBeGreaterThanOrEqual(0.98);
+    }
+    expect(b.info.alignment.find((v) => v.id === 'right')!.cut.bottom).toBe(true);
+    // Legacy loses most of the arms here with depth on (the reported failure).
+    const legacy = await fuse(renderCharacterViews(V4, { size: SIZE, perturb: { ...REPORTED, right: { dx: 0.03, scale: 1.05, cropBottom: 0.05 } } }), LEGACY_FUSION_OPTIONS, true);
+    expect(legacy.m.arm).toBeLessThan(0.5);
+  }, 40000);
+
+  it('D1 / D2: exact depth on consistent four and six views', async () => {
+    const d1 = await D1();
+    sane(d1);
+    expect(d1.m.iou).toBeGreaterThanOrEqual(0.85);
+    expect(d1.m.arm).toBeGreaterThanOrEqual(0.97);
+    expect(d1.m.bloat).toBeLessThanOrEqual(0.18);
+    expect(warningsOf(d1).some((w) => w.includes('does not quite match'))).toBe(false);
+    expect(Object.values(d1.info.consistency).every((c) => c! < 0.25)).toBe(true);
+    const d2 = await fuse(renderCharacterViews([...V4, 'top', 'bottom'], { size: SIZE }), {}, true);
+    expect(d2.m.head).toBeGreaterThanOrEqual(0.95);
+    expect(d2.m.leg).toBeGreaterThanOrEqual(0.95);
+    expect(d2.m.iou).toBeGreaterThanOrEqual(0.9);
+    // A consistent set is consistent whatever the number of views: no view's carve runs into the guard.
+    expect(warningsOf(d2)).toEqual([]);
+    expect(Object.values(d2.info.consistency).every((c) => c! < 0.1)).toBe(true);
+    // Consistent sides stay consistent when only the caps are reframed (cut at both sides, scaled).
+    const d2b = await fuse(renderCharacterViews([...V4, 'top', 'bottom'], { size: SIZE, perturb: { top: { scale: 0.8, dx: 0.04 }, bottom: { scale: 1.2, dy: 0.03 } } }), {}, true);
+    expect(warningsOf(d2b).some((w) => w.includes('does not quite match'))).toBe(false);
+    expect(Object.values(d2b.info.consistency).every((c) => c! < 0.1)).toBe(true);
+  }, 60000);
+
+  it('consistency and the carved field do not depend on the order of the views', async () => {
+    const set = renderCharacterViews([...V4, 'top', 'bottom'], { size: SIZE, perturb: { left: { proportions: { armHeight: -0.06 } } } });
+    const a = await fuse(set, {}, true);
+    const shuffled: CharacterViews = { ...set, inputs: [set.inputs[0], ...set.inputs.slice(1).reverse()] };
+    const b = await fuse(shuffled, {}, true);
+    for (const id of Object.keys(a.info.consistency) as ViewId[]) expect(b.info.consistency[id]).toBeCloseTo(a.info.consistency[id]!, 12);
+    expect(a.info.consistency.left).toBeGreaterThanOrEqual(0.25);
+    expect(a.info.consistency.right).toBeLessThan(0.1);
+    let maxDiff = 0;
+    for (let i = 0; i < a.field.length; i++) maxDiff = Math.max(maxDiff, Math.abs(a.field[i] - b.field[i]));
+    expect(maxDiff).toBeLessThan(1e-6);
+  }, 60000);
+
+  it.each([[0.03], [0.08], [0.28]])('D3: cropBottom %s with depth keeps the arms', async (crop) => {
+    const r = await fuse(renderCharacterViews(V4, { size: SIZE, perturb: others({ cropBottom: crop }) }), {}, true);
+    expect(r.m.arm).toBeGreaterThanOrEqual(0.9);
+    expect(r.m.iou).toBeGreaterThanOrEqual(0.75);
+    // Registered crops are consistent with the front (the guard has nothing to block).
+    expect(warningsOf(r).some((w) => w.includes('does not quite match'))).toBe(false);
+  }, 30000);
+
+  it.each([[-0.03], [-0.06], [-0.08]])('D4: arms %s everywhere but the front, with depth', async (armHeight) => {
+    const r = await fuse(renderCharacterViews(V4, { size: SIZE, perturb: others({ proportions: { armHeight } }) }), {}, true);
+    expect(r.m.arm).toBeGreaterThanOrEqual(0.85);
+    expect(r.m.leg).toBeGreaterThanOrEqual(0.95);
+    expect(r.m.torso).toBeGreaterThanOrEqual(0.95);
+    expect(r.m.head).toBeGreaterThanOrEqual(0.95);
+  }, 30000);
+
+  it('D5 / D6: one lowered side, longer legs', async () => {
+    const d5 = await fuse(renderCharacterViews(V4, { size: SIZE, perturb: { left: { proportions: { armHeight: -0.06 } } } }), {}, true);
+    expect(d5.m.arm).toBeGreaterThanOrEqual(0.9);
+    expect(d5.info.consistency.left).toBeGreaterThanOrEqual(0.25);
+    expect(d5.info.consistency.right).toBeLessThan(0.25);
+    expect(warningsOf(d5)).toEqual([viewWarning(FUSION_TEXT.viewInconsistent, 'left').en]);
+    expect(d5.info.report.views.find((v) => v.id === 'left')!.notes.map((n) => n.code)).toContain('inconsistent');
+    expect(d5.info.report.views.find((v) => v.id === 'right')!.notes.map((n) => n.code)).not.toContain('inconsistent');
+    const d6 = await fuse(renderCharacterViews(V4, { size: SIZE, perturb: others({ proportions: { legLength: 1.08 } }) }), {}, true);
+    expect(d6.m.arm).toBeGreaterThanOrEqual(0.9);
+  }, 30000);
+
+  it.each([[1, 0.08], [2, 0.08], [3, 0.08], [4, 0.08], [5, 0.08], [1, 0.12], [2, 0.12]])('D7: independent artists seed %s ±%s with depth', async (seed, spread) => {
+    const r = await fuse(independentArtistViews(V4, seed, { size: SIZE, spread }), {}, true);
+    expect(r.m.arm).toBeGreaterThanOrEqual(0.85);
+    if (spread === 0.08) {
+      expect(r.m.leg).toBeGreaterThanOrEqual(0.95);
+      expect(r.m.iou).toBeGreaterThanOrEqual(0.8);
+    }
+  }, 30000);
+
+  it('D8: the reported case with depth', async () => {
+    for (const set of [
+      renderCharacterViews(['front', 'back', 'left'], { size: SIZE, perturb: REPORTED }),
+      renderCharacterViews(V4, { size: SIZE, perturb: { ...REPORTED, right: { dx: 0.03, scale: 1.05, cropBottom: 0.05 } } }),
+    ]) {
+      const r = await fuse(set, {}, true);
+      sane(r);
+      expect(r.m.arm).toBeGreaterThanOrEqual(0.85);
+      expect(r.m.torso).toBeGreaterThanOrEqual(0.95);
+      expect(r.m.leg).toBeGreaterThanOrEqual(0.95);
+      expect(r.m.head).toBeGreaterThanOrEqual(0.95);
+    }
+  }, 40000);
+
+  it('A1 costs at most a little more than the legacy pipeline', async () => {
+    const set = consistent();
+    const time = async (opts: Partial<FusionOptions>) => {
+      let best = Infinity;
+      for (let i = 0; i < 2; i++) {
+        const t0 = performance.now();
+        await reconstructFromViews(set.inputs, opts, ctx());
+        best = Math.min(best, performance.now() - t0);
+      }
+      return best;
+    };
+    const legacy = await time(LEGACY_FUSION_OPTIONS);
+    const current = await time({});
+    expect(current).toBeLessThan(1.5 * legacy + 100);
+  }, 60000);
+});
+
+describe('robust fusion: non-character subjects with depth', () => {
+  const ALL6: ViewId[] = ['front', 'back', 'left', 'right', 'top', 'bottom'];
+  const S = 256, SCALE = S * 0.38;
+
+  /** IoU of the occupancy with an analytic solid drawn centred at SCALE px per unit (front frame = object frame here). */
+  function solidIoU(solid: Solid, r: Awaited<ReturnType<typeof reconstructWithField>>, keep?: (p: [number, number, number]) => boolean): { iou: number; kept: number } {
+    const front = r.views[0];
+    const box = estimateObjectBox(r.views.filter((v) => v.trust === 'full'), 0.5);
+    const proj = viewProjection(front, box.size);
+    const [nx, ny, nz] = r.grid.dims;
+    let inter = 0, truth = 0, occ = 0, keepTrue = 0, keepHit = 0;
+    for (let k = 0; k < nz; k++)
+      for (let j = 0; j < ny; j++)
+        for (let i = 0; i < nx; i++) {
+          const X = r.grid.origin[0] + i * r.grid.spacing, Y = r.grid.origin[1] + j * r.grid.spacing, Z = r.grid.origin[2] + k * r.grid.spacing;
+          const u = proj.ou + proj.su * X, v = proj.ov + proj.sv * Y;
+          const p: [number, number, number] = [(u - S / 2) / SCALE, -(v - S / 2) / SCALE, Z / SCALE];
+          const t = containsPoint(solid, p), o = r.field[i + nx * (j + ny * k)] > 0.5;
+          if (t) truth++;
+          if (o) occ++;
+          if (t && o) inter++;
+          if (keep && t && keep(p)) { keepTrue++; if (o) keepHit++; }
+        }
+    return { iou: inter / (truth + occ - inter), kept: keepTrue ? keepHit / keepTrue : 1 };
+  }
+  const run = (solid: Solid, views: ViewId[], opts: Partial<FusionOptions> = {}, depth = true) => {
+    const { inputs, renders } = renderViews(solid, views, { width: S, height: S, scale: SCALE });
+    return reconstructWithField(inputs, opts, { estimateDepth: depth ? fakeDepthEstimator(renders) : null });
+  };
+
+  it('sphere, mug handle, U-block cavity, plate', async () => {
+    const sphereR = await run([sphere([0, 0, 0], 1)], ALL6);
+    expect(solidIoU([sphere([0, 0, 0], 1)], sphereR).iou).toBeGreaterThanOrEqual(0.95); // legacy 0.92
+    expect(sphereR.info.guardColumns).toBe(0);
+    const mug: Solid = [cylinderY(0, 0, 0.55, -0.8, 0.8), cylinderX(0.3, 0, 0.07, 0.55, 0.95), cylinderX(-0.3, 0, 0.07, 0.55, 0.95), box([0.88, -0.37, -0.07], [1.02, 0.37, 0.07])];
+    const mugR = await run(mug, ALL6), mugLegacy = await run(mug, ALL6, LEGACY_FUSION_OPTIONS);
+    // The thin handle: its tubes survive whole; the 0.14-thick bar keeps ≥ 90 % (the guard tube is ρ = 0.9 of
+    // its depth, and a thin plate has many surface voxels). Legacy calibration carves most of it away (≈ 0.28).
+    expect(solidIoU(mug, mugR, (p) => p[0] > 0.6 && p[0] < 0.86).kept).toBeGreaterThanOrEqual(0.95);
+    const handle = solidIoU(mug, mugR, (p) => p[0] > 0.6).kept;
+    expect(handle).toBeGreaterThanOrEqual(0.9);
+    expect(handle).toBeGreaterThanOrEqual(solidIoU(mug, mugLegacy, (p) => p[0] > 0.6).kept + 0.3);
+    expect(computeMeshStats(mugR.geometry).watertight).toBe(true);
+    const u: Solid = [box([-1, -0.6, -0.6], [-0.7, 0.6, 0.6]), box([0.7, -0.6, -0.6], [1, 0.6, 0.6]), box([-1, -0.6, -0.6], [1, 0.6, -0.3])];
+    const uR = await run(u, ALL6);
+    expect(solidIoU(u, uR).iou).toBeGreaterThanOrEqual(0.85); // the cavity is still carved
+    const plate: Solid = [box([-1, -0.6, -0.03], [1, 0.6, 0.03])];
+    const plateR = await run(plate, ALL6), plateLegacy = await run(plate, ALL6, LEGACY_FUSION_OPTIONS);
+    expect(Math.abs(solidIoU(plate, plateR).iou - solidIoU(plate, plateLegacy).iou)).toBeLessThanOrEqual(0.01);
+  }, 60000);
+
+  it('front + back only: the balloon path is untouched', async () => {
+    const a = await run([sphere([0, 0, 0], 1)], ['front', 'back'], {}, false);
+    const b = await run([sphere([0, 0, 0], 1)], ['front', 'back'], LEGACY_FUSION_OPTIONS, false);
+    expect(Math.abs(a.info.triangles / b.info.triangles - 1)).toBeLessThanOrEqual(0.05);
+    expect(a.info.depth).toEqual({ front: 'silhouette', back: 'silhouette' });
+  }, 30000);
 });

@@ -7,11 +7,13 @@
  * settings (keys persisted by src/ai/settings — local or session storage,
  * never both), whether our server answered, the AI preparation options, the
  * one AI job that may run at a time (prep or view generation), the prepared
- * image awaiting Accept, the extra views, the human analysis of the front
- * image, and the edit / rig flags of the model on screen.
+ * image awaiting Accept, the extra views with their alignment / trust and
+ * pre-run consistency checks, the human analysis of the front image, and the
+ * edit / rig flags of the model on screen.
  */
-import type { Availability, Driver, I18nText, Lang, Mask, ParamValue, ParamValues, Progress, RGBAImage, ViewId, ViewSet } from '../core/types';
-import { defaultParams } from '../core/types';
+import type { Availability, Driver, I18nText, Lang, Mask, ParamValue, ParamValues, Progress, RGBAImage, ViewAlign, ViewId, ViewSet } from '../core/types';
+import { DEFAULT_VIEW_ALIGN, defaultParams, sanitizeViewAlign } from '../core/types';
+import type { FusionReport, ViewAlignment } from '../core/fusion/types';
 import type { MeshStats } from '../core/mesh/stats';
 import { MESH_PARAMS, type MeshMode } from '../core/mesh/options';
 import type { HumanAnalysis } from '../core/human/types';
@@ -45,6 +47,8 @@ export interface ResultInfo {
   depthPreview: RGBAImage | null;
   elapsedMs: number;
   sourceName: string;
+  /** Multi-view fusion's consistency report (null for other drivers). */
+  fusion: FusionReport | null;
 }
 
 /** The views besides the front (the front is always the source image). */
@@ -61,6 +65,8 @@ export interface ViewEntry {
   mask: Mask | null;
   origin: 'upload' | 'ai';
   name: string;
+  /** Alignment to the front (auto / manual offset, scale, flip) and what the view is trusted for. */
+  align: ViewAlign;
 }
 
 export type ViewEntries = Partial<Record<OtherViewId, ViewEntry>>;
@@ -145,6 +151,12 @@ export interface AppState {
   /** The source before an accepted AI preparation ("Revert to original"). */
   original: SourceImage | null;
   views: ViewEntries;
+  /**
+   * Pre-run registration of each extra view against the current front
+   * (derived, computed asynchronously by useStudio; the fusion's own report
+   * after a run is authoritative). Cleared when the front or the view changes.
+   */
+  viewChecks: Partial<Record<OtherViewId, ViewAlignment>>;
 
   // ---- Model edits ----
   /** Sculpt mode is on (a session owns the viewer's pointer input). */
@@ -215,6 +227,12 @@ export type Action =
   // Views
   | { type: 'viewSet'; view: OtherViewId; entry: ViewEntry }
   | { type: 'viewClear'; view: OtherViewId }
+  /** Patch of a view's alignment; dx / dy / scale in the patch make it manual. */
+  | { type: 'viewAlign'; view: OtherViewId; patch: Partial<ViewAlign> }
+  | { type: 'viewAlignAuto'; view: OtherViewId }
+  | { type: 'viewAlignReset'; view: OtherViewId }
+  /** Registration result; accepted only while `front` and `image` are still the current ones. */
+  | { type: 'viewChecked'; view: OtherViewId; front: RGBAImage; image: RGBAImage; check: ViewAlignment }
   // Model edits
   | { type: 'setSculptActive'; active: boolean }
   | { type: 'sculptSessionStart' }
@@ -258,6 +276,7 @@ export function sanitizePrep(stored: unknown, base: PrepOptions = DEFAULT_PREP_O
 /** Reset of everything tied to the previous subject (a brand-new image or none). */
 const freshSubject = (): Partial<AppState> => ({
     views: {},
+    viewChecks: {},
     prepared: null,
     preparedWith: null,
     frontPrep: null,
@@ -278,6 +297,14 @@ const freshModel: Partial<AppState> = {
   depthEdited: false,
   regenConfirm: false,
 };
+
+/** The checks without `view`'s (the same object when there was none). */
+function withoutCheck(checks: AppState['viewChecks'], view: OtherViewId): AppState['viewChecks'] {
+  if (!checks[view]) return checks;
+  const out = { ...checks };
+  delete out[view];
+  return out;
+}
 
 /** Views made by AI from the previous front: dropped when the front changes (uploads are kept). */
 function withoutAiViews(views: ViewEntries): ViewEntries {
@@ -461,6 +488,7 @@ export function reducer(state: AppState, action: Action): AppState {
       return {
         ...state,
         views,
+        viewChecks: {}, // the front changed: every registration is stale
         viewsError: null,
         source: prepared,
         original: state.original ?? state.source,
@@ -478,6 +506,7 @@ export function reducer(state: AppState, action: Action): AppState {
       return {
         ...state,
         views: withoutAiViews(state.views),
+        viewChecks: {},
         viewsError: null,
         source: state.original,
         original: null,
@@ -490,13 +519,41 @@ export function reducer(state: AppState, action: Action): AppState {
     }
 
     case 'viewSet':
-      return { ...state, views: { ...state.views, [action.view]: action.entry }, viewsError: null };
+      return { ...state, views: { ...state.views, [action.view]: action.entry }, viewChecks: withoutCheck(state.viewChecks, action.view), viewsError: null };
     case 'viewClear': {
       if (!state.views[action.view]) return state;
       const views = { ...state.views };
       delete views[action.view];
-      return { ...state, views };
+      return { ...state, views, viewChecks: withoutCheck(state.viewChecks, action.view) };
     }
+    case 'viewAlign': {
+      const entry = state.views[action.view];
+      if (!entry) return state;
+      const p = action.patch;
+      // A geometric correction is a manual one; flipping changes the registered image (the check is stale).
+      const manual = p.dx !== undefined || p.dy !== undefined || p.scale !== undefined;
+      const align = sanitizeViewAlign({ ...entry.align, ...p, ...(manual ? { mode: 'manual' } : {}) }, entry.align);
+      const viewChecks = align.flipX !== entry.align.flipX ? withoutCheck(state.viewChecks, action.view) : state.viewChecks;
+      return { ...state, views: { ...state.views, [action.view]: { ...entry, align } }, viewChecks };
+    }
+    case 'viewAlignAuto': {
+      const entry = state.views[action.view];
+      if (!entry) return state;
+      // A check made for a manual placement scores that placement; back in auto mode it is stale.
+      const viewChecks = state.viewChecks[action.view]?.status === 'manual' ? withoutCheck(state.viewChecks, action.view) : state.viewChecks;
+      return { ...state, views: { ...state.views, [action.view]: { ...entry, align: { ...entry.align, mode: 'auto', dx: 0, dy: 0, scale: 1 } } }, viewChecks };
+    }
+    case 'viewAlignReset': {
+      const entry = state.views[action.view];
+      if (!entry) return state;
+      const viewChecks =
+        entry.align.flipX || state.viewChecks[action.view]?.status === 'manual' ? withoutCheck(state.viewChecks, action.view) : state.viewChecks;
+      return { ...state, views: { ...state.views, [action.view]: { ...entry, align: { ...DEFAULT_VIEW_ALIGN } } }, viewChecks };
+    }
+    case 'viewChecked':
+      // Results for a front or a view image that has been replaced meanwhile are dropped.
+      if (state.source?.image !== action.front || state.views[action.view]?.image !== action.image) return state;
+      return { ...state, viewChecks: { ...state.viewChecks, [action.view]: action.check } };
 
     case 'setSculptActive':
       return state.sculptActive === action.active ? state : { ...state, sculptActive: action.active };
@@ -547,12 +604,17 @@ export function presentViews(views: ViewEntries): OtherViewId[] {
   return OTHER_VIEWS.filter((v) => !!views[v]);
 }
 
-/** The extra views as the drivers' ViewSet (the pipeline adds the front). */
+/** Extra views that take part in a generation (present and not switched off). */
+export function activeViews(views: ViewEntries): OtherViewId[] {
+  return presentViews(views).filter((v) => views[v]!.align.trust !== 'off');
+}
+
+/** The extra views as the drivers' ViewSet (the pipeline adds the front); views switched off are left out, so no driver uploads them. */
 export function extraViewSet(views: ViewEntries): ViewSet {
   const out: ViewSet = {};
   for (const id of OTHER_VIEWS) {
     const v = views[id];
-    if (v) out[id] = { id, image: v.image, mask: v.mask, file: v.file, origin: v.origin };
+    if (v && v.align.trust !== 'off') out[id] = { id, image: v.image, mask: v.mask, file: v.file, origin: v.origin, align: v.align };
   }
   return out;
 }
@@ -578,8 +640,9 @@ export function generateBlock(state: AppState, availability: Availability | 'che
   if (availability && availability !== 'checking' && !availability.ok) return { kind: 'unavailable', reason: availability.reason ?? null };
   if (state.aiJob) return { kind: 'ai-busy' };
   if (driver?.views === 'required') {
-    const missing = (driver.minViews ?? []).filter((v): v is OtherViewId => v !== 'front' && !state.views[v]);
-    if (presentViews(state.views).length === 0 || missing.length > 0) return { kind: 'views', missing };
+    const active = activeViews(state.views);
+    const missing = (driver.minViews ?? []).filter((v): v is OtherViewId => v !== 'front' && !active.includes(v as OtherViewId));
+    if (active.length === 0 || missing.length > 0) return { kind: 'views', missing };
   }
   return null;
 }
@@ -684,6 +747,7 @@ export function createInitialState(env: InitEnv): AppState {
     frontPrep: null,
     original: null,
     views: {},
+    viewChecks: {},
     sculptActive: false,
     sculpted: false,
     sculptBase: false,

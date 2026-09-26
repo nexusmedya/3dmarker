@@ -117,6 +117,52 @@ export type DriverBadge =
 export type ViewId = 'front' | 'back' | 'left' | 'right' | 'top' | 'bottom';
 export const VIEW_IDS: ViewId[] = ['front', 'back', 'left', 'right', 'top', 'bottom'];
 
+/** What a view may contribute to a multi-view reconstruction. */
+export type ViewTrust = 'full' | 'color' | 'off';
+
+/**
+ * Per-view alignment request. `mode: 'auto'`: the fusion registers the view to
+ * the front itself (dx / dy / scale are ignored, kept as the UI's cached copy).
+ * `mode: 'manual'`: dx / dy / scale are absolute corrections of the silhouette
+ * bbox fit (see alignedBox in src/core/fusion/align.ts): dx / dy in fractions of
+ * the view's longest bbox side, + = the content moves image-right / down in the
+ * object frame; scale > 1 = the content counts as larger. flipX mirrors the view
+ * image and mask before anything else. Applies to any mode.
+ */
+export interface ViewAlign {
+  mode: 'auto' | 'manual';
+  dx: number;
+  dy: number;
+  scale: number;
+  flipX: boolean;
+  trust: ViewTrust;
+}
+
+export const DEFAULT_VIEW_ALIGN: ViewAlign = { mode: 'auto', dx: 0, dy: 0, scale: 1, flipX: false, trust: 'full' };
+
+/** Sanitiser limits: |dx|, |dy| ≤ offset; scaleMin ≤ scale ≤ scaleMax. */
+export const VIEW_ALIGN_RANGE = { offset: 0.25, scaleMin: 0.5, scaleMax: 2 } as const;
+
+const TRUSTS: ViewTrust[] = ['full', 'color', 'off'];
+
+/** A valid ViewAlign from anything (unknown / non-finite fields fall back to `base`). */
+export function sanitizeViewAlign(v: unknown, base: ViewAlign = DEFAULT_VIEW_ALIGN): ViewAlign {
+  const src = v && typeof v === 'object' ? (v as Record<string, unknown>) : {};
+  const num = (k: 'dx' | 'dy' | 'scale', lo: number, hi: number) => {
+    const x = src[k];
+    return typeof x === 'number' && Number.isFinite(x) ? Math.min(hi, Math.max(lo, x)) : base[k];
+  };
+  const r = VIEW_ALIGN_RANGE;
+  return {
+    mode: src.mode === 'manual' ? 'manual' : src.mode === 'auto' ? 'auto' : base.mode,
+    dx: num('dx', -r.offset, r.offset),
+    dy: num('dy', -r.offset, r.offset),
+    scale: num('scale', r.scaleMin, r.scaleMax),
+    flipX: typeof src.flipX === 'boolean' ? src.flipX : base.flipX,
+    trust: typeof src.trust === 'string' && (TRUSTS as string[]).includes(src.trust) ? (src.trust as ViewTrust) : base.trust,
+  };
+}
+
 export interface ViewImage {
   id: ViewId;
   /** Working image (longest side ≤ the app's working size). */
@@ -126,6 +172,8 @@ export interface ViewImage {
   /** The file the image came from (cloud drivers upload it). */
   file: Blob;
   origin: 'source' | 'upload' | 'ai';
+  /** Alignment / trust of an extra view (absent = auto, full trust). Ignored for the front. */
+  align?: ViewAlign;
 }
 
 export type ViewSet = Partial<Record<ViewId, ViewImage>>;

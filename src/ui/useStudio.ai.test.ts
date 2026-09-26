@@ -11,7 +11,7 @@ import { act, createElement } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { BoxGeometry, Mesh } from 'three';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { DepthMap } from '../core/types';
+import type { DepthMap, ViewAlign } from '../core/types';
 import type { HumanAnalysis } from '../core/human/types';
 import type { AiSettings } from '../ai/types';
 import type { BuiltModel, SourceImage } from '../app/pipeline';
@@ -22,6 +22,16 @@ const mocks = vi.hoisted(() => ({
   prepareFrontImage: vi.fn(),
   generateViewImage: vi.fn(),
   analyzeHuman: vi.fn(),
+  prepareView: vi.fn(),
+  alignView: vi.fn(),
+}));
+vi.mock('../core/fusion/frame', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../core/fusion/frame')>();
+  return { ...actual, prepareView: mocks.prepareView };
+});
+vi.mock('../core/fusion/align', () => ({
+  alignView: mocks.alignView,
+  ALIGN_TEXT: { weak: { tr: 'Önle eşleştirilemedi', en: 'Could not be matched to the front' } },
 }));
 vi.mock('../app/pipeline', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../app/pipeline')>();
@@ -36,10 +46,12 @@ vi.mock('../core/human/analyze', async (importOriginal) => {
   return { ...actual, analyzeHuman: mocks.analyzeHuman };
 });
 
-import { buildDepthModel } from '../app/pipeline';
+import type { ViewAlignment } from '../core/fusion/types';
+import type { FusionViewInput } from '../core/fusion/types';
+import { buildDepthModel, buildGeometryModel } from '../app/pipeline';
 import { createProviderConfig, currentAiSettings } from '../ai/settings';
 import { STYLES } from '../ai/styles';
-import { REMESH_DEBOUNCE_MS, aiFileName, meshSignature, useStudio, type Studio } from './useStudio';
+import { CHECK_REFRESH_MS, REMESH_DEBOUNCE_MS, aiFileName, meshSignature, useStudio, type Studio } from './useStudio';
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -92,11 +104,37 @@ async function load(name: string) {
 const ctrlEnter = () => act(async () => void window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true })));
 const wait = (ms: number) => act(() => new Promise<void>((r) => setTimeout(r, ms)));
 
+/** A stand-in for the fusion's prepared view: only its identity and request matter to the hook. */
+const fakePrepared = (input: FusionViewInput) => ({ id: input.id, image: input.image, mask: input.mask, align: input.align, bbox: { x0: 0, y0: 0, x1: 2, y1: 2 } });
+
+/** Like the core: a manual request is scored at its own placement (status 'manual', applied = the request). */
+function fakeCheck(view: { id: ViewAlignment['id']; align?: ViewAlign }): ViewAlignment {
+  const c = { dx: 0, dy: 0.02, scale: 1, flipX: false };
+  const manual = view.align?.mode === 'manual';
+  return {
+    id: view.id,
+    status: manual ? 'manual' : 'aligned',
+    level: 'good',
+    score: manual ? 70 : 90,
+    confidence: 0.9,
+    applied: manual ? { dx: view.align!.dx, dy: view.align!.dy, scale: view.align!.scale, flipX: view.align!.flipX } : c,
+    suggested: c,
+    residual: { dx: 0, dy: 0, scale: 1 },
+    cut: { top: false, bottom: false, left: false, right: false },
+    fitBox: { x0: 0, y0: 0, x1: 2, y1: 2 },
+    trust: 'full',
+    notes: [{ code: 'aligned', text: { tr: 'Önle hizalı', en: 'Aligned with the front' } }],
+    guides: { rows: [], cols: [] },
+  };
+}
+
 beforeEach(() => {
   localStorage.clear();
   sessionStorage.clear();
   for (const m of Object.values(mocks)) m.mockReset();
   decodeByName();
+  mocks.prepareView.mockImplementation(fakePrepared);
+  mocks.alignView.mockImplementation((_front: unknown, view: { id: ViewAlignment['id']; align?: ViewAlign }) => fakeCheck(view));
   mocks.analyzeHuman.mockResolvedValue(human(false));
   // No server (static hosting) unless a test says otherwise.
   vi.stubGlobal('fetch', vi.fn(async () => new Response('<!doctype html>', { status: 404, headers: { 'content-type': 'text/html' } })));
@@ -390,6 +428,142 @@ describe('views', () => {
       await pending;
     });
     expect(studio.state.views).toEqual({});
+  });
+});
+
+describe('view consistency checks and alignment', () => {
+  const upload = (view: 'back' | 'left' | 'right', name: string) => act(async () => studio.actions.uploadView(view, new File([name], name, { type: 'image/png' })));
+  const checked = (...views: string[]) => vi.waitFor(() => expect(Object.keys(studio.state.viewChecks).sort()).toEqual(views));
+
+  it('registers every uploaded view against the front (prepared once), one per tick, and drops stale results', async () => {
+    await mount();
+    await load('toy.png');
+    const front = studio.state.source!.image;
+    await upload('back', 'back.png');
+    await upload('left', 'left.png');
+    await checked('back', 'left');
+    expect(studio.state.viewChecks.back).toMatchObject({ id: 'back', score: 90 });
+    // The front is prepared once for both views; each view once, with its request.
+    const frontCalls = mocks.prepareView.mock.calls.filter((c) => c[0].id === 'front');
+    expect(frontCalls).toHaveLength(1);
+    expect(frontCalls[0][0]).toMatchObject({ image: front, mask: null });
+    expect(mocks.prepareView.mock.calls.filter((c) => c[0].id !== 'front').map((c) => c[0].id).sort()).toEqual(['back', 'left']);
+    expect(mocks.alignView).toHaveBeenCalledTimes(2);
+    expect(mocks.alignView.mock.calls[0][0]).toBe(mocks.alignView.mock.calls[1][0]); // the same prepared front
+    expect(mocks.alignView.mock.calls[0][2]).toEqual({ mode: 'auto' });
+
+    // A geometric correction keeps the check (re-scored live in the UI) and redoes it once the edits settle,
+    // with the manual request: the core scores the manual placement itself. Quick edits coalesce into one.
+    await act(async () => studio.actions.setViewAlign('back', { dy: -0.03 }));
+    expect(studio.state.views.back?.align).toMatchObject({ mode: 'manual', dy: -0.03 });
+    expect(studio.state.viewChecks.back).toMatchObject({ status: 'aligned', score: 90 });
+    expect(mocks.alignView).toHaveBeenCalledTimes(2);
+    await act(async () => studio.actions.setViewAlign('back', { dy: -0.04 }));
+    await wait(CHECK_REFRESH_MS / 2);
+    expect(mocks.alignView).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(studio.state.viewChecks.back).toMatchObject({ status: 'manual', score: 70, applied: { dy: -0.04 } }));
+    expect(mocks.alignView).toHaveBeenCalledTimes(3);
+    expect(mocks.prepareView.mock.calls.filter((c) => c[0].id === 'back').at(-1)![0].align).toMatchObject({ mode: 'manual', dy: -0.04 });
+    await wait(CHECK_REFRESH_MS * 2);
+    expect(mocks.alignView).toHaveBeenCalledTimes(3); // settled: no further checks
+    // A flip needs a new one at once, with the flipped request.
+    await act(async () => studio.actions.setViewAlign('back', { flipX: true }));
+    expect(studio.state.viewChecks.back).toBeUndefined();
+    await vi.waitFor(() => expect(mocks.alignView).toHaveBeenCalledTimes(4));
+    await checked('back', 'left');
+    const flipped = mocks.prepareView.mock.calls.filter((c) => c[0].id === 'back').at(-1)![0];
+    expect(flipped.align).toMatchObject({ flipX: true, mode: 'manual', dy: -0.04 });
+    // Back to automatic: the manual check goes, an automatic one replaces it.
+    await act(async () => studio.actions.autoAlignView('back'));
+    expect(studio.state.views.back?.align).toMatchObject({ mode: 'auto', dx: 0, dy: 0, scale: 1, flipX: true });
+    expect(studio.state.viewChecks.back).toBeUndefined();
+    await vi.waitFor(() => expect(studio.state.viewChecks.back).toMatchObject({ status: 'aligned', score: 90 }));
+    expect(mocks.alignView).toHaveBeenCalledTimes(5);
+    await act(async () => studio.actions.resetViewAlign('back'));
+    expect(studio.state.views.back?.align).toMatchObject({ mode: 'auto', flipX: false, trust: 'full' });
+    await vi.waitFor(() => expect(mocks.alignView).toHaveBeenCalledTimes(6)); // the flip went: a new check
+    await checked('back', 'left');
+    await wait(CHECK_REFRESH_MS * 2);
+    expect(mocks.alignView).toHaveBeenCalledTimes(6);
+
+    // A view switched off is not checked.
+    await act(async () => studio.actions.setViewAlign('left', { trust: 'off' }));
+    await act(async () => studio.actions.setViewAlign('left', { flipX: true }));
+    await act(async () => new Promise<void>((r) => setTimeout(r, 20)));
+    expect(studio.state.viewChecks.left).toBeUndefined();
+    const calls = mocks.alignView.mock.calls.length;
+    await act(async () => studio.actions.setViewAlign('left', { trust: 'full' }));
+    await checked('back', 'left');
+    expect(mocks.alignView.mock.calls.length).toBe(calls + 1);
+
+    // A new front clears everything; the driver gets the alignment with each view.
+    await load('other.png');
+    expect(studio.state.viewChecks).toEqual({});
+    expect(studio.state.views).toEqual({});
+  });
+
+  it('marks a view it cannot check as weak (no retry loop) and hands the alignment to the driver', async () => {
+    const warned = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    mocks.alignView.mockImplementation(() => {
+      throw new Error('boom');
+    });
+    await mount();
+    await act(async () => studio.actions.selectDriver('multiview-fusion'));
+    await load('toy.png');
+    await upload('back', 'back.png');
+    await checked('back');
+    expect(studio.state.viewChecks.back).toMatchObject({ status: 'weak', score: 0, notes: [{ code: 'weak' }] });
+    expect(mocks.alignView).toHaveBeenCalledTimes(1);
+    expect(warned).toHaveBeenCalledWith('[align]', expect.any(Error));
+    // An empty silhouette (prepareView → null) gets the same placeholder without calling alignView.
+    mocks.prepareView.mockImplementation((input: FusionViewInput) => (input.id === 'front' ? fakePrepared(input) : null));
+    await upload('left', 'left.png');
+    await checked('back', 'left');
+    expect(studio.state.viewChecks.left?.status).toBe('weak');
+    expect(mocks.alignView).toHaveBeenCalledTimes(1);
+
+    await act(async () => studio.actions.setViewAlign('back', { dy: 0.04, trust: 'color' }));
+    mocks.runPipeline.mockImplementationOnce(() => new Promise(() => {}));
+    await ctrlEnter();
+    const views = mocks.runPipeline.mock.calls[0][0].views;
+    expect(views.back.align).toMatchObject({ mode: 'manual', dy: 0.04, trust: 'color' });
+    await act(async () => studio.actions.cancel());
+    warned.mockRestore();
+  });
+
+  it('copies the view prompt (front framing, English) and reports clipboard failures', async () => {
+    const writeText = vi.fn(async () => {});
+    vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } });
+    await mount();
+    expect(studio.actions.viewPromptText('back')).toBeNull();
+    expect(await studio.actions.copyViewPrompt('back')).toBe(false);
+    await load('toy.png');
+    const text = studio.actions.viewPromptText('top')!;
+    expect(text).toContain('Attached is the FRONT view');
+    expect(text).toContain('the TOP view');
+    expect(text).toContain('Output size 2 × 2 px');
+    expect(text).not.toContain('T-pose'); // no T-pose asked, not a person
+    await act(async () => studio.actions.setPrep({ subject: 'human', tPose: true }));
+    expect(studio.actions.viewPromptText('left')).toContain('strict T-pose');
+    expect(await studio.actions.copyViewPrompt('back')).toBe(true);
+    expect(writeText).toHaveBeenCalledWith(studio.actions.viewPromptText('back'));
+    writeText.mockRejectedValueOnce(new Error('denied'));
+    expect(await studio.actions.copyViewPrompt('back')).toBe(false);
+    vi.stubGlobal('navigator', { ...navigator, clipboard: undefined });
+    expect(await studio.actions.copyViewPrompt('back')).toBe(false);
+  });
+
+  it('stores the fusion report of a generated model', async () => {
+    const geometry = new BoxGeometry(1, 1, 1);
+    const report = { views: [], warnings: [] };
+    geometry.userData.fusion = report;
+    mocks.runPipeline.mockResolvedValueOnce({ model: buildGeometryModel(geometry, null), inputMask: null });
+    await mount();
+    await act(async () => studio.actions.selectDriver('silhouette-extrude'));
+    await load('m.png');
+    await ctrlEnter();
+    await vi.waitFor(() => expect(studio.state.result).not.toBeNull());
+    expect(studio.state.result?.fusion).toBe(report);
   });
 });
 

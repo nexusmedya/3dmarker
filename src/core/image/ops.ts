@@ -127,6 +127,34 @@ export function resizeFloat(data: Float32Array, width: number, height: number, w
   return out;
 }
 
+/** Horizontally mirrored copy of an RGBA image (new buffer). */
+export function mirrorRGBA(img: RGBAImage): RGBAImage {
+  const { width: w, height: h, data } = img;
+  const out = new Uint8ClampedArray(data.length);
+  for (let y = 0; y < h; y++) {
+    const row = y * w * 4;
+    for (let x = 0; x < w; x++) {
+      const s = row + x * 4, d = row + (w - 1 - x) * 4;
+      out[d] = data[s];
+      out[d + 1] = data[s + 1];
+      out[d + 2] = data[s + 2];
+      out[d + 3] = data[s + 3];
+    }
+  }
+  return { width: w, height: h, data: out };
+}
+
+/** Horizontally mirrored copy of a mask (new buffer). */
+export function mirrorMask(mask: Mask): Mask {
+  const { width: w, height: h, data } = mask;
+  const out = new Uint8Array(data.length);
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) out[row + w - 1 - x] = data[row + x];
+  }
+  return { width: w, height: h, data: out };
+}
+
 /** Nearest-neighbour resample of a mask. */
 export function resizeMask(mask: Mask, w: number, h: number): Mask {
   if (w === mask.width && h === mask.height) return { width: w, height: h, data: mask.data.slice() };

@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { DepthMap, Mask, RGBAImage } from '../types';
-import { maskBBox, VIEW_FRAMES, viewProjection, type PreparedView } from './frame';
-import { applyCarve, calibrateDepth, carveTargets, silhouetteDepth } from './depthCarve';
+import { DEFAULT_VIEW_ALIGN } from '../types';
+import { maskBBox, NO_CUT, VIEW_FRAMES, viewProjection, type PreparedView } from './frame';
+import { applyCarve, calibrateDepth, calibrateDepthAnchored, carveTargets, silhouetteDepth } from './depthCarve';
+import { GuardField } from './guard';
 import { buildHull, createGrid, rayCrossings, rayTToWorld } from './volume';
 
 function maskOf(w: number, h: number, inside: (x: number, y: number) => boolean): Mask {
@@ -14,7 +16,8 @@ const constant = (w: number, h: number, v: number): DepthMap => ({ width: w, hei
 const blank = (w: number, h: number): RGBAImage => ({ width: w, height: h, data: new Uint8ClampedArray(w * h * 4) });
 
 function view(id: PreparedView['id'], mask: Mask): PreparedView {
-  return { id, frame: VIEW_FRAMES[id], image: blank(mask.width, mask.height), mask, maskSource: 'given', bbox: maskBBox(mask)! };
+  const bbox = maskBBox(mask)!;
+  return { id, frame: VIEW_FRAMES[id], image: blank(mask.width, mask.height), mask, maskSource: 'given', bbox, align: DEFAULT_VIEW_ALIGN, cut: { ...NO_CUT }, fitBox: { ...bbox }, registration: 'bbox', trust: 'full' };
 }
 
 /** 20³ cube box seen from the front (full square), plus an optional side view. */
@@ -123,8 +126,10 @@ describe('depth calibration', () => {
     // Front + a full side view: a cube whose front face is flat. A depth ramp must not groove it.
     const { field, grid, proj, mask, rect } = setup(maskOf(20, 20, () => true));
     const ramp: DepthMap = { width: 20, height: 20, data: Float32Array.from({ length: 400 }, (_, i) => (i % 20) / 19) };
-    const t = carveTargets(field, grid, proj, mask, { depth: ramp, rect }, { strength: 1, fit: 'object', halfExtent: 10 });
-    expect(t.every((v) => Number.isNaN(v))).toBe(true);
+    for (const calibration of ['anchored', 'envelope'] as const) {
+      const t = carveTargets(field, grid, proj, mask, { depth: ramp, rect }, { strength: 1, fit: 'object', halfExtent: 10, calibration });
+      expect(t.every((v) => Number.isNaN(v))).toBe(true);
+    }
     // Uncalibrated, the same map carves up to half the box.
     const raw = carveTargets(field, grid, proj, mask, { depth: ramp, rect }, { strength: 1, fit: 'object', halfExtent: 10, calibrate: false });
     expect(raw.some((v) => v > 5)).toBe(true);
@@ -150,5 +155,104 @@ describe('silhouetteDepth', () => {
     expect(at(C, C)).toBeCloseTo(1, 1);
     for (const r of [10, 20]) expect(Math.abs(at(C + r, C) - Math.sqrt(1 - (r / R) ** 2))).toBeLessThan(0.05);
     expect(at(1, 1)).toBe(0);
+  });
+});
+
+describe('anchored calibration', () => {
+  /** Bins of hull entries: tight rays on y = b·x, loose ones nearer the face. */
+  function synthetic(b: number, contaminate?: { x: number; y: number }): { xs: number[]; ys: number[] } {
+    const xs: number[] = [], ys: number[] = [];
+    for (let i = 0; i <= 600; i++) {
+      const x = (i % 101) / 100;
+      xs.push(x);
+      ys.push(b * x - (i % 4 === 0 ? 0 : 0.5 + ((i * 7) % 5) * 0.4));
+    }
+    if (contaminate) for (let n = 0; n < 40; n++) { xs.push(contaminate.x + (n % 5) * 0.002); ys.push(contaminate.y); }
+    return { xs, ys };
+  }
+
+  it('recovers the slope with a = 0, unmoved by one contaminated bin', () => {
+    const { xs, ys } = synthetic(12);
+    const [a, b] = calibrateDepthAnchored(xs, ys, xs.length, 60)!;
+    expect(a).toBe(0);
+    expect(Math.abs(b - 12)).toBeLessThan(0.7);
+    // Forty rays of one bin reach 40 voxels behind (a misregistered silhouette): the median ignores them,
+    // while the envelope's intercept jumps.
+    const c = synthetic(12, { x: 0.3, y: 40 });
+    const [a2, b2] = calibrateDepthAnchored(c.xs, c.ys, c.xs.length, 60)!;
+    expect(a2).toBe(0);
+    expect(Math.abs(b2 - 12)).toBeLessThan(0.7);
+    const env = calibrateDepth(c.xs, c.ys, c.xs.length, 60)!;
+    expect(env[0]).toBeGreaterThan(20);
+    expect(calibrateDepthAnchored(xs, ys, xs.length, 5)![1]).toBe(5);
+    expect(calibrateDepthAnchored([], [], 0, 10)).toBeNull();
+    // Fewer than two usable bins: the envelope supplies the slope, a stays 0.
+    const few = { xs: [0.5, 0.5, 0.5, 0.5, 0.51], ys: [6, 6, 6, 6, 6] };
+    expect(calibrateDepthAnchored(few.xs, few.ys, 5, 60)).toEqual([0, calibrateDepth(few.xs, few.ys, 5, 60)![1]]);
+  });
+
+  it('strength caps how deep a view carves, not the scale of its map', () => {
+    // Front + a full side view: the hull is a cube, the map a ramp spanning the full extent along x.
+    const full = maskOf(20, 20, () => true);
+    const size: [number, number, number] = [20, 20, 20];
+    const views = [view('front', full), view('left', maskOf(20, 20, (x) => x > 10))]; // the side shows only the near half
+    const grid = createGrid(size, 20, 2);
+    const hull = () => buildHull(views, { size, depthFrom: 'side' }, grid, { hull: 'strict', tolerance: 0 });
+    const proj = viewProjection(views[0], size);
+    const ramp: DepthMap = { width: 20, height: 20, data: Float32Array.from({ length: 400 }, (_, i) => 1 - (i % 20) / 19) };
+    const rect = { x0: 0, y0: 0, x1: 20, y1: 20 };
+    const surface = (strength: number) => {
+      const f = hull();
+      const t = carveTargets(f, grid, proj, full, { depth: ramp, rect }, { strength, fit: 'object', halfExtent: 10, calibration: 'anchored' });
+      applyCarve(f, grid, proj, t);
+      // First surface along the front rays of the far-right column (d = 0: the deepest).
+      const [nx, ny, nz] = grid.dims;
+      const a = nx - 4, b = Math.floor(ny / 2);
+      const out = new Float64Array(2);
+      expect(rayCrossings(f, a + nx * (b + ny * (nz - 1)), -nx * ny, nz, 0.5, out)).toBe(true);
+      return rayTToWorld(grid, proj, out[0]);
+    };
+    // The side view says the object fills z ∈ [0, 10] only... its hull entries are flat there, so the anchored
+    // slope comes from the hull midpoint cap: with strength 1 the deepest ray is carved to the interval middle.
+    const s1 = surface(1), s05 = surface(0.5);
+    expect(s1).toBeLessThan(s05 + 1e-6);
+    expect(s05).toBeGreaterThanOrEqual(10 - 5 - 1); // half strength: at most half the extent deep (k·2E = 5)
+  });
+
+  it('applyCarve reports carved / blocked and never goes below the guard', () => {
+    const { field, grid, proj, mask, rect } = setup();
+    const t = carveTargets(field, grid, proj, mask, { depth: constant(20, 20, 0), rect }, { strength: 1, fit: 'object', halfExtent: 10, calibrate: false });
+    const nx = grid.dims[0], ny = grid.dims[1];
+    const center = new Float32Array(nx * ny), half = new Float32Array(nx * ny);
+    const zBox = new Float32Array(grid.dims[2]).fill(1);
+    // Guard one column fully along Z.
+    const gi = Math.floor(nx / 2), gj = Math.floor(ny / 2);
+    center[gi + nx * gj] = (grid.dims[2] - 1) / 2;
+    half[gi + nx * gj] = grid.dims[2];
+    const guard = new GuardField(grid, center, half, zBox, 1);
+    const plain = field.slice();
+    const stats = applyCarve(plain, grid, proj, t);
+    expect(stats.blocked).toBe(0);
+    expect(stats.carved).toBeGreaterThan(0);
+    const guarded = field.slice();
+    const gs = applyCarve(guarded, grid, proj, t, guard);
+    expect(gs.blocked).toBeGreaterThan(0);
+    expect(gs.carved).toBe(stats.carved - gs.blocked);
+    // Every blocked voxel of a fully guarded column lies deep inside the tube.
+    expect(gs.deep).toBe(gs.blocked);
+    for (let k = 0; k < grid.dims[2]; k++) {
+      const p = gi + nx * (gj + ny * k);
+      expect(guarded[p]).toBeGreaterThanOrEqual(Math.min(field[p], guard.value(gi, gj, k)) - 1e-6);
+    }
+    // A dry run reports the same stats and leaves the field untouched.
+    const untouched = field.slice();
+    expect(applyCarve(untouched, grid, proj, t, guard, true)).toEqual(gs);
+    expect(untouched).toEqual(field);
+    // A tube the carve only grazes: blocked at the rim, not deep.
+    half[gi + nx * gj] = 0.4;
+    const grazed = field.slice();
+    const rim = applyCarve(grazed, grid, proj, t, guard);
+    expect(rim.deep).toBe(0);
+    expect(rim.blocked).toBeLessThanOrEqual(gs.blocked);
   });
 });

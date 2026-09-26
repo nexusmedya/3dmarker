@@ -6,7 +6,7 @@
  * index i + nx·(j + ny·k) and its centre at origin + (i, j, k)·spacing. The
  * outermost layer is kept at 0 so the extracted surface is always closed.
  */
-import type { Axis } from './types';
+import type { Axis, CutFlags, HullBack } from './types';
 import type { ObjectBox, PreparedView, ViewProjection } from './frame';
 import { viewProjection } from './frame';
 import { dilateMask, SummedArea } from './silhouette';
@@ -38,9 +38,10 @@ export function createGrid(size: readonly [number, number, number], resolution: 
 /**
  * Coverage of every voxel column of a view: the mean of `silhouette` over
  * the voxel's footprint in the image, for the (ua, va) plane of the grid
- * (index a + dims[ua]·b).
+ * (index a + dims[ua]·b). Footprints beyond an edge flagged in `unknown`
+ * (the silhouette is cut off there) count as foreground.
  */
-export function coverageTable(proj: ViewProjection, grid: Grid, silhouette: SummedArea): Float32Array {
+export function coverageTable(proj: ViewProjection, grid: Grid, silhouette: SummedArea, unknown?: CutFlags): Float32Array {
   const nu = grid.dims[proj.ua], nv = grid.dims[proj.va];
   const s = grid.spacing, h = s / 2;
   const u0 = new Float64Array(nu), u1 = new Float64Array(nu);
@@ -58,13 +59,14 @@ export function coverageTable(proj: ViewProjection, grid: Grid, silhouette: Summ
     v1[b] = Math.max(p, q);
   }
   const out = new Float32Array(nu * nv);
+  const flags = unknown && (unknown.top || unknown.bottom || unknown.left || unknown.right) ? unknown : undefined;
   for (let b = 0; b < nv; b++)
-    for (let a = 0; a < nu; a++) out[a + nu * b] = silhouette.coverage(u0[a], v0[b], u1[a], v1[b]);
+    for (let a = 0; a < nu; a++) out[a + nu * b] = silhouette.coverage(u0[a], v0[b], u1[a], v1[b], flags);
   return out;
 }
 
 /** Fraction of each voxel's extent along `axis` inside [−half, half]. */
-function extentCoverage(grid: Grid, axis: Axis, half: number): Float32Array {
+export function extentCoverage(grid: Grid, axis: Axis, half: number): Float32Array {
   const n = grid.dims[axis], s = grid.spacing;
   const out = new Float32Array(n);
   for (let i = 0; i < n; i++) {
@@ -79,6 +81,8 @@ export interface HullOptions {
   hull: 'strict' | 'tolerant';
   /** Dilation of non-front views in tolerant mode, fraction of the view's longest bbox side. */
   tolerance: number;
+  /** Whether the back silhouette is intersected into the XY plane (it mirrors the front's). Default 'exclude'. */
+  hullBack?: HullBack;
 }
 
 /** Silhouette dilation radius (pixels) used for a view. */
@@ -88,12 +92,24 @@ export function dilationRadius(view: PreparedView, o: HullOptions): number {
   return o.tolerance * Math.max(x1 - x0, y1 - y0);
 }
 
+/** The three silhouette planes of the hull (front/back: XY, left/right: ZY, top/bottom: XZ) and which ones a view bounded. */
+export interface HullPlanes {
+  xy: Float32Array;
+  zy: Float32Array;
+  xz: Float32Array;
+  hasZY: boolean;
+  hasXZ: boolean;
+}
+
 /**
  * Soft visual hull: occupancy = min over views of the silhouette coverage of
  * the voxel's projection. Orthographic projections are separable, so each
  * view is a 2D table over one grid plane (front/back: XY, left/right: ZY,
  * top/bottom: XZ), clipped to the object box (which alone bounds Z for a
- * front/back-only set).
+ * front/back-only set). Only trusted ('full') views enter; the back's
+ * silhouette is skipped unless `hullBack: 'intersect'` (for a rigid object it
+ * mirrors the front's and can only carve where the two drawings disagree);
+ * a view's rows / columns beyond a cut image edge are unknown, not empty.
  */
 export function buildHull(views: PreparedView[], box: ObjectBox, grid: Grid, o: HullOptions): Float32Array {
   return drain(buildHullSteps(views, box, grid, o));
@@ -101,15 +117,26 @@ export function buildHull(views: PreparedView[], box: ObjectBox, grid: Grid, o: 
 
 /** buildHull as cooperative steps (a yield per view and per Z slab). */
 export function* buildHullSteps(views: PreparedView[], box: ObjectBox, grid: Grid, o: HullOptions): Steps<Float32Array> {
+  return (yield* buildHullPlanesSteps(views, box, grid, o)).field;
+}
+
+/** buildHullSteps that also returns the silhouette planes (for the thin-part guard). */
+export function* buildHullPlanesSteps(views: PreparedView[], box: ObjectBox, grid: Grid, o: HullOptions): Steps<{ field: Float32Array; planes: HullPlanes }> {
   const [nx, ny, nz] = grid.dims;
   const xy = new Float32Array(nx * ny).fill(1);
   const zy = new Float32Array(nz * ny).fill(1);
   const xz = new Float32Array(nx * nz).fill(1);
+  let hasZY = false, hasXZ = false;
+  const hullBack = o.hullBack ?? 'exclude';
   for (const view of views) {
+    if (view.trust !== 'full') continue;
+    if (view.id === 'back' && hullBack === 'exclude') continue;
     const r = dilationRadius(view, o);
     const sil = new SummedArea(r > 0 ? dilateMask(view.mask, r) : view.mask);
-    const table = coverageTable(viewProjection(view, box.size), grid, sil);
+    const table = coverageTable(viewProjection(view, box.size), grid, sil, view.id === 'front' ? undefined : view.cut);
     const plane = view.id === 'front' || view.id === 'back' ? xy : view.id === 'left' || view.id === 'right' ? zy : xz;
+    if (plane === zy) hasZY = true;
+    else if (plane === xz) hasXZ = true;
     for (let i = 0; i < plane.length; i++) if (table[i] < plane[i]) plane[i] = table[i];
     yield;
   }
@@ -137,7 +164,7 @@ export function* buildHullSteps(views: PreparedView[], box: ObjectBox, grid: Gri
     }
   }
   clearBorder(field, grid.dims);
-  return field;
+  return { field, planes: { xy, zy, xz, hasZY, hasXZ } };
 }
 
 /** Zero the outermost voxel layer (keeps the iso-surface closed). */
