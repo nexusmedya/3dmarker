@@ -4,7 +4,7 @@
  * arm towards +X), its true joint positions, and fake BlazePose landmarks of
  * it seen from the front.
  */
-import { BoxGeometry, BufferGeometry, CapsuleGeometry, Group, Mesh, MeshStandardMaterial, SphereGeometry } from 'three';
+import { BoxGeometry, BufferGeometry, CapsuleGeometry, Group, Mesh, MeshStandardMaterial, Quaternion, SphereGeometry, Vector3 } from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { Mask } from '../core/types';
 import { POSE, type Landmark, type PoseResult } from '../core/human/types';
@@ -137,4 +137,105 @@ export function fakePose(joints: JointLayout, overrides: Partial<Record<number, 
   put(POSE.rightFootIndex, joints.RightToeBase && { x: joints.RightToeBase.x, y: -0.985 });
   for (const [i, p] of Object.entries(overrides)) put(Number(i), p);
   return { landmarks: lm, box: { x: PX.x0, y: PX.y0, width: PX.w, height: PX.h } };
+}
+
+// ---------------------------------------------------------------------------
+// Animals (side view: the body along X, feet on y = -1)
+
+export interface AnimalFixture {
+  mesh: Mesh;
+  /** Ground-truth landmarks (model units). */
+  truth: Record<string, { x: number; y: number; z: number }>;
+}
+
+function capsuleBetween(parts: BufferGeometry[], r: number, a: [number, number, number], b: [number, number, number], seg: (n: number) => number): void {
+  const [ax, ay, az] = a, [bx, by, bz] = b;
+  const len = Math.hypot(bx - ax, by - ay, bz - az);
+  // Enough rings along the length that no triangle spans a whole limb (skin smoothing follows the edges).
+  const g = new CapsuleGeometry(r, Math.max(len, 1e-3), seg(4), seg(12), Math.max(1, Math.round(len * 12)));
+  // Capsules are built along +Y: rotate onto a → b.
+  const dir = new Vector3(bx - ax, by - ay, bz - az).normalize();
+  g.applyQuaternion(new Quaternion().setFromUnitVectors(new Vector3(0, 1, 0), dir));
+  g.translate((ax + bx) / 2, (ay + by) / 2, (az + bz) / 2);
+  parts.push(g);
+}
+
+/**
+ * A dog seen from the side, facing +X (head at +X, tail at -X): torso
+ * capsule, neck, head sphere + snout, ears, four legs, a tail rising
+ * backwards. 2.4 units long, ~1.5 tall, feet at y = -1.
+ */
+export function makeDog(detail = 1, facing: 1 | -1 = 1): AnimalFixture {
+  const seg = (n: number) => Math.max(3, Math.round(n * detail));
+  const parts: BufferGeometry[] = [];
+  const f = facing;
+  const P = (x: number, y: number, z = 0): [number, number, number] => [f * x, y, z];
+  capsuleBetween(parts, 0.2, P(-0.5, -0.2), P(0.45, -0.18), seg); // torso, y ≈ -0.4 .. 0.02
+  capsuleBetween(parts, 0.1, P(0.45, -0.12), P(0.62, 0.15), seg); // neck
+  const head = new SphereGeometry(0.15, seg(16), seg(12));
+  head.translate(f * 0.68, 0.22, 0);
+  parts.push(head);
+  capsuleBetween(parts, 0.06, P(0.72, 0.18), P(0.95, 0.12), seg); // snout
+  for (const z of [0.07, -0.07]) capsuleBetween(parts, 0.03, P(0.64, 0.3, z), P(0.6, 0.44, z * 1.3), seg); // ears
+  for (const z of [0.1, -0.1]) {
+    capsuleBetween(parts, 0.055, P(0.38, -0.3, z), P(0.38, -0.95, z), seg); // front legs
+    capsuleBetween(parts, 0.06, P(-0.42, -0.3, z), P(-0.4, -0.95, z), seg); // hind legs
+  }
+  capsuleBetween(parts, 0.04, P(-0.62, -0.15), P(-1.0, 0.1), seg); // tail
+  const merged = mergeGeometries(parts.map((g) => g.index ? g.toNonIndexed() : g), false)!;
+  parts.forEach((g) => g.dispose());
+  const mesh = new Mesh(merged, new MeshStandardMaterial());
+  mesh.name = 'dog';
+  const j = (x: number, y: number, z = 0) => ({ x: f * x, y, z });
+  return {
+    mesh,
+    truth: { head: j(0.68, 0.22), nose: j(0.98, 0.12), hips: j(-0.42, -0.2), chest: j(0.38, -0.18), frontFoot: j(0.38, -0.95), hindFoot: j(-0.4, -0.95), tailTip: j(-1.03, 0.12) },
+  };
+}
+
+/** A bird from the side facing +X: body, neck, head + beak, tail, folded wings, two thin legs. */
+export function makeBird(detail = 1): AnimalFixture {
+  const seg = (n: number) => Math.max(3, Math.round(n * detail));
+  const parts: BufferGeometry[] = [];
+  const body = new SphereGeometry(0.35, seg(20), seg(14));
+  body.scale(1.3, 0.85, 0.8);
+  body.translate(0, 0, 0);
+  parts.push(body);
+  capsuleBetween(parts, 0.1, [0.3, 0.15, 0], [0.42, 0.45, 0], seg); // neck
+  const head = new SphereGeometry(0.14, seg(14), seg(10));
+  head.translate(0.46, 0.55, 0);
+  parts.push(head);
+  capsuleBetween(parts, 0.035, [0.56, 0.54, 0], [0.75, 0.5, 0], seg); // beak
+  capsuleBetween(parts, 0.07, [-0.4, 0.05, 0], [-0.75, 0.1, 0], seg); // tail
+  for (const z of [0.2, -0.2]) capsuleBetween(parts, 0.05, [0.2, 0.15, z], [-0.45, 0.05, z], seg); // folded wings
+  for (const z of [0.08, -0.08]) {
+    capsuleBetween(parts, 0.025, [0.0, -0.25, z], [0.0, -0.95, z], seg); // legs
+    capsuleBetween(parts, 0.02, [0.0, -0.97, z], [0.12, -0.97, z], seg); // toes
+  }
+  const merged = mergeGeometries(parts.map((g) => g.index ? g.toNonIndexed() : g), false)!;
+  parts.forEach((g) => g.dispose());
+  const mesh = new Mesh(merged, new MeshStandardMaterial());
+  mesh.name = 'bird';
+  return { mesh, truth: { head: { x: 0.46, y: 0.55, z: 0 }, beak: { x: 0.78, y: 0.5, z: 0 }, foot: { x: 0, y: -0.95, z: 0 }, tailTip: { x: -0.78, y: 0.1, z: 0 } } };
+}
+
+/** A snake lying along X (head at +X, thicker there), slightly wavy. */
+export function makeSnake(detail = 1): AnimalFixture {
+  const seg = (n: number) => Math.max(3, Math.round(n * detail));
+  const parts: BufferGeometry[] = [];
+  const n = 12;
+  for (let i = 0; i < n; i++) {
+    const x0 = -1.2 + (2.2 * i) / n, x1 = -1.2 + (2.2 * (i + 1)) / n;
+    const r = 0.04 + 0.05 * (i / n);
+    capsuleBetween(parts, r, [x0, -0.9, 0.1 * Math.sin(i)], [x1, -0.9, 0.1 * Math.sin(i + 1)], seg);
+  }
+  const head = new SphereGeometry(0.13, seg(14), seg(10));
+  head.scale(1.4, 0.8, 1);
+  head.translate(1.12, -0.9, 0.1 * Math.sin(n));
+  parts.push(head);
+  const merged = mergeGeometries(parts.map((g) => g.index ? g.toNonIndexed() : g), false)!;
+  parts.forEach((g) => g.dispose());
+  const mesh = new Mesh(merged, new MeshStandardMaterial());
+  mesh.name = 'snake';
+  return { mesh, truth: { head: { x: 1.12, y: -0.9, z: 0 }, tailTip: { x: -1.24, y: -0.9, z: 0 } } };
 }

@@ -18,7 +18,7 @@ const byId = new Map(library.map((c) => [c.info.id, c]));
 
 /** World joint positions of a fresh skeleton posed by `clip` at `t` seconds. */
 function poseAt(l: JointLayout, clip: AnimationClip, t: number): Record<HumanoidBone, Vector3> {
-  const sk: RigSkeleton = buildSkeleton(l);
+  const sk: RigSkeleton<HumanoidBone> = buildSkeleton(l);
   const mixer = new AnimationMixer(sk.root);
   mixer.clipAction(clip).play();
   mixer.setTime(t);

@@ -23,13 +23,14 @@ export interface RestTransform {
   quaternion: [number, number, number, number];
 }
 
-export interface RigSkeleton {
-  /** The Hips bone (root of the hierarchy). */
+export interface RigSkeleton<N extends string = string> {
+  /** The root bone (Hips for humanoids). */
   root: Bone;
   /** Bones in skeleton order (parents first); index = skin index. */
   bones: Bone[];
-  names: HumanoidBone[];
-  byName: Map<HumanoidBone, Bone>;
+  /** Bone names (humanoid bones for buildSkeleton, any names for a generic SkeletonSpec). */
+  names: N[];
+  byName: Map<N, Bone>;
   skeleton: Skeleton;
 }
 
@@ -68,7 +69,7 @@ export function describeRig(layout: JointLayout): RigDescriptor {
 }
 
 /** Build the bone hierarchy in its rest pose (see the module comment). Throws if a core joint is missing. */
-export function buildSkeleton(layout: JointLayout): RigSkeleton {
+export function buildSkeleton(layout: JointLayout): RigSkeleton<HumanoidBone> {
   const missing = missingBones(layout);
   if (missing.length) throw new Error(`Joint layout is missing: ${missing.join(', ')}`);
   const names = bonesOfLayout(layout);
@@ -92,8 +93,9 @@ export function buildSkeleton(layout: JointLayout): RigSkeleton {
 }
 
 /** Move the joints of an existing skeleton to a new layout (rest pose), keeping the bone objects. */
-export function applyLayout(rig: RigSkeleton, layout: JointLayout): void {
-  for (const name of rig.names) {
+export function applyLayout(rig: RigSkeleton<string>, layout: JointLayout): void {
+  for (const n of rig.names) {
+    const name = n as HumanoidBone;
     const p = layout[name];
     if (!p) continue;
     const parent = parentOf(name);
@@ -106,7 +108,7 @@ export function applyLayout(rig: RigSkeleton, layout: JointLayout): void {
   }
 }
 
-function storeRest(bone: Bone): void {
+export function storeRest(bone: Bone): void {
   const rest: RestTransform = { position: bone.position.toArray() as RestTransform['position'], quaternion: [0, 0, 0, 1] };
   bone.userData.rest = rest;
 }
@@ -125,7 +127,8 @@ export function resetToRest(root: Object3D): void {
 /** The layout a skeleton currently has (from its rest transforms). */
 export function layoutOf(rig: RigSkeleton): JointLayout {
   const out: JointLayout = {};
-  for (const name of rig.names) {
+  for (const n of rig.names) {
+    const name = n as HumanoidBone;
     const rest = (rig.byName.get(name)!.userData as { rest: RestTransform }).rest;
     const parent = parentOf(name);
     const base = parent ? out[parent]! : { x: 0, y: 0, z: 0 };
@@ -135,7 +138,8 @@ export function layoutOf(rig: RigSkeleton): JointLayout {
 }
 
 export interface BoneSegment {
-  bone: HumanoidBone;
+  /** Bone name (a HumanoidBone for humanoid rigs). */
+  bone: string;
   /** Skin index (position in the skeleton's bone list). */
   index: number;
   head: Vector3;
@@ -147,7 +151,7 @@ export interface BoneSegment {
  * primary child). End bones have none; bones without a child (hands without
  * fingers, toes, last finger joints) extend their parent's direction.
  */
-export function boneSegments(names: HumanoidBone[], layout: JointLayout): BoneSegment[] {
+export function boneSegments(names: readonly HumanoidBone[], layout: JointLayout): BoneSegment[] {
   const present = new Set(names);
   const out: BoneSegment[] = [];
   const height = Math.max(1e-3, (layout.HeadTop_End?.y ?? 1) - Math.min(layout.LeftFoot?.y ?? 0, layout.RightFoot?.y ?? 0));

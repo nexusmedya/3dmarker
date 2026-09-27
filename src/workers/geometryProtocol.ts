@@ -12,7 +12,6 @@ import { LocalizedError } from '../core/errors';
 import type { I18nText, Progress } from '../core/types';
 import type { FusionInfo, FusionOptions, FusionViewInput } from '../core/fusion/types';
 import type { SkinningOptions, SkinWeights } from '../rig/skinning';
-import type { HumanoidBone } from '../rig/types';
 import type { FusionDepthSpec, InferJob } from './fusionDepth';
 import type { MlProgress } from './mlProtocol';
 
@@ -26,7 +25,8 @@ export interface SerializedError {
 
 /** Plain bone segment (BoneSegment without three's Vector3). */
 export interface SegmentPayload {
-  bone: HumanoidBone;
+  /** Bone name (any skeleton: humanoid, animal templates, custom). */
+  bone: string;
   index: number;
   head: { x: number; y: number; z: number };
   tail: { x: number; y: number; z: number };

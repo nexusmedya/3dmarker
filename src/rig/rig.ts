@@ -1,12 +1,21 @@
 /**
  * Rig a built model in place: every plain mesh under `model.object` is
  * swapped for a SkinnedMesh sharing a CLONED geometry (plus skinIndex /
- * skinWeight) and the original material, the Hips bone is added to
+ * skinWeight) and the original material, the root bone is added to
  * `model.object`, and the viewer is told to rescan. When `model.object` is
  * itself a mesh (depth / geometry models) it cannot be swapped (the viewer
  * and the shell hold it), so it keeps its place with an empty placeholder
  * geometry (flagged `userData.rigPlaceholder`; renders nothing, skipped by
  * the exporters) and the skinned copy becomes its child.
+ *
+ * Any skeleton works (a SkeletonSpec: humanoid, quadruped, bird, snake,
+ * custom — ./templates.ts); a humanoid JointLayout is turned into its spec.
+ * The handle keeps the spec, the current skin weights and the humanoid
+ * view (`layout` / `descriptor`) while the spec still is a humanoid.
+ * `setSpec` applies editor changes: rest moves re-bind in place, structural
+ * edits (add / delete / rename / reparent) rebuild the bones and carry the
+ * weights over by name; re-weighting (all bones or some) runs in the
+ * geometry worker and a newer change supersedes an older one.
  *
  * `unrig()` restores the original meshes / geometry and disposes the skinned
  * clones; `dispose()` is for a model the viewer already dropped (it only
@@ -20,12 +29,17 @@ import { LocalizedError } from '../core/errors';
 import { AbortError, type I18nText, type Progress } from '../core/types';
 import { yieldToPaint } from '../core/yield';
 import { autoPlaceJointsDetailed, completeLayout } from './autoJoints';
+import { bonesOfLayout } from './bones';
 import { buildContactSample } from './contact';
 import { collectMeshData, isRigPlaceholder, RIG_PLACEHOLDER, skinnableMeshes, type MeshData } from './meshData';
-import { applyLayout, boneSegments, buildSkeleton, describeRig, missingBones, resetToRest, type RigDescriptor, type RigSkeleton } from './skeleton';
+import { describeRig, missingBones, resetToRest, type RigDescriptor, type RigSkeleton } from './skeleton';
 import type { SkinningOptions, SkinWeights } from './skinning';
+import {
+  applySpecRest, buildSkeletonFromSpec, cloneSpec, effectiveTemplate, humanoidLayoutOf, humanoidSpecFromLayout, remapContact, remapWeights,
+  sameTopology, segmentsOfSpec, validateSpec, type SpecDescriptor,
+} from './spec';
 import { createSkinWeigher, type SkinWeigher } from './weigher';
-import type { HumanoidBone, JointLayout, Vec3 } from './types';
+import type { HumanoidBone, JointLayout, SkeletonSpec, TemplateId, Vec3 } from './types';
 
 /** The part of ViewerCore the rig uses (structural, so tests can pass a fake). */
 export interface RigViewer {
@@ -48,10 +62,14 @@ export const RIG_TEXT = {
   weights: { tr: 'Deri ağırlıkları hesaplanıyor…', en: 'Computing skin weights…' },
   preparing: { tr: 'Mesh hazırlanıyor…', en: 'Preparing the mesh…' },
   binding: { tr: 'İskelet bağlanıyor…', en: 'Binding the skeleton…' },
+  notHumanoid: { tr: 'Bu iskelet insansı değil.', en: 'This skeleton is not a humanoid.' },
+  invalid: { tr: 'İskelet geçersiz: {why}', en: 'Invalid skeleton: {why}' },
 } satisfies Record<string, I18nText>;
 
 export interface RigOptions {
-  /** Joint positions (model.object's frame); default: autoPlaceJoints heuristic. */
+  /** Any skeleton (wins over `layout`). */
+  spec?: SkeletonSpec;
+  /** Humanoid joint positions (model.object's frame); default: autoPlaceJoints heuristic. */
   layout?: JointLayout;
   /** Triangles of the model collected beforehand (e.g. by autoPlaceJoints). */
   meshData?: MeshData;
@@ -60,28 +78,69 @@ export interface RigOptions {
   onProgress?: (p: Progress) => void;
 }
 
+export interface EditOptions {
+  signal?: AbortSignal;
+  onProgress?: (p: Progress) => void;
+}
+
+export interface SpecUpdateOptions extends EditOptions {
+  /**
+   * 'none' (default): keep the weights (carried over by name after
+   * structural edits; re-bind only); 'all': recompute every weight; a list
+   * of bone names: automatic weights for those bones only, the others keep
+   * theirs (scaled to fill the rest).
+   */
+  reweigh?: 'all' | 'none' | string[];
+  /** Old name → new name of renamed bones (keeps their weights). */
+  renamed?: Record<string, string>;
+  /** Weights to apply with the spec (undo / redo); wins over `reweigh`. */
+  weights?: SkinWeights;
+}
+
 export interface RigHandle {
   readonly root: Object3D;
+  /** Current skeleton / bones / helper (replaced by structural edits). */
   readonly skeleton: Skeleton;
-  readonly bones: Map<HumanoidBone, Bone>;
+  readonly bones: Map<string, Bone>;
   readonly helper: SkeletonHelper;
   readonly meshes: SkinnedMesh[];
-  /** Current rest layout. */
+  /** Template of the current skeleton (a humanoid edited out of shape becomes 'custom'). */
+  readonly template: TemplateId;
+  /** Current skeleton (rest pose). */
+  readonly spec: SkeletonSpec;
+  /** True while the skeleton still is a humanoid (humanoid clips, imports, joint editor). */
+  readonly isHumanoid: boolean;
+  /** Current humanoid rest layout ({} for other skeletons). */
   readonly layout: JointLayout;
+  /** Humanoid clip-building data; throws for a non-humanoid skeleton (check `isHumanoid`). */
   readonly descriptor: RigDescriptor;
+  /** Generic clip-building data (any skeleton). */
+  readonly generic: SpecDescriptor;
+  /** Current skin weights (input vertex order of `surface`). */
+  readonly weights: SkinWeights;
+  /** The skinned surface in the rest pose (root frame): positions and triangles. */
+  readonly surface: { positions: Float32Array; index: Uint32Array };
+  /** Increments on every applied change of the skeleton or the weights. */
+  readonly version: number;
   readonly disposed: boolean;
   setSkeletonVisible(visible: boolean): void;
   readonly skeletonVisible: boolean;
   /** Back to the bind (T-) pose. */
   restPose(): void;
   /**
-   * Move one joint (model frame) and re-bind + re-weight. Children keep their positions.
+   * Move one humanoid joint (model frame) and re-bind + re-weight. Children keep their positions.
    * Resolves true when this edit was applied, false when a newer edit superseded it (the
    * newer one includes this patch: edits accumulate until one is applied). Rejects with
    * AbortError when `signal` aborts.
    */
-  setJoint(bone: HumanoidBone, pos: Vec3, opts?: { signal?: AbortSignal; onProgress?: (p: Progress) => void }): Promise<boolean>;
-  setJoints(patch: JointLayout, opts?: { signal?: AbortSignal; onProgress?: (p: Progress) => void }): Promise<boolean>;
+  setJoint(bone: HumanoidBone, pos: Vec3, opts?: EditOptions): Promise<boolean>;
+  setJoints(patch: JointLayout, opts?: EditOptions): Promise<boolean>;
+  /** Apply an edited skeleton (see SpecUpdateOptions). Resolves false when superseded. */
+  setSpec(spec: SkeletonSpec, opts?: SpecUpdateOptions): Promise<boolean>;
+  /** Replace the skin weights (weight painting). */
+  setWeights(weights: SkinWeights): void;
+  /** Automatic weights for a spec (default: the current one) without applying them. */
+  autoWeights(spec?: SkeletonSpec, opts?: EditOptions): Promise<SkinWeights>;
   /** Restore the original meshes and free the rig. */
   unrig(): void;
   /** Free what the rig holds without touching the (already discarded) model. */
@@ -130,6 +189,13 @@ const emptyGeometry = () => {
   return g;
 };
 
+function invalid(spec: SkeletonSpec): LocalizedError | null {
+  const errs = validateSpec(spec);
+  if (!errs.length) return null;
+  const why = errs.slice(0, 3).join('; ');
+  return new LocalizedError({ tr: RIG_TEXT.invalid.tr.replace('{why}', why), en: RIG_TEXT.invalid.en.replace('{why}', why) });
+}
+
 export async function rigModel(core: RigViewer | null, model: BuiltModel, opts: RigOptions = {}): Promise<RigHandle> {
   const { signal, onProgress } = opts;
   const root = model.object;
@@ -147,29 +213,36 @@ export async function rigModel(core: RigViewer | null, model: BuiltModel, opts: 
   // Yield between the heavy synchronous steps so the page paints and cancel takes effect.
   await yieldToPaint();
   check();
-  let layout = opts.layout;
-  if (!layout || missingBones(layout).length) {
-    const auto = autoPlaceJointsDetailed(root, { meshData: data });
-    layout = layout ? completeLayout(layout, auto.heuristic) : auto.layout;
-    await yieldToPaint();
-    check();
+  let spec: SkeletonSpec;
+  if (opts.spec) {
+    const bad = invalid(opts.spec);
+    if (bad) throw bad;
+    spec = cloneSpec(opts.spec);
+    spec.template = effectiveTemplate(spec);
+  } else {
+    let layout = opts.layout;
+    if (!layout || missingBones(layout).length) {
+      const auto = autoPlaceJointsDetailed(root, { meshData: data });
+      layout = layout ? completeLayout(layout, auto.heuristic) : auto.layout;
+      await yieldToPaint();
+      check();
+    }
+    spec = humanoidSpecFromLayout(layout);
   }
-  const rig = buildSkeleton(layout);
+  const rig = buildSkeletonFromSpec(spec);
   // Welding, adjacency, BVH and the weights run in the geometry worker when there is one.
   const weigher = await createSkinWeigher(data.positions, data.index, signal);
 
-  const weigh = async (lay: JointLayout, sig?: AbortSignal, prog?: (p: Progress) => void) => {
-    const segs = boneSegments(rig.names, lay);
-    return weigher.weigh(segs, {
+  const weigh = (s: SkeletonSpec, sig?: AbortSignal, prog?: (p: Progress) => void) =>
+    weigher.weigh(segmentsOfSpec(s), {
       ...opts.skinning,
       signal: sig,
       onProgress: (r) => prog?.({ label: RIG_TEXT.weights, ratio: r }),
     });
-  };
   let weights: SkinWeights;
   try {
     check();
-    weights = await weigh(layout, signal, onProgress);
+    weights = await weigh(spec, signal, onProgress);
     check();
   } catch (e) {
     weigher.dispose();
@@ -213,25 +286,34 @@ export async function rigModel(core: RigViewer | null, model: BuiltModel, opts: 
     swaps.push({ original, skinned, material, inPlace, placeholder, originalGeometry, start: range.start, count: n });
   }
 
-  // Bones first among the root's children: name lookups (animation binding) find them before any same-named node.
-  root.add(rig.root);
-  root.children.splice(root.children.indexOf(rig.root), 1);
-  root.children.unshift(rig.root);
+  attachBones(root, rig.root);
   root.updateMatrixWorld(true);
   rig.skeleton.calculateInverses();
   for (const s of swaps) s.skinned.bind(rig.skeleton, s.skinned.matrixWorld);
 
-  const helper = new SkeletonHelper(root);
-  helper.name = 'rig-skeleton';
-  const mat = helper.material as Material & { depthTest: boolean; linewidth?: number };
-  mat.depthTest = false;
-  helper.renderOrder = 998;
+  const helper = makeHelper(root);
   const savedRemesh = model.remesh;
   model.remesh = null;
   core?.rescanObject ? core.rescanObject() : core?.refresh();
   core?.invalidate();
 
-  return createHandle(core, model, rig, swaps, helper, weigher, weigh, layout, savedRemesh, data.positions, weights);
+  return createHandle({ core, model, rig, swaps, helper, weigher, weigh, spec, savedRemesh, data, weights });
+}
+
+/** Bones first among the root's children: name lookups (animation binding) find them before any same-named node. */
+function attachBones(root: Object3D, bone: Bone): void {
+  root.add(bone);
+  root.children.splice(root.children.indexOf(bone), 1);
+  root.children.unshift(bone);
+}
+
+function makeHelper(root: Object3D): SkeletonHelper {
+  const helper = new SkeletonHelper(root);
+  helper.name = 'rig-skeleton';
+  const mat = helper.material as Material & { depthTest: boolean; linewidth?: number };
+  mat.depthTest = false;
+  helper.renderOrder = 998;
+  return helper;
 }
 
 /** Put `next` where `prev` is among its parent's children (same index). */
@@ -243,29 +325,88 @@ function replaceChild(parent: Object3D, prev: Object3D, next: Object3D): void {
   parent.children.splice(Math.max(0, i), 0, next);
 }
 
-function createHandle(
-  core: RigViewer | null,
-  model: BuiltModel,
-  rig: RigSkeleton,
-  swaps: Swap[],
-  helper: SkeletonHelper,
-  weigher: SkinWeigher,
-  weigh: (layout: JointLayout, signal?: AbortSignal, onProgress?: (p: Progress) => void) => Promise<SkinWeights>,
-  initialLayout: JointLayout,
-  savedRemesh: BuiltModel['remesh'],
-  positions: Float32Array,
-  initialWeights: SkinWeights,
-): RigHandle {
+interface HandleInit {
+  core: RigViewer | null;
+  model: BuiltModel;
+  rig: RigSkeleton;
+  swaps: Swap[];
+  helper: SkeletonHelper;
+  weigher: SkinWeigher;
+  weigh: (spec: SkeletonSpec, signal?: AbortSignal, onProgress?: (p: Progress) => void) => Promise<SkinWeights>;
+  spec: SkeletonSpec;
+  savedRemesh: BuiltModel['remesh'];
+  data: MeshData;
+  weights: SkinWeights;
+}
+
+/**
+ * Automatic weights for `bones` only, blended into `current`: per vertex the
+ * listed bones take their automatic weights, the other bones share what is
+ * left in their current proportions.
+ */
+export function mergeBoneWeights(current: SkinWeights, auto: SkinWeights, boneIdx: ReadonlySet<number>): SkinWeights {
+  const n = current.skinIndex.length / 4;
+  const out: SkinWeights = { skinIndex: new Uint16Array(n * 4), skinWeight: new Float32Array(n * 4) };
+  const acc = new Map<number, number>();
+  for (let v = 0; v < n; v++) {
+    acc.clear();
+    let sel = 0, rest = 0;
+    for (let s = 0; s < 4; s++) {
+      const b = auto.skinIndex[v * 4 + s], w = auto.skinWeight[v * 4 + s];
+      if (w > 0 && boneIdx.has(b)) (acc.set(b, (acc.get(b) ?? 0) + w), (sel += w));
+    }
+    for (let s = 0; s < 4; s++) {
+      const b = current.skinIndex[v * 4 + s], w = current.skinWeight[v * 4 + s];
+      if (w > 0 && !boneIdx.has(b)) rest += w;
+    }
+    const scale = rest > 1e-9 ? (1 - sel) / rest : 0;
+    if (rest > 1e-9) {
+      for (let s = 0; s < 4; s++) {
+        const b = current.skinIndex[v * 4 + s], w = current.skinWeight[v * 4 + s];
+        if (w > 0 && !boneIdx.has(b)) acc.set(b, (acc.get(b) ?? 0) + w * scale);
+      }
+    }
+    if (!acc.size) {
+      // Nothing left (a vertex owned by the listed bones that the auto weights moved elsewhere): take auto as is.
+      for (let s = 0; s < 4; s++) {
+        const b = auto.skinIndex[v * 4 + s], w = auto.skinWeight[v * 4 + s];
+        if (w > 0) acc.set(b, (acc.get(b) ?? 0) + w);
+      }
+    }
+    const top = [...acc.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4);
+    const sum = top.reduce((t, e) => t + e[1], 0) || 1;
+    top.forEach(([b, w], s) => {
+      out.skinIndex[v * 4 + s] = b;
+      out.skinWeight[v * 4 + s] = w / sum;
+    });
+    if (!top.length) out.skinWeight[v * 4] = 1;
+  }
+  return out;
+}
+
+function createHandle(init: HandleInit): RigHandle {
+  const { core, model, swaps, weigher, weigh, savedRemesh, data } = init;
   const root = model.object;
-  let layout: JointLayout = structuredCloneLayout(initialLayout);
-  // Clips built from the descriptor are grounded on the skinned surface.
-  const describe = (l: JointLayout, w: SkinWeights): RigDescriptor => ({ ...describeRig(l), contact: buildContactSample(positions, w) });
-  let descriptor = describe(layout, initialWeights);
+  let rig = init.rig;
+  let helper = init.helper;
+  let spec: SkeletonSpec = cloneSpec(init.spec);
+  let weights: SkinWeights = init.weights;
+  let generic: SpecDescriptor = { spec, contact: buildContactSample(data.positions, weights) };
+  let humanLayout: JointLayout | null = humanoidLayoutOf(spec);
+  let descriptor: RigDescriptor | null = null;
   let visible = false;
   let disposed = false;
   let seq = 0;
-  /** Everything requested since the last applied edit (partial patches accumulate). */
+  let version = 0;
+  /** Humanoid joint edits requested since the last applied one (partial patches accumulate). */
   let pending: JointLayout | null = null;
+
+  const describeHuman = (): RigDescriptor | null => {
+    if (!humanLayout || spec.template !== 'humanoid') return null;
+    const d = describeRig(humanLayout);
+    return { ...d, contact: generic.contact ? remapContact(generic.contact, spec, d.bones) : undefined };
+  };
+  descriptor = describeHuman();
 
   const rebind = () => {
     resetToRest(root);
@@ -279,26 +420,7 @@ function createHandle(
     }
   };
 
-  const setJoints = async (patch: JointLayout, o: { signal?: AbortSignal; onProgress?: (p: Progress) => void } = {}): Promise<boolean> => {
-    if (disposed) return false;
-    const my = ++seq;
-    // Merge onto the not-yet-applied edits, so superseding one does not drop them.
-    const next = structuredCloneLayout(pending ?? layout);
-    for (const [b, p] of Object.entries(patch) as [HumanoidBone, Vec3][]) if (next[b] && p) next[b] = { x: p.x, y: p.y, z: p.z };
-    pending = next;
-    let w: Awaited<ReturnType<typeof weigh>>;
-    try {
-      w = await weigh(next, o.signal, o.onProgress);
-    } catch (e) {
-      if (my === seq) pending = null; // the latest edit was cancelled: forget the unapplied edits
-      throw e;
-    }
-    if (disposed || my !== seq) return false; // superseded by a newer edit (which includes this patch)
-    pending = null;
-    layout = next;
-    descriptor = describe(layout, w);
-    applyLayout(rig, layout);
-    rebind();
+  const writeWeights = (w: SkinWeights) => {
     for (const s of swaps) {
       const si = s.skinned.geometry.getAttribute('skinIndex') as BufferAttribute;
       const sw = s.skinned.geometry.getAttribute('skinWeight') as BufferAttribute;
@@ -307,8 +429,87 @@ function createHandle(
       si.needsUpdate = true;
       sw.needsUpdate = true;
     }
+  };
+
+  /** Make `next` (+ its weights) the rig's state: re-bind in place or rebuild the bones. */
+  const apply = (next: SkeletonSpec, w: SkinWeights) => {
+    next.template = effectiveTemplate(next);
+    if (sameTopology(spec, next)) {
+      applySpecRest(rig, next);
+    } else {
+      resetToRest(root);
+      const old = rig;
+      root.remove(old.root);
+      rig = buildSkeletonFromSpec(next);
+      attachBones(root, rig.root);
+      old.skeleton.dispose();
+      if (visible) core?.removeOverlay(helper);
+      helper.dispose();
+      helper = makeHelper(root);
+      if (visible) core?.addOverlay(helper);
+    }
+    spec = next;
+    weights = w;
+    rebind();
+    writeWeights(w);
+    humanLayout = humanoidLayoutOf(spec);
+    generic = { spec, contact: buildContactSample(data.positions, w) };
+    descriptor = describeHuman();
+    version++;
     helper.updateMatrixWorld(true);
     core?.invalidate();
+  };
+
+  const setJoints = async (patch: JointLayout, o: EditOptions = {}): Promise<boolean> => {
+    if (disposed) return false;
+    if (!humanLayout) throw new LocalizedError(RIG_TEXT.notHumanoid);
+    const my = ++seq;
+    // Merge onto the not-yet-applied edits, so superseding one does not drop them.
+    const next = cloneLayout(pending ?? humanLayout);
+    for (const [b, p] of Object.entries(patch) as [HumanoidBone, Vec3][]) if (next[b] && p) next[b] = { x: p.x, y: p.y, z: p.z };
+    pending = next;
+    const humanNames = new Set<string>(bonesOfLayout(next));
+    const nextSpec = humanoidSpecFromLayout(next, spec.bones.filter((b) => !humanNames.has(b.name)));
+    let w: SkinWeights;
+    try {
+      w = await weigh(nextSpec, o.signal, o.onProgress);
+    } catch (e) {
+      if (my === seq) pending = null; // the latest edit was cancelled: forget the unapplied edits
+      throw e;
+    }
+    if (disposed || my !== seq) return false; // superseded by a newer edit (which includes this patch)
+    pending = null;
+    apply(nextSpec, w);
+    return true;
+  };
+
+  const setSpec = async (nextIn: SkeletonSpec, o: SpecUpdateOptions = {}): Promise<boolean> => {
+    if (disposed) return false;
+    const bad = invalid(nextIn);
+    if (bad) throw bad;
+    const next = cloneSpec(nextIn);
+    const my = ++seq;
+    pending = null;
+    const mode = o.weights ? 'given' : o.reweigh ?? 'none';
+    let w: SkinWeights;
+    if (o.weights) w = o.weights;
+    else {
+      const carried = sameTopology(spec, next) && !o.renamed ? weights : remapWeights(weights, spec, next, o.renamed);
+      if (mode === 'none') w = carried;
+      else {
+        const auto = await weigh(next, o.signal, o.onProgress);
+        if (disposed || my !== seq) return false;
+        if (mode === 'all') w = auto;
+        else {
+          const names = new Set(mode as string[]);
+          const idx = new Set<number>();
+          next.bones.forEach((b, i) => names.has(b.name) && idx.add(i));
+          w = mergeBoneWeights(carried, auto, idx);
+        }
+      }
+    }
+    if (disposed || my !== seq) return false;
+    apply(next, w);
     return true;
   };
 
@@ -320,15 +521,41 @@ function createHandle(
 
   const handle: RigHandle = {
     root,
-    skeleton: rig.skeleton,
-    bones: rig.byName,
-    helper,
+    get skeleton() {
+      return rig.skeleton;
+    },
+    get bones() {
+      return rig.byName;
+    },
+    get helper() {
+      return helper;
+    },
     meshes: swaps.map((s) => s.skinned),
+    get template() {
+      return spec.template;
+    },
+    get spec() {
+      return spec;
+    },
+    get isHumanoid() {
+      return !!descriptor;
+    },
     get layout() {
-      return layout;
+      return descriptor && humanLayout ? humanLayout : {};
     },
     get descriptor() {
+      if (!descriptor) throw new LocalizedError(RIG_TEXT.notHumanoid);
       return descriptor;
+    },
+    get generic() {
+      return generic;
+    },
+    get weights() {
+      return weights;
+    },
+    surface: { positions: data.positions, index: data.index },
+    get version() {
+      return version;
     },
     get disposed() {
       return disposed;
@@ -354,6 +581,21 @@ function createHandle(
       return setJoints({ [bone]: pos }, o);
     },
     setJoints,
+    setSpec,
+    setWeights(w) {
+      if (disposed) return;
+      if (w.skinIndex.length !== weights.skinIndex.length) throw new Error('Weight count does not match the mesh');
+      weights = w;
+      writeWeights(w);
+      generic = { spec, contact: buildContactSample(data.positions, w) };
+      descriptor = describeHuman();
+      version++;
+      core?.invalidate();
+    },
+    autoWeights(s = spec, o = {}) {
+      if (disposed) return Promise.reject(new Error('Rig disposed'));
+      return weigh(s, o.signal, o.onProgress);
+    },
     unrig() {
       if (disposed) return;
       disposed = true;
@@ -395,14 +637,14 @@ function createHandle(
   return handle;
 }
 
-function structuredCloneLayout(l: JointLayout): JointLayout {
+function cloneLayout(l: JointLayout): JointLayout {
   const out: JointLayout = {};
   for (const [b, p] of Object.entries(l) as [HumanoidBone, Vec3][]) if (p) out[b] = { x: p.x, y: p.y, z: p.z };
   return out;
 }
 
 /** World position of a bone's joint (for markers / the joint editor). */
-export function jointWorldPosition(handle: RigHandle, bone: HumanoidBone, target = new Vector3()): Vector3 {
+export function jointWorldPosition(handle: RigHandle, bone: string, target = new Vector3()): Vector3 {
   const b = handle.bones.get(bone);
   if (!b) return target.set(0, 0, 0);
   b.updateWorldMatrix(true, false);

@@ -28,7 +28,11 @@
  * (node TRS, LINEAR samplers; clips that target no exported node are
  * skipped). OBJ / STL / PLY have no skins: they get the mesh as currently
  * posed (`pose: 'current'`, the default — what the viewer shows, e.g. a
- * paused animation frame) or in the bind pose (`pose: 'rest'`).
+ * paused animation frame) or in the bind pose (`pose: 'rest'`). Any
+ * skeleton exports this way — humanoid, animal templates or custom bones
+ * from the rig editor — and so do custom clips (tracks bind by bone name).
+ * Attributes only the rig editor uses (the weight heat map) never go into
+ * a file.
  */
 import { BufferAttribute, BufferGeometry, Group, Matrix3, Matrix4, Mesh as MeshClass, PropertyBinding, Skeleton, TextureSource, Vector3, Vector4 } from 'three';
 import type {
@@ -87,6 +91,7 @@ export interface ExportOptions {
 /** Export `object` (and its children) as a file blob; the object itself is not modified. GLB/STL/PLY are binary. */
 export async function exportObject(object: Object3D, format: ExportFormat, opts: ExportOptions = {}): Promise<Blob> {
   let root = bakeWorldTransform(object, opts.scale ?? 1);
+  stripEditorAttributes(root);
   const type = exportFormatInfo(format).mime;
   const rigged = hasSkinOrRig(root);
   if (rigged) {
@@ -306,6 +311,32 @@ export function flipDataTexture(tex: DataTexture): DataTexture {
 
 // ---------------------------------------------------------------------------
 // Rigged models
+
+/** Vertex attributes the rig editor adds while painting weights (src/rig/editor/heatmap.ts). */
+export const EDITOR_ATTRIBUTES: readonly string[] = ['rigHeat'];
+
+/**
+ * Give meshes whose geometry carries editor-only attributes a shallow copy
+ * without them (the live geometry is untouched; call on a clone).
+ */
+export function stripEditorAttributes(root: Object3D): void {
+  root.traverse((o) => {
+    const mesh = o as Mesh;
+    if (!mesh.isMesh || !mesh.geometry) return;
+    const src = mesh.geometry;
+    if (!EDITOR_ATTRIBUTES.some((n) => src.getAttribute(n))) return;
+    const g = new BufferGeometry();
+    g.setIndex(src.getIndex());
+    for (const [name, attr] of Object.entries(src.attributes)) if (!EDITOR_ATTRIBUTES.includes(name)) g.setAttribute(name, attr);
+    for (const grp of src.groups) g.addGroup(grp.start, grp.count, grp.materialIndex);
+    g.morphAttributes = src.morphAttributes;
+    g.morphTargetsRelative = src.morphTargetsRelative;
+    g.boundingBox = src.boundingBox;
+    g.boundingSphere = src.boundingSphere;
+    g.name = src.name;
+    mesh.geometry = g;
+  });
+}
 
 /** Set by src/rig on a mesh whose geometry moved to a skinned child (it renders nothing). */
 const RIG_PLACEHOLDER = 'rigPlaceholder';

@@ -110,8 +110,11 @@ export interface AnimationInfo {
   name: { tr: string; en: string };
   category: AnimationCategory;
   loop: boolean;
-  /** 'builtin' clips are generated procedurally; 'imported' come from a BVH / FBX / GLB file. */
-  source: 'builtin' | 'imported';
+  /**
+   * 'builtin' clips are generated procedurally; 'imported' come from a BVH / FBX / GLB file;
+   * 'custom' were authored in the rig editor's timeline.
+   */
+  source: 'builtin' | 'imported' | 'custom';
   duration: number;
 }
 
@@ -119,4 +122,70 @@ export interface AnimationInfo {
 export interface RigClip {
   clip: AnimationClip;
   info: AnimationInfo;
+}
+
+// ---------------------------------------------------------------------------
+// Generic skeletons (templates: humanoid, quadruped, bird, snake / chain, custom)
+
+/** Skeleton families the rig can build and animate. */
+export type TemplateId = 'humanoid' | 'quadruped' | 'bird' | 'snake' | 'custom';
+
+export const TEMPLATE_IDS: TemplateId[] = ['humanoid', 'quadruped', 'bird', 'snake', 'custom'];
+
+/** What a bone is for (procedural clips, IK chains and mirroring use it; free-form bones have none). */
+export type RolePart =
+  | 'root'
+  | 'spine'
+  | 'neck'
+  | 'head'
+  | 'jaw'
+  | 'ear'
+  | 'tail'
+  | 'leg'
+  | 'arm'
+  | 'wing'
+  | 'chain'
+  | 'end';
+
+export interface BoneRole {
+  part: RolePart;
+  /** Subject's left / right. */
+  side?: 'L' | 'R';
+  /** Quadrupeds: front or hind leg. */
+  limb?: 'front' | 'hind';
+  /**
+   * Position in its chain. Legs / arms: 0 shoulder / hip, 1 upper, 2 lower,
+   * 3 foot / hand, 4 toe (IK chains are 1 → 2 with the end effector at 3).
+   * Spine / neck / tail / wing / chain: 0 at the body end.
+   */
+  index?: number;
+}
+
+/**
+ * One bone of a generic skeleton, in the rest pose (root-local frame, the
+ * frame of `model.object` — see JointLayout). `head` is the joint the bone
+ * rotates about; `tail` its far end (a connected child's head, or a free end
+ * for leaves). Bone names are unique and animation-binding safe
+ * ([A-Za-z0-9_-]).
+ */
+export interface BoneSpec {
+  name: string;
+  parent: string | null;
+  head: Vec3;
+  tail: Vec3;
+  /** Gets skin weights (false for end markers such as HeadTop_End). */
+  deform: boolean;
+  role?: BoneRole;
+}
+
+/**
+ * A skeleton of any shape: bones parents-first with exactly one root, and
+ * the body frame the procedural clips and the mirror tools use: `forward`
+ * (where the head / face points) and `up`; the subject's left is
+ * up × forward and the symmetry plane passes through the root's head.
+ */
+export interface SkeletonSpec {
+  template: TemplateId;
+  bones: BoneSpec[];
+  frame: { forward: Vec3; up: Vec3 };
 }

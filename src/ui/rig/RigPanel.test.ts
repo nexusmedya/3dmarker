@@ -16,7 +16,7 @@ vi.mock('../../core/human/analyze', () => ({ analyzeHuman }));
 import { buildGeometryModel, type BuiltModel } from '../../app/pipeline';
 import type { ViewerCore } from '../../app/viewer';
 import { asciiFbx, mixamoBones } from '../../rig/fbxFixture';
-import { makeMannequin } from '../../rig/testing';
+import { makeDog, makeMannequin } from '../../rig/testing';
 import { LangProvider } from '../i18n';
 import { detectForRig, RigPanel } from './RigPanel';
 
@@ -325,6 +325,115 @@ describe('RigPanel', () => {
     await waitFor(() => !q('rig-reweight'));
     expect(elbow().distanceTo(start)).toBeLessThan(1e-6);
     expect(q('anim-import-wave-hello')).toBeTruthy(); // imported clips survive (retargeted)
+  }, 60_000);
+});
+
+describe('RigPanel: animal templates and the rig editor', () => {
+  const setValue = async (el: HTMLInputElement | HTMLSelectElement, value: string, event: 'input' | 'change' = 'change') => {
+    const proto = el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(proto, 'value')!.set!.call(el, value);
+      el.dispatchEvent(new Event(event, { bubbles: true }));
+    });
+  };
+  const key = (k: string, mods: Partial<KeyboardEventInit> = {}) => act(async () => window.dispatchEvent(new KeyboardEvent('keydown', { key: k, ...mods })));
+
+  it('auto-suggests a quadruped for a dog, plays animal clips, edits bones with undo / redo, keys a pose and saves a custom clip', async () => {
+    analyzeHuman.mockResolvedValue({ width: 8, height: 8, faces: [], hands: [], poses: [], isHuman: false });
+    const core = fakeCore();
+    core.camera.position.set(0, 0, 5);
+    core.camera.updateMatrixWorld(true);
+    const model = buildGeometryModel(makeDog().mesh.geometry, null);
+    await mount(model, core);
+    expect((q('rig-template') as HTMLSelectElement).value).toBe('auto');
+    await click('rig-auto');
+    await waitFor(() => !!q('rig-status'));
+    expect(q('rig-status')!.dataset.template).toBe('quadruped');
+    expect(q('rig-status')!.dataset.method).toBe('side');
+    expect(q('rig-template-badge')!.textContent).toContain('Quadruped');
+    expect(q('anim-quad-walk')).toBeTruthy();
+    expect(q('anim-walk')).toBe(null); // no humanoid clips
+    expect((q('anim-import') as HTMLInputElement).disabled).toBe(true);
+    expect(q('rig-edit-joints')).toBe(null); // the humanoid joint editor is for humanoids
+    await click('anim-quad-trot');
+    expect(q('anim-now')!.textContent).toContain('Trot');
+
+    // Open the rig editor: playback stops.
+    await click('rig-editor-toggle');
+    expect(q('rig-editor-panel')).toBeTruthy();
+    expect(q('anim-now')!.textContent).toContain('Pick an animation');
+    const bones = () => Number(q('rig-editor-panel')!.dataset.bones);
+    const n0 = bones();
+    expect(q('rig-ed-bone-LeftFrontFoot')).toBeTruthy();
+
+    // Add a child to the head, undo (Ctrl+Z), redo (Ctrl+Y).
+    await click('rig-ed-bone-Head');
+    expect((q('rig-ed-name') as HTMLInputElement).value).toBe('Head');
+    await click('rig-ed-add');
+    await waitFor(() => bones() === n0 + 1);
+    expect(q('rig-status')!.dataset.bones).toBe(String(n0 + 1));
+    await key('z', { ctrlKey: true });
+    await waitFor(() => bones() === n0);
+    await key('y', { ctrlKey: true });
+    await waitFor(() => bones() === n0 + 1);
+    // Delete a leg's toe with symmetry: both toes go.
+    await click('rig-ed-bone-LeftHindToe');
+    await click('rig-ed-delete');
+    await waitFor(() => bones() === n0 - 1);
+    expect(q('rig-ed-bone-RightHindToe')).toBe(null);
+    // Rename (sanitised) through the properties.
+    await click('rig-ed-bone-Tail');
+    const name = q('rig-ed-name') as HTMLInputElement;
+    await setValue(name, 'Tail Base', 'input');
+    await act(async () => name.dispatchEvent(new FocusEvent('blur', { bubbles: false })));
+    await act(async () => name.dispatchEvent(new FocusEvent('focusout', { bubbles: true })));
+    await waitFor(() => !!q('rig-ed-bone-Tail_Base'));
+    expect(model.object.getObjectByName('Tail_Base')).toBeTruthy();
+
+    // Pose mode (Tab), rotate the head, key everything at 0 and 1 s, save the clip.
+    await key('Tab');
+    expect(q('rig-editor-panel')!.dataset.mode).toBe('pose');
+    await click('rig-ed-key-all');
+    expect(host.querySelectorAll('[data-testid="rig-ed-keys-all-key"]')).toHaveLength(1);
+    await setValue(q('rig-ed-time') as HTMLInputElement, '1', 'input');
+    model.object.getObjectByName('Head')!.rotation.x = 0.6;
+    await key('i'); // insert key: nothing selected → all bones
+    expect(host.querySelectorAll('[data-testid="rig-ed-keys-all-key"]')).toHaveLength(2);
+    await click('rig-ed-save');
+    await waitFor(() => !!q('anim-custom-custom-1'));
+    expect(model.animations!.some((c) => c.name === 'Custom 1')).toBe(true);
+    // Undo the second key (history covers keyframes too).
+    await key('z', { ctrlKey: true });
+    await waitFor(() => host.querySelectorAll('[data-testid="rig-ed-keys-all-key"]').length === 1);
+
+    // Weight tools: normalise is undoable.
+    await click('rig-ed-mode-paint');
+    expect(q('rig-editor-panel')!.dataset.mode).toBe('paint');
+    await click('rig-ed-bone-Chest');
+    await click('rig-ed-normalize');
+
+    // Closing the editor keeps the edited skeleton; the saved clip plays.
+    await click('rig-editor-toggle');
+    expect(q('rig-editor-panel')).toBe(null);
+    await click('anim-custom-custom-1');
+    expect(q('anim-now')!.textContent).toContain('Custom 1');
+  }, 60_000);
+
+  it('rigs with an explicitly chosen template (snake chain / custom single bone) without person detection', async () => {
+    const core = fakeCore();
+    await mount(buildGeometryModel(makeDog().mesh.geometry, null), core);
+    await setValue(q('rig-template') as HTMLSelectElement, 'custom');
+    await click('rig-auto');
+    await waitFor(() => !!q('rig-status'));
+    expect(analyzeHuman).not.toHaveBeenCalled();
+    expect(q('rig-status')!.dataset.template).toBe('custom');
+    expect(q('rig-status')!.dataset.bones).toBe('1');
+    await click('rig-remove');
+    await setValue(q('rig-template') as HTMLSelectElement, 'snake');
+    await click('rig-auto');
+    await waitFor(() => !!q('rig-status'));
+    expect(q('rig-status')!.dataset.template).toBe('snake');
+    expect(q('anim-snake-slither')).toBeTruthy();
   }, 60_000);
 });
 

@@ -1,9 +1,13 @@
 /**
- * Rig & animation card: auto-rig the model on screen as a humanoid (pose
- * landmarks from src/core/human when a person is detected in the front
- * image, else the silhouette heuristic), edit joints in the viewer, play the
- * built-in library or imported clips (BVH / FBX / GLB) and choose which
- * clips go into the GLB export (`model.animations`).
+ * Rig & animation card: auto-rig the model on screen with a skeleton
+ * template — humanoid (pose landmarks from src/core/human when a person is
+ * detected in the front image, else the silhouette heuristic), quadruped,
+ * bird, snake / chain or custom; "Otomatik" suggests one (humanoid for a
+ * detected person or a T / A-pose silhouette, else from the side profile) —
+ * edit humanoid joints in the viewer or anything in the advanced rig editor
+ * (./RigEditor.tsx), play the built-in library (humanoid or animal clips),
+ * imported clips (BVH / FBX / GLB, humanoids) or custom clips authored in
+ * the editor, and choose which clips go into the GLB export (`model.animations`).
  *
  * The rig engine (src/rig, three-mesh-bvh, loaders) is loaded on first use.
  * The rig edits `model.object` in place and calls `onModelChanged` whenever
@@ -21,23 +25,50 @@ import type { HandResult, PoseResult } from '../../core/human/types';
 import { analyzeHuman } from '../../core/human/analyze';
 import { boneLabel, mirrorBone } from '../../rig/bones';
 import type * as RigEngine from '../../rig/engine';
-import { ANIMATION_CATEGORIES, type AnimationCategory, type HumanoidBone, type JointLayout, type RigClip } from '../../rig/types';
+import { ANIMATION_CATEGORIES, TEMPLATE_IDS, type AnimationCategory, type HumanoidBone, type JointLayout, type RigClip, type TemplateId } from '../../rig/types';
 import { useI18n } from '../i18n';
 import { ProgressBar } from '../GeneratePanel';
 import { IconAlert, IconCheck, IconInfo, IconUndo, IconX } from '../icons';
 import { IconBone, IconImport, IconLoop, IconMove, IconPause, IconPlay, IconSearch, IconStop } from './icons';
+import { RigEditor } from './RigEditor';
 import './rig.css';
 
 type Engine = typeof RigEngine;
 type JointMethod = RigEngine.JointMethod;
+type AnimalMethod = RigEngine.AnimalMethod;
+export type TemplateChoice = 'auto' | TemplateId;
+
+/** Template names (kept here so the panel does not load the rig engine to show them). */
+export const TEMPLATE_LABELS: Record<TemplateId, I18nText> = {
+  humanoid: { tr: 'İnsansı', en: 'Humanoid' },
+  quadruped: { tr: 'Dört ayaklı (köpek, kedi, at)', en: 'Quadruped (dog, cat, horse)' },
+  bird: { tr: 'Kuş', en: 'Bird' },
+  snake: { tr: 'Yılan / zincir (kuyruk)', en: 'Snake / chain (tail)' },
+  custom: { tr: 'Özel (tek kök kemik)', en: 'Custom (single root bone)' },
+};
 
 export const RIG_PANEL_TEXT = {
   title: { tr: 'Kemik ve animasyon', en: 'Rig & animation' },
   intro: {
-    tr: 'Modele insansı bir iskelet ekler, deri ağırlıklarını hesaplar ve hazır animasyonları oynatır. En iyi sonuç T-pozundaki tam vücut modellerle alınır.',
-    en: 'Adds a humanoid skeleton, computes skin weights and plays ready-made animations. Works best on full-body models in a T-pose.',
+    tr: 'Modele bir iskelet (insan, hayvan ya da özel) ekler, deri ağırlıklarını hesaplar ve hazır animasyonları oynatır. İnsanlarda en iyi sonuç T-pozundaki tam vücut modellerle, hayvanlarda yandan görünümle alınır.',
+    en: 'Adds a skeleton (human, animal or custom), computes skin weights and plays ready-made animations. Humans work best full-body in a T-pose, animals seen from the side.',
   },
-  autoRig: { tr: 'Otomatik kemik (insansı)', en: 'Auto-rig (humanoid)' },
+  autoRig: { tr: 'Otomatik kemik', en: 'Auto-rig' },
+  template: { tr: 'İskelet şablonu', en: 'Skeleton template' },
+  templateAuto: { tr: 'Otomatik (önerilen)', en: 'Automatic (suggested)' },
+  suggested: { tr: 'otomatik seçim', en: 'auto-selected' },
+  methodSide: { tr: 'yandan görünümden (gövde ekseni, bacaklar, baş, kuyruk)', en: 'from the side view (body axis, legs, head, tail)' },
+  methodFront: { tr: 'önden görünüm — oranlardan, eklemleri kontrol edin', en: 'front view — from proportions, check the joints' },
+  methodChain: { tr: 'gövde ekseni boyunca', en: 'along the body axis' },
+  methodAnimalProportional: { tr: 'oranlardan (bacak bulunamadı) — eklemleri düzenleyin', en: 'from proportions (no legs found) — adjust the joints' },
+  methodCustom: { tr: 'tek kök kemik — rig editöründe kemik ekleyin', en: 'a single root bone — add bones in the rig editor' },
+  rigEditor: { tr: 'Rig editörü', en: 'Rig editor' },
+  editorHint: {
+    tr: 'Kemik ağacı, gizmo ile eklem taşıma, ağırlık boyama, poz ve anahtar kare animasyonu. Masaüstü için tasarlandı; dokunmatikte de çalışır.',
+    en: 'Bone tree, joint gizmo, weight painting, posing and keyframe animation. Desktop-first; works on touch too.',
+  },
+  custom: { tr: 'Özel animasyonlar', en: 'Custom animations' },
+  importHumanoidOnly: { tr: 'Dosyadan animasyon aktarma insansı iskeletlerde çalışır.', en: 'Importing animation files works on humanoid skeletons.' },
   cancel: { tr: 'İptal', en: 'Cancel' },
   noModel: { tr: 'Önce bir 3B model oluşturun.', en: 'Generate a 3D model first.' },
   disabled: { tr: 'İşlem sürerken kemik eklenemez.', en: 'Rigging is unavailable while a job is running.' },
@@ -130,7 +161,10 @@ interface ImportedEntry {
 interface RigInfo {
   bones: number;
   vertices: number;
-  method: JointMethod;
+  template: TemplateId;
+  /** The template was chosen by the suggestion ('auto'). */
+  suggested: boolean;
+  method: JointMethod | AnimalMethod | 'custom';
   detection: Detection;
   /** Why detection was unavailable (the loader's localized reason). */
   detectDetail?: I18nText;
@@ -234,6 +268,7 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
   const redoRef = useRef<JointLayout[]>([]);
   const cbRef = useRef({ onModelChanged, onActiveChange });
   cbRef.current = { onModelChanged, onActiveChange };
+  const clipTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [phase, setPhase] = useState<'idle' | 'working' | 'rigged'>('idle');
   const [progress, setProgress] = useState<Progress | null>(null);
@@ -259,13 +294,20 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
   const [importError, setImportError] = useState<I18nText | null>(null);
   const [history, setHistory] = useState({ undo: 0, redo: 0 });
   const [retrying, setRetrying] = useState(false);
+  const [template, setTemplate] = useState<TemplateChoice>('auto');
+  const [customs, setCustoms] = useState<RigClip[]>([]);
+  const [editorOpen, setEditorOpen] = useState(false);
+  /** Bumped when the rig editor changed the skeleton (bone count, humanoid view). */
+  const [, setRigVersion] = useState(0);
   const mirrorRef = useRef(mirror);
   mirrorRef.current = mirror;
   const showSkeletonRef = useRef(showSkeleton);
   showSkeletonRef.current = showSkeleton;
 
   const foreign = useMemo(() => hasForeignSkin(model), [model]);
-  const allClips = useMemo(() => [...builtins, ...imported.map((e) => e.rig)], [builtins, imported]);
+  const allClips = useMemo(() => [...builtins, ...imported.map((e) => e.rig), ...customs], [builtins, imported, customs]);
+  const allClipsRef = useRef(allClips);
+  allClipsRef.current = allClips;
   const byId = useMemo(() => new Map(allClips.map((c) => [c.info.id, c])), [allClips]);
 
   const loadEngine = useCallback(async () => (engineRef.current ??= await import('../../rig/engine')), []);
@@ -337,6 +379,8 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
       setInfo(null);
       setBuiltins([]);
       setImported([]);
+      setCustoms([]);
+      setEditorOpen(false);
       setExportSel(new Set());
       setEditing(false);
       setSelected(null);
@@ -374,7 +418,8 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
     try {
       const engine = await loadEngine();
       let det: RigDetection = { pose: null, hands: [], detection: 'skipped' };
-      if (frontImage) {
+      const wantsHuman = template === 'auto' || template === 'humanoid';
+      if (frontImage && wantsHuman) {
         setProgress({ label: T.detecting });
         det = await detectForRig(frontImage, ac.signal, setProgress);
       }
@@ -382,14 +427,30 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
       if (ac.signal.aborted) throw new DOMException('Aborted', 'AbortError');
       setProgress({ label: T.placing });
       const data = engine.collectMeshData(m.object);
-      const auto = engine.autoPlaceJointsDetailed(m.object, {
-        pose,
-        hands,
-        imageSize: frontImage ? { width: frontImage.width, height: frontImage.height } : undefined,
-        imageMask: frontMask,
-        meshData: data,
-      });
-      const handle = await engine.rigModel(core, m, { layout: auto.layout, meshData: data, signal: ac.signal, onProgress: setProgress });
+      const auto = wantsHuman
+        ? engine.autoPlaceJointsDetailed(m.object, {
+            pose,
+            hands,
+            imageSize: frontImage ? { width: frontImage.width, height: frontImage.height } : undefined,
+            imageMask: frontMask,
+            meshData: data,
+          })
+        : null;
+      const chosen: TemplateId =
+        template === 'auto' ? engine.suggestTemplate({ data, humanoidMethod: auto?.method, plausibility: auto?.plausibility, poseFound: auto?.method === 'pose' }).template : template;
+      let spec: RigEngine.SpecDescriptor['spec'] | undefined;
+      let method: RigInfo['method'] = auto?.method ?? 'proportional';
+      let plausibility = auto?.plausibility ?? 1;
+      if (chosen === 'custom') {
+        spec = engine.emptySpec(data.box);
+        method = 'custom';
+      } else if (chosen !== 'humanoid') {
+        const a = engine.autoPlaceAnimal(data, chosen, { imageMask: frontMask });
+        spec = a.spec;
+        method = a.method;
+        plausibility = 1;
+      }
+      const handle = await engine.rigModel(core, m, spec ? { spec, meshData: data, signal: ac.signal, onProgress: setProgress } : { layout: auto!.layout, meshData: data, signal: ac.signal, onProgress: setProgress });
       if (modelRef.current !== m || ac.signal.aborted) {
         if (core.getObject() === handle.root) handle.unrig();
         else handle.dispose();
@@ -397,17 +458,27 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
         return;
       }
       handleRef.current = handle;
-      autoRef.current = { layout: cloneLayout(auto.layout), data, silhouette: auto.silhouette };
+      autoRef.current = auto && handle.isHumanoid ? { layout: cloneLayout(auto.layout), data, silhouette: auto.silhouette } : null;
       undoRef.current = [];
       redoRef.current = [];
       setHistory({ undo: 0, redo: 0 });
       if (originalAnimsRef.current?.model !== m) originalAnimsRef.current = { model: m, animations: m.animations };
       playerRef.current = makePlayer(engine, core, m);
-      const lib = engine.buildLibrary(handle.descriptor);
+      const lib = handle.isHumanoid ? engine.buildLibrary(handle.descriptor) : engine.buildAnimalLibrary(handle.generic);
       setBuiltins(lib);
       setImported([]);
+      setCustoms([]);
       setExportSel(new Set(lib.map((c) => c.info.id)));
-      setInfo({ bones: handle.bones.size, vertices: data.positions.length / 3, method: auto.method, detection: det.detection, detectDetail: det.detail, plausibility: auto.plausibility });
+      setInfo({
+        bones: handle.bones.size,
+        vertices: data.positions.length / 3,
+        template: handle.template,
+        suggested: template === 'auto',
+        method,
+        detection: det.detection,
+        detectDetail: det.detail,
+        plausibility,
+      });
       handle.setSkeletonVisible(showSkeletonRef.current);
       setPhase('rigged');
       cbRef.current.onActiveChange(true);
@@ -434,6 +505,8 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
     setInfo(null);
     setBuiltins([]);
     setImported([]);
+    setCustoms([]);
+    setEditorOpen(false);
     setExportSel(new Set());
     setEditing(false);
     setCurrent(null);
@@ -445,14 +518,21 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
   // ---- skeleton / joint editor ---------------------------------------------
 
   useEffect(() => {
-    handleRef.current?.setSkeletonVisible(showSkeleton || editing);
-  }, [showSkeleton, editing, phase]);
+    // The rig editor draws its own bones.
+    handleRef.current?.setSkeletonVisible((showSkeleton || editing) && !editorOpen);
+  }, [showSkeleton, editing, phase, editorOpen]);
 
-  const rebuildClips = (engine: Engine, desc: RigEngine.RigDescriptor) => {
+  const rebuildClips = (engine: Engine, h: RigEngine.RigHandle) => {
     const player = playerRef.current;
-    for (const c of allClips) player?.uncache(c.clip);
-    setBuiltins(engine.buildLibrary(desc));
-    setImported((prev) => prev.map((e) => ({ ...e, rig: engine.retargetAnimation(e.source, desc, { id: e.id }) })));
+    for (const c of allClipsRef.current) player?.uncache(c.clip);
+    if (h.isHumanoid) {
+      const desc = h.descriptor;
+      setBuiltins(engine.buildLibrary(desc));
+      setImported((prev) => prev.map((e) => ({ ...e, rig: engine.retargetAnimation(e.source, desc, { id: e.id }) })));
+    } else {
+      // Animal / custom skeletons: the clips that fit their roles; imported clips stay as they were.
+      setBuiltins(engine.buildAnimalLibrary(h.generic));
+    }
   };
 
   const commitJoints = async (patch: JointLayout, record: 'undo' | 'redo' | 'new' = 'new') => {
@@ -474,7 +554,7 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
       const applied = await h.setJoints(patch, { signal: ac.signal, onProgress: (p) => latest() && setReweighting(p) });
       if (!applied || !latest()) return;
       editorRef.current?.setLayout(h.layout);
-      rebuildClips(engine, h.descriptor);
+      rebuildClips(engine, h);
     } catch (e) {
       if (!isAbort(e)) setError(errorToText(e));
     } finally {
@@ -615,6 +695,7 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
   };
   useEffect(() => () => {
     if (pending.current.timer) clearTimeout(pending.current.timer);
+    if (clipTimer.current) clearTimeout(clipTimer.current);
     reweighRef.current?.abort();
   }, []);
 
@@ -624,6 +705,7 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
     const p = playerRef.current;
     if (!p) return;
     if (editing) setEditing(false);
+    if (editorOpen) setEditorOpen(false);
     // One-shots (jump, sit-down, fall-die…) hold their last frame; the switch only affects looping clips.
     p.play(c.clip, { loop: loop && c.info.loop, speed, crossFade: crossFade && p.isPlaying ? 0.3 : 0 });
     setCurrent(c.info.id);
@@ -644,6 +726,7 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
       setPlaying(false);
     } else {
       if (editing) setEditing(false);
+      if (editorOpen) setEditorOpen(false);
       p.resume();
       setPlaying(true);
     }
@@ -690,6 +773,7 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
   const groups = ANIMATION_CATEGORIES.map((cat) => ({ cat, clips: filtered.filter((c) => c.info.source === 'builtin' && c.info.category === cat.id) }))
     .filter((g) => g.clips.length);
   const importedShown = filtered.filter((c) => c.info.source === 'imported');
+  const customShown = filtered.filter((c) => c.info.source === 'custom');
 
   const toggleExport = (id: string, on: boolean) =>
     setExportSel((prev) => {
@@ -700,17 +784,75 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
     });
 
   const busy = !enabled || phase === 'working' || !!reweighting;
-  const doubtful = !!info && info.method !== 'pose' && info.plausibility < 0.5;
+  const doubtful = !!info && info.template === 'humanoid' && info.method !== 'pose' && info.plausibility < 0.5;
+  const animalMethod: Partial<Record<RigInfo['method'], I18nText>> = {
+    side: T.methodSide,
+    front: T.methodFront,
+    chain: T.methodChain,
+    custom: T.methodCustom,
+  };
   const methodText = !info
     ? null
-    : info.method === 'pose'
-      ? T.methodPose
-      : info.method === 'silhouette'
-        ? doubtful ? T.methodUncertain : T.methodSilhouette
-        : info.method === 'arms-down'
-          ? T.methodArmsDown
-          // "No person detected" only when detection actually ran.
-          : info.detection === 'none' ? T.methodProportional : T.methodProportionalPlain;
+    : info.template !== 'humanoid'
+      ? animalMethod[info.method] ?? T.methodAnimalProportional
+      : info.method === 'pose'
+        ? T.methodPose
+        : info.method === 'silhouette'
+          ? doubtful ? T.methodUncertain : T.methodSilhouette
+          : info.method === 'arms-down'
+            ? T.methodArmsDown
+            // "No person detected" only when detection actually ran.
+            : info.detection === 'none' ? T.methodProportional : T.methodProportionalPlain;
+  const liveHandle = handleRef.current;
+  const humanoid = !!liveHandle && liveHandle.isHumanoid;
+  const liveTemplate: TemplateId | undefined = liveHandle?.template ?? info?.template;
+
+  const onEditorChanged = () => {
+    const h = handleRef.current, engine = engineRef.current;
+    if (!h || !engine) return;
+    setRigVersion((v) => v + 1);
+    setInfo((i) => i && { ...i, bones: h.bones.size, template: h.template });
+    // Cached animation bindings point at the bones they were made for (structural edits rebuild them).
+    for (const c of allClipsRef.current) playerRef.current?.uncache(c.clip);
+    // Rebuilding the library is heavier than a brush stroke: coalesce bursts of edits.
+    if (clipTimer.current) clearTimeout(clipTimer.current);
+    clipTimer.current = setTimeout(() => {
+      clipTimer.current = null;
+      if (handleRef.current === h && !h.disposed) rebuildClips(engine, h);
+    }, 400);
+    cbRef.current.onModelChanged();
+  };
+  const onSaveCustom = (rc: RigClip) => {
+    setCustoms((prev) => {
+      const old = prev.find((c) => c.info.id === rc.info.id);
+      if (old) playerRef.current?.uncache(old.clip);
+      return [...prev.filter((c) => c.info.id !== rc.info.id), rc];
+    });
+    setExportSel((prev) => new Set([...prev, rc.info.id]));
+  };
+  /** Bone renames in the editor: the saved custom clips follow (tracks bind by name). */
+  const onBonesRenamed = (renamed: Record<string, string>) => {
+    const engine = engineRef.current;
+    if (!engine) return;
+    setCustoms((prev) =>
+      prev.map((c) => {
+        const doc = (c.clip.userData as { doc?: RigEngine.keys.ClipDoc }).doc;
+        if (!doc) return c;
+        playerRef.current?.uncache(c.clip);
+        return engine.keys.toAnimationClip(engine.keys.renameDocBones(doc, renamed), c.info.id);
+      }),
+    );
+  };
+  const openEditor = (on: boolean) => {
+    if (on) {
+      playerRef.current?.stop();
+      setPlaying(false);
+      setCurrent(null);
+      setTime(0);
+      setEditing(false);
+    }
+    setEditorOpen(on);
+  };
 
   const renderItem = (c: RigClip) => (
     <li key={c.info.id} className={`rig-item${current === c.info.id ? ' is-current' : ''}`}>
@@ -764,6 +906,17 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
           <p className="note small">
             <IconInfo size={14} /> {tx(T.intro)}
           </p>
+          <label className="rig-template">
+            <span>{tx(T.template)}</span>
+            <select className="select" value={template} onChange={(e) => setTemplate(e.target.value as TemplateChoice)} disabled={phase === 'working'} data-testid="rig-template">
+              <option value="auto">{tx(T.templateAuto)}</option>
+              {TEMPLATE_IDS.map((id) => (
+                <option key={id} value={id}>
+                  {tx(TEMPLATE_LABELS[id])}
+                </option>
+              ))}
+            </select>
+          </label>
           <div className="rig-row">
             <button type="button" className="btn btn-primary btn-sm" onClick={() => void autoRig()} disabled={!enabled || phase === 'working'} data-testid="rig-auto">
               {phase === 'working' ? <span className="spinner spinner-sm" aria-hidden="true" /> : <IconBone size={15} />} {tx(T.autoRig)}
@@ -779,16 +932,22 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
         </>
       ) : (
         <>
-          <div className="rig-status" data-testid="rig-status" data-bones={info?.bones} data-method={info?.method}>
+          <div className="rig-status" data-testid="rig-status" data-bones={info?.bones} data-method={info?.method} data-template={liveTemplate}>
             <span className="status status-ok">
               <IconCheck size={13} /> <strong>{tx(T.bones, { n: int(info?.bones ?? 0) })}</strong>
             </span>
+            {liveTemplate && (
+              <span className="rig-template-badge" data-testid="rig-template-badge">
+                {tx(TEMPLATE_LABELS[liveTemplate])}
+                {info?.suggested && ` · ${tx(T.suggested)}`}
+              </span>
+            )}
             <span>
               {tx(T.weighted, { n: int(info?.vertices ?? 0) })}
               {methodText && ` (${tx(methodText)})`}
             </span>
           </div>
-          {info?.detection === 'unavailable' && (
+          {info?.detection === 'unavailable' && info.template === 'humanoid' && (
             <p className="note small rig-warn" data-testid="rig-detect-warning" title={info.detectDetail ? tx(info.detectDetail) : undefined}>
               <IconAlert size={14} />
               <span>
@@ -806,9 +965,37 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
             </p>
           )}
           <div className="rig-toggles">
-            <Switch label={tx(T.showSkeleton)} checked={showSkeleton || editing} disabled={editing} onChange={setShowSkeleton} testId="rig-skeleton" />
-            <Switch label={tx(T.editJoints)} checked={editing} disabled={!enabled} onChange={setEditing} testId="rig-edit-joints" />
+            <Switch label={tx(T.showSkeleton)} checked={showSkeleton || editing} disabled={editing || editorOpen} onChange={setShowSkeleton} testId="rig-skeleton" />
+            {humanoid && (
+              <Switch
+                label={tx(T.editJoints)}
+                checked={editing}
+                disabled={!enabled}
+                onChange={(v) => {
+                  if (v) setEditorOpen(false);
+                  setEditing(v);
+                }}
+                testId="rig-edit-joints"
+              />
+            )}
+            <Switch label={tx(T.rigEditor)} checked={editorOpen} disabled={!enabled && !editorOpen} onChange={openEditor} testId="rig-editor-toggle" />
           </div>
+          {editorOpen && liveHandle && engineRef.current && coreRef.current && (
+            <div className="rig-section">
+              <div className="rig-section-title">{tx(T.rigEditor)}</div>
+              <p className="field-hint">{tx(T.editorHint)}</p>
+              <RigEditor
+                engine={engineRef.current}
+                handle={liveHandle}
+                core={coreRef.current}
+                enabled={enabled && !reweighting}
+                onSkeletonChanged={onEditorChanged}
+                onSaveClip={onSaveCustom}
+                customClips={customs}
+                onBonesRenamed={onBonesRenamed}
+              />
+            </div>
+          )}
           {editing && (
             <div className="rig-editor" data-testid="rig-editor">
               <p className="note small">
@@ -950,6 +1137,12 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
                   <ul className="rig-sublist">{g.clips.map(renderItem)}</ul>
                 </li>
               ))}
+              {customShown.length > 0 && (
+                <li>
+                  <div className="rig-group-title">{tx(T.custom)}</div>
+                  <ul className="rig-sublist">{customShown.map(renderItem)}</ul>
+                </li>
+              )}
               {importedShown.length > 0 && (
                 <li>
                   <div className="rig-group-title">{tx(T.imported)}</div>
@@ -975,7 +1168,7 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
               <input
                 type="file"
                 accept=".bvh,.fbx,.glb,.gltf"
-                disabled={importing || !!reweighting}
+                disabled={importing || !!reweighting || !humanoid}
                 data-testid="anim-import"
                 aria-label={tx(T.import)}
                 onChange={(e) => {
@@ -985,7 +1178,7 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
                 }}
               />
             </label>
-            <p className="field-hint">{tx(T.importHint)}</p>
+            <p className="field-hint">{tx(humanoid ? T.importHint : T.importHumanoidOnly)}</p>
             {importError && (
               <div className="alert alert-danger" role="alert" data-testid="anim-import-error">
                 <IconAlert size={16} />
