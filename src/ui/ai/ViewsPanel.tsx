@@ -16,7 +16,7 @@ import type { I18nText, Mask, Progress, RGBAImage, ViewAlign, ViewId, ViewTrust 
 import { DEFAULT_VIEW_ALIGN } from '../../core/types';
 import { hasTransparency, maskFromAlpha, mirrorMask } from '../../core/image/ops';
 import { maskBBox, type MaskSource, type PixelBox } from '../../core/fusion/frame';
-import { SHARED_AXES, alignLevel, alignNoteText, alignResidual, alignScore, alignedBox } from '../../core/fusion/align';
+import { SHARED_AXES, alignLevel, alignNoteText, alignResidual, alignScore, alignedBox, slotCap } from '../../core/fusion/align';
 import type { AlignLevel, ViewAlignment } from '../../core/fusion/types';
 import { VIEW_LABELS } from '../../ai/views';
 import { throttleLatest, type Throttled } from '../../app/throttle';
@@ -43,12 +43,12 @@ export const VIEW_TEXT = {
   noFront: { tr: 'Önce görsel yükleyin', en: 'Upload an image first' },
   drop: { tr: 'Bırakın', en: 'Drop here' },
   upload: { tr: 'Yükle', en: 'Upload' },
-  uploadView: { tr: '{view} görünümünü yükle', en: 'Upload the {view} view' },
+  uploadView: { tr: '{view} görünümü yükle', en: 'Upload the {view} view' },
   generate: { tr: 'AI ile üret', en: 'Generate with AI' },
   regenerate: { tr: 'AI ile yeniden üret', en: 'Regenerate with AI' },
-  generateView: { tr: '{view} görünümünü AI ile üret', en: 'Generate the {view} view with AI' },
+  generateView: { tr: '{view} görünümü AI ile üret', en: 'Generate the {view} view with AI' },
   clear: { tr: 'Temizle', en: 'Clear' },
-  clearView: { tr: '{view} görünümünü temizle', en: 'Clear the {view} view' },
+  clearView: { tr: '{view} görünümü temizle', en: 'Clear the {view} view' },
   generating: { tr: 'Üretiliyor…', en: 'Generating…' },
   generateMissing: { tr: 'Eksik görünümleri üret ({n})', en: 'Generate missing views ({n})' },
   allPresent: { tr: 'Tüm görünümler hazır', en: 'All views are there' },
@@ -71,7 +71,7 @@ export const VIEW_TEXT = {
   check: { tr: 'Tutarlılık', en: 'Consistency' },
   checkLabel: { tr: 'Tutarlılık %{score}, {level}: {note}', en: 'Consistency {score} %, {level}: {note}' },
   align: { tr: 'Hizala', en: 'Align' },
-  alignView: { tr: '{view} görünümünü hizala', en: 'Align the {view} view' },
+  alignView: { tr: '{view} görünümü hizala', en: 'Align the {view} view' },
   offsetX: { tr: 'Yatay kayma', en: 'Offset X' },
   offsetY: { tr: 'Dikey kayma', en: 'Offset Y' },
   scale: { tr: 'Ölçek', en: 'Scale' },
@@ -188,7 +188,8 @@ export function liveAlignment(check: ViewAlignment, align: ViewAlign): { score: 
   if (!manual && check.status !== 'manual') return { score: check.score, level: check.level };
   const residual = alignResidual(check.suggested, manual ? align : check.suggested);
   const maskSource: MaskSource = check.notes.some((n) => n.code === 'noMask') ? 'none' : 'given';
-  const score = alignScore({ confidence: check.confidence, residual, cut: check.cut, status: manual ? 'manual' : 'aligned', id: check.id, maskSource });
+  // The slot checks (wrong slot, facing, duplicate) hold whatever the placement.
+  const score = alignScore({ confidence: check.confidence, residual, cut: check.cut, status: manual ? 'manual' : 'aligned', id: check.id, maskSource, cap: slotCap(check.notes) });
   return { score, level: alignLevel(score) };
 }
 
@@ -383,7 +384,7 @@ export function ViewsPanel(p: Props) {
       ) : (
         <button
           type="button"
-          className="btn btn-primary btn-block"
+          className="btn btn-primary btn-block ai-wrap-btn"
           onClick={p.onGenerateMissing}
           disabled={!canAi || missing.length === 0}
           title={!p.aiReady ? p.aiReason ?? tx(T.aiNotReady) : !p.front ? tx(T.needFront) : undefined}
@@ -396,7 +397,7 @@ export function ViewsPanel(p: Props) {
       {!busy && p.onUseFusion && missing.length < OTHER_VIEW_IDS.length && (
         <button
           type="button"
-          className="btn btn-secondary btn-block"
+          className="btn btn-secondary btn-block ai-wrap-btn"
           onClick={p.onUseFusion}
           disabled={lock}
           title={tx(T.nextFusionHint)}
@@ -424,7 +425,7 @@ function SlotHead({ view, children }: { view: ViewId; children?: ReactNode }) {
   return (
     <div className="ai-slot-head">
       <ViewDiagram view={view} />
-      <span className="ai-slot-name">{tx(VIEW_LABELS[view])}</span>
+      <span className="ai-slot-name" title={tx(VIEW_LABELS[view])}>{tx(VIEW_LABELS[view])}</span>
       {children}
     </div>
   );
@@ -713,7 +714,11 @@ function AlignPanel({
   const root = useRef<HTMLDivElement>(null);
   const align = info.align ?? DEFAULT_VIEW_ALIGN;
   const shared = SHARED_AXES[view];
-  const name = tx(VIEW_LABELS[view]).toLocaleLowerCase(lang === 'tr' ? 'tr-TR' : 'en-US');
+  const locale = lang === 'tr' ? 'tr-TR' : 'en-US';
+  const name = tx(VIEW_LABELS[view]).toLocaleLowerCase(locale);
+  // "Align the back view" / "Arka görünümü hizala": the Turkish title starts with the view's name.
+  const title = tx(T.alignView, { view: name });
+  const heading = title.charAt(0).toLocaleUpperCase(locale) + title.slice(1);
   const current = currentCorrection(check, align);
   const live = check ? liveAlignment(check, align) : null;
   const status = live && check ? `${live.score} · ${tx(LEVEL_TEXT[live.level])} · ${alignNoteText(check, lang)}` : tx(T.pending);
@@ -791,7 +796,7 @@ function AlignPanel({
     >
       <div className="ai-align-head">
         <h3 id={`${uid}-title`} className="ai-align-title">
-          <IconAlign size={16} /> {tx(T.alignView, { view: name })}
+          <IconAlign size={16} /> {heading}
         </h3>
         <button type="button" className="icon-btn" onClick={onClose} aria-label={tx(T.close)} title={tx(T.close)} data-testid="align-close">
           <IconX size={16} />

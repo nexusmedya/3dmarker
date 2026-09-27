@@ -376,11 +376,12 @@ test.describe('sculpt', () => {
     await step(page, '3d');
     await page.getByTestId('driver-select').selectOption('silhouette-inflate');
     await generate(page);
-    const original = await positionChecksum(page);
 
     await step(page, 'edit');
     await page.getByTestId('sculpt-toggle').click();
     await expect(page.getByTestId('sculpt-panel')).toHaveAttribute('data-active', 'true');
+    // Measured once sculpting is on: a mesh with long edges is subdivided then, and undo returns to that surface.
+    const original = await positionChecksum(page);
     await page.getByTestId('brush-draw').click();
     const box = (await page.getByTestId('viewer').boundingBox())!;
     const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
@@ -450,6 +451,9 @@ test.describe('rig and animation', () => {
     expect(Number(await page.getByTestId('rig-status').getAttribute('data-bones'))).toBeGreaterThanOrEqual(15);
     // MediaPipe is unreachable: the joints come from the T-pose silhouette.
     await expect(page.getByTestId('rig-status')).toHaveAttribute('data-method', /silhouette|arms-down|proportional/);
+    // …and the panel says why (the detector could not load), with a retry.
+    await expect(page.getByTestId('rig-detect-warning')).toBeVisible();
+    await expect(page.getByTestId('rig-detect-retry')).toBeEnabled();
     await page.getByTestId('rig-skeleton').check({ force: true });
     await page.getByTestId('viewer').screenshot({ path: `${SHOTS}/tpose-skeleton.png` });
     const rest = await posedState(page);

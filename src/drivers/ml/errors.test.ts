@@ -4,6 +4,18 @@ import { LocalizedError } from '../../core/errors';
 import { isNetworkError, localizeMlError } from './errors';
 
 describe('localizeMlError', () => {
+  it('maps a stalled model download to a bilingual message', () => {
+    const e = new Error('No data from https://huggingface.co/x for 30 s');
+    e.name = 'ModelStalledError';
+    expect(isNetworkError(e)).toBe(false);
+    const out = localizeMlError(e, 'org/model') as LocalizedError;
+    expect(out).toBeInstanceOf(LocalizedError);
+    expect(out.i18n.en).toContain('stopped responding');
+    expect(out.i18n.tr).toContain('yanıt vermiyor');
+    expect(out.i18n.en).toContain('org/model');
+    expect(isNetworkError(out)).toBe(false); // the fusion reports it as "depth unavailable" with this reason
+  });
+
   it('maps browser fetch failures to a bilingual download error', () => {
     for (const msg of ['Failed to fetch', 'NetworkError when attempting to fetch resource.', 'Load failed']) {
       const e = new TypeError(msg);

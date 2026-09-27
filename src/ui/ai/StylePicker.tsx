@@ -4,7 +4,7 @@
  * tabindex (arrow keys / Home / End move and select, like native radios).
  * The first entry, "None", keeps the original look.
  */
-import { useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { memo, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import type { I18nText } from '../../core/types';
 import type { StyleCategory, StylePreset } from '../../ai/types';
 import { STYLES, STYLE_CATEGORIES, getStyle } from '../../ai/styles';
@@ -46,7 +46,8 @@ function gridColumns(grid: HTMLElement | null): number {
   return n >= kids.length ? 1 : Math.max(1, n);
 }
 
-export function StylePicker({ value, onChange, disabled }: Props) {
+/** Memoised: 60 cards that only change with the value, `disabled` or the language (context). */
+export const StylePicker = memo(function StylePicker({ value, onChange, disabled }: Props) {
   const { tx } = useI18n();
   const id = useId();
   const [query, setQuery] = useState('');
@@ -226,4 +227,4 @@ export function StylePicker({ value, onChange, disabled }: Props) {
       )}
     </div>
   );
-}
+});

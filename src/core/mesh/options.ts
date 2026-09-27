@@ -34,6 +34,28 @@ export interface MeshOptions {
   gamma: number;
 }
 
+/**
+ * An image area with fine relief (a face with its ears, a hand), in pixels of
+ * the depth map. The mesh builder keeps its detail: smoothing is faded out
+ * there and the grid is refined inside it.
+ */
+export interface DetailRegion {
+  kind: 'face' | 'hand';
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * A depth map that carries its detail regions (set by the human-detail
+ * refinement; an extra property, so plain DepthMap consumers ignore it and
+ * spreads / the depth editor's copies keep or drop it harmlessly).
+ */
+export interface DetailedDepth {
+  detail?: DetailRegion[];
+}
+
 export const DEFAULT_MESH_OPTIONS: MeshOptions = {
   resolution: 256,
   depthScale: 0.25,

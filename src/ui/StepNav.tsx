@@ -28,7 +28,7 @@ interface Props {
 }
 
 export function StepNav({ step, status, onStep }: Props) {
-  const { t, tx } = useI18n();
+  const { t, tx, lang } = useI18n();
   const listRef = useRef<HTMLDivElement>(null);
   const tabs = useRef(new Map<StepId, HTMLButtonElement>());
 
@@ -42,6 +42,27 @@ export function StepNav({ step, status, onStep }: Props) {
       list.scrollTo?.({ left: Math.max(0, left - 12), behavior: 'smooth' });
     }
   }, [step]);
+
+  // Edge fades show that the row scrolls (phones: steps 5-6 may start off-screen).
+  useEffect(() => {
+    const list = listRef.current;
+    if (!list) return;
+    const update = () => {
+      const scrollable = list.scrollWidth > list.clientWidth + 1;
+      list.classList.toggle('can-scroll-start', scrollable && list.scrollLeft > 1);
+      list.classList.toggle('can-scroll-end', scrollable && list.scrollLeft + list.clientWidth < list.scrollWidth - 1);
+      // Sticky on phones: focused controls keep clear of it (styles.css scroll-margin).
+      document.documentElement.style.setProperty('--stepnav-h', `${list.offsetHeight}px`);
+    };
+    update();
+    list.addEventListener('scroll', update, { passive: true });
+    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(update);
+    ro?.observe(list);
+    return () => {
+      list.removeEventListener('scroll', update);
+      ro?.disconnect();
+    };
+  }, [lang]);
 
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     const i = STEP_IDS.indexOf(step);

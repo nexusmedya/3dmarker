@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { AbortError, defaultParams, type DriverInput, type Progress } from '../../core/types';
+import { AbortError, defaultParams, type DepthMap, type DriverInput, type Progress } from '../../core/types';
+import type { DetailedDepth } from '../../core/mesh/options';
 import type { HumanAnalysis } from '../../core/human/types';
 import { planCrops } from '../../core/human/enhance';
 import { fakeAnalysis, syntheticFace, syntheticHand } from '../../core/human/testing';
@@ -15,7 +16,7 @@ vi.mock('../../core/human/analyze', () => ({ analyzeHuman: vi.fn() }));
 const { requestDepth } = await import('./workerClient');
 const { analyzeHuman } = await import('../../core/human/analyze');
 const { ML_DRIVERS } = await import('./index');
-const { HUMAN_PARAMS } = await import('./depthDriver');
+const { HUMAN_PARAMS, humanUnavailableNote } = await import('./depthDriver');
 const mockedRequest = vi.mocked(requestDepth);
 const mockedAnalyze = vi.mocked(analyzeHuman);
 
@@ -194,5 +195,51 @@ describe('human detail in the ML depth drivers', () => {
     mockedRequest.mockClear();
     await driver.run(input({ params: { ...defaultParams(driver.params), detail: 840 } }));
     expect(mockedRequest).toHaveBeenCalledTimes(1); // global 840 only
+  });
+
+  it('marks the face / hand areas on the depth so the mesh keeps their fine relief', async () => {
+    const hand = syntheticHand(320, 200, 30);
+    mockedAnalyze.mockResolvedValue(fakeAnalysis(W, H, { faces: [face], hands: [hand] }));
+    const res = await driver.run(input({ params: defaultParams(driver.params) }));
+    if (res.kind !== 'depth') throw new Error('expected depth');
+    const regions = (res.depth as DepthMap & DetailedDepth).detail!;
+    expect(regions.map((r) => r.kind)).toEqual(['face', 'hand']);
+    const [f, h] = regions;
+    // Each region contains its landmark box (plus a margin for ears / finger tips).
+    expect(f.x).toBeLessThan(face.box.x);
+    expect(f.x + f.width).toBeGreaterThan(face.box.x + face.box.width);
+    expect(h.y).toBeLessThan(hand.box.y);
+    expect(h.y + h.height).toBeGreaterThan(hand.box.y + hand.box.height);
+    // No people → no regions.
+    mockedAnalyze.mockResolvedValue(fakeAnalysis(W, H));
+    const plain = await driver.run(input({ params: defaultParams(driver.params) }));
+    if (plain.kind !== 'depth') throw new Error('expected depth');
+    expect((plain.depth as DepthMap & DetailedDepth).detail).toBeUndefined();
+  });
+
+  it('says so in the progress when detection is unavailable, and still returns the depth', async () => {
+    const blocked: HumanAnalysis = {
+      ...fakeAnalysis(W, H),
+      unavailableReason: 'Could not load the human detection (face) model: HTTP 403',
+      unavailableText: { tr: 'İnsan algılama (yüz) modeli yüklenemedi: HTTP 403', en: 'Could not load the human detection (face) model: HTTP 403' },
+    };
+    mockedAnalyze.mockResolvedValue(blocked);
+    const inp = input({ params: defaultParams(driver.params) });
+    const res = await driver.run(inp);
+    expect(res.kind).toBe('depth');
+    const last = inp.progress.at(-1)!.label;
+    expect(last.en).toMatch(/^Human detail unavailable, continuing without face \/ hand relief: .*HTTP 403/);
+    expect(last.tr).toMatch(/^İnsan detayı kullanılamadı.*HTTP 403/);
+  });
+
+  it('notes partial failures and keeps the detectors that worked', async () => {
+    mockedAnalyze.mockResolvedValue({ ...withFace(), failed: { hands: 'timed out' } });
+    const inp = input({ params: defaultParams(driver.params) });
+    const res = await driver.run(inp);
+    if (res.kind !== 'depth') throw new Error('expected depth');
+    expect(inp.progress.map((p) => p.label.en)).toContain('Human detail partly unavailable (the hand detection model did not load); continuing with what was found…');
+    expect((res.depth as DepthMap & DetailedDepth).detail).toHaveLength(1);
+    expect(humanUnavailableNote(withFace())).toBeNull();
+    expect(humanUnavailableNote(null)?.en).toMatch(/unknown error/);
   });
 });

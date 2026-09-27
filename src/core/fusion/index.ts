@@ -13,13 +13,21 @@ export {
   alignView,
   alignedBox,
   correctionOf,
+  crossCheckViews,
+  duplicatesFront,
+  featureless,
+  impliedDepth,
+  facingCue,
   formatPercent,
   registerViews,
+  sameImage,
+  slotCap,
+  slotEvidence,
 } from './align';
 export type { AlignOptions } from './align';
-export { FUSION_TEXT, FUSION_VIEW_NAMES, prepareFusionViews, reconstructFromViews, sanitizeFusionOptions, viewWarning } from './reconstruct';
-export { GUARD_FILL, GuardField, buildGuard, buildGuardSteps, localThickness } from './guard';
-export type { GuardOptions } from './guard';
+export { DepthOfflineError, FUSION_TEXT, FUSION_VIEW_NAMES, prepareFusionViews, reconstructFromViews, sanitizeFusionOptions, viewWarning } from './reconstruct';
+export { GUARD_FILL, GuardField, ROUND_SLACK, buildGuard, buildGuardSteps, localThickness, thinPartGate } from './guard';
+export type { GuardOptions, ThinPartInfo } from './guard';
 export { calibrateDepth, calibrateDepthAnchored } from './depthCarve';
 export type { CarveStats } from './depthCarve';
 export { buildHull, buildHullPlanesSteps, buildHullSteps, createGrid } from './volume';

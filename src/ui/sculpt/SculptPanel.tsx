@@ -115,6 +115,18 @@ const TEXT = {
     tr: 'Mesh seçeneklerini değiştirmek yüzeyi yeniden örer ve heykel düzenlemelerini siler.',
     en: 'Changing the mesh options rebuilds the surface and discards sculpt edits.',
   },
+  emptyStroke: {
+    tr: 'Fırça hiçbir noktaya değmedi: model bu fırça için çok seyrek. Fırçayı büyütün ya da daha yüksek çözünürlükte üretin.',
+    en: 'The brush touched no vertices: the mesh is too coarse for this brush. Enlarge the brush or generate at a higher resolution.',
+  },
+  coarse: {
+    tr: 'Mesh bu fırça boyutu için seyrek: noktalar fırçadan daha aralıklı, darbeler etkisiz kalabilir. Fırçayı büyütün ya da daha yüksek çözünürlükte üretin.',
+    en: 'The mesh is sparse for this brush size: its points are further apart than the brush, so strokes may do nothing. Enlarge the brush or generate at a higher resolution.',
+  },
+  refined: {
+    tr: 'Mesh heykel için sıklaştırıldı: {from} → {to} üçgen.',
+    en: 'The mesh was subdivided for sculpting: {from} → {to} triangles.',
+  },
   shortcuts: { tr: 'Kısayollar', en: 'Shortcuts' },
   kBrush: { tr: 'Fırça seç', en: 'Pick a brush' },
   kRadius: { tr: 'Yarıçap küçült / büyüt', en: 'Radius smaller / larger' },
@@ -214,6 +226,10 @@ export function SculptPanel({ coreRef, model, enabled, onEdited, onActiveChange,
   const [preparing, setPreparing] = useState(false);
   const [noMeshes, setNoMeshes] = useState(false);
   const [error, setError] = useState<I18nText | null>(null);
+  /** The last stroke reached no vertex (cleared by the next edit). */
+  const [emptyStroke, setEmptyStroke] = useState(false);
+  /** Mesh density of the session: median edge and bounding radius (world), refinement at start. */
+  const [density, setDensity] = useState<{ median: number; radius: number; refined: { before: number; after: number } | null } | null>(null);
 
   const sessionRef = useRef<SculptSession | null>(null);
   const unsubRef = useRef<(() => void) | null>(null);
@@ -256,7 +272,11 @@ export function SculptPanel({ coreRef, model, enabled, onEdited, onActiveChange,
         if (keep) parkSession(s);
         else s.dispose();
       }
-      if (mountedRef.current) setState(IDLE);
+      if (mountedRef.current) {
+        setState(IDLE);
+        setEmptyStroke(false);
+        setDensity(null);
+      }
       setActiveFlag(false);
     },
     [setActiveFlag],
@@ -296,11 +316,19 @@ export function SculptPanel({ coreRef, model, enabled, onEdited, onActiveChange,
     (s: SculptSession) => {
       sessionRef.current = s;
       if (s.settings !== settingsRef.current) s.setSettings(settingsRef.current);
+      setEmptyStroke(false);
+      setDensity({ median: s.medianEdgeLength, radius: s.boundingRadius, refined: s.refined });
       unsubRef.current = s.subscribe((e) => {
         if (e.type === 'settings') setSettings(e.settings);
+        else if (e.type === 'empty-stroke') setEmptyStroke(true);
         else {
           setState(e.state);
-          if (e.type === 'edit') scheduleStats(s);
+          if (e.type === 'edit') {
+            setEmptyStroke(false);
+            // Re-meshed (syncGeometry): the density changed.
+            setDensity((d) => (d && d.median === s.medianEdgeLength ? d : { median: s.medianEdgeLength, radius: s.boundingRadius, refined: s.refined }));
+            scheduleStats(s);
+          }
         }
       });
     },
@@ -351,9 +379,11 @@ export function SculptPanel({ coreRef, model, enabled, onEdited, onActiveChange,
         setNoMeshes(true);
         return;
       }
-      statsOf(session); // once, while "Preparing…" shows: strokes never change the topology
+      const stats = statsOf(session); // once, while "Preparing…" shows: strokes never change the topology
       attach(session);
       cbRef.current.onSessionStart?.();
+      // A coarse mesh was subdivided: report its new size (not an edit: 0 strokes).
+      if (session.refined) cbRef.current.onEdited(stats, 0);
     }
     session.setActive(true);
     setState(session.state);
@@ -373,6 +403,7 @@ export function SculptPanel({ coreRef, model, enabled, onEdited, onActiveChange,
 
   const active = state.active;
   const blocked: I18nText | null = !model ? TEXT.noModel : !enabled ? TEXT.disabled : noMeshes ? TEXT.noMeshes : null;
+  const coarse = !!density && density.median > settings.radius * density.radius;
   const radiusPct = ((settings.radius - RADIUS_MIN) / (RADIUS_MAX - RADIUS_MIN)) * 100;
 
   return (
@@ -414,6 +445,21 @@ export function SculptPanel({ coreRef, model, enabled, onEdited, onActiveChange,
       {active && (
         <div className="sculpt-body">
           <p className="muted small">{tx(TEXT.howTo)}</p>
+
+          {density?.refined && (
+            <p className="note small" data-testid="sculpt-refined">
+              <IconInfo size={14} /> {tx(TEXT.refined, { from: int(density.refined.before), to: int(density.refined.after) })}
+            </p>
+          )}
+          {emptyStroke ? (
+            <p className="note sculpt-warn small" role="status" data-testid="sculpt-empty-stroke">
+              <IconAlert size={14} /> {tx(TEXT.emptyStroke)}
+            </p>
+          ) : coarse ? (
+            <p className="note sculpt-warn small" data-testid="sculpt-coarse">
+              <IconAlert size={14} /> {tx(TEXT.coarse)}
+            </p>
+          ) : null}
 
           <div className="sculpt-brushes" role="group" aria-label={tx(TEXT.brushes)}>
             {BRUSH_IDS.map((b, i) => (

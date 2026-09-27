@@ -31,7 +31,7 @@ vi.mock('../core/fusion/frame', async (importOriginal) => {
 });
 vi.mock('../core/fusion/align', () => ({
   alignView: mocks.alignView,
-  ALIGN_TEXT: { weak: { tr: 'Önle eşleştirilemedi', en: 'Could not be matched to the front' } },
+  ALIGN_TEXT: { weak: { tr: 'Ön görünümle eşleştirilemedi', en: 'Could not be matched to the front' } },
 }));
 vi.mock('../app/pipeline', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../app/pipeline')>();
@@ -123,7 +123,7 @@ function fakeCheck(view: { id: ViewAlignment['id']; align?: ViewAlign }): ViewAl
     cut: { top: false, bottom: false, left: false, right: false },
     fitBox: { x0: 0, y0: 0, x1: 2, y1: 2 },
     trust: 'full',
-    notes: [{ code: 'aligned', text: { tr: 'Önle hizalı', en: 'Aligned with the front' } }],
+    notes: [{ code: 'aligned', text: { tr: 'Ön görünümle hizalı', en: 'Aligned with the front' } }],
     guides: { rows: [], cols: [] },
   };
 }
@@ -411,6 +411,36 @@ describe('views', () => {
     // A brand-new image starts over.
     await load('other.png');
     expect(studio.state.views).toEqual({});
+  });
+
+  it('one refused view does not stop the batch; key / quota errors still do', async () => {
+    const { AiError } = await import('../ai/transport');
+    mocks.generateViewImage.mockImplementation(async (view: string) => {
+      if (view === 'left') throw new AiError({ tr: 'Reddedildi', en: 'Refused' }, 'content-policy', 400);
+      return new Blob([`ai-${view}`], { type: 'image/png' });
+    });
+    await mount();
+    await act(async () => {
+      studio.actions.setAiSettings(withKey());
+      studio.actions.setPrep({ subject: 'object' });
+    });
+    await load('toy.png');
+    await act(async () => studio.actions.generateMissing());
+    expect(mocks.generateViewImage.mock.calls.map((c) => c[0])).toEqual(['back', 'left', 'right', 'top', 'bottom']);
+    expect(Object.keys(studio.state.views).sort()).toEqual(['back', 'bottom', 'right', 'top']);
+    expect(studio.state.viewsError?.en).toBe('4/5 views generated; Left: content policy');
+    expect(studio.state.viewsError?.tr).toBe('4/5 görünüm üretildi; Sol: içerik politikası');
+
+    // A rate limit would hit every remaining view: stop at the first one.
+    mocks.generateViewImage.mockReset();
+    mocks.generateViewImage.mockImplementation(async () => {
+      throw new AiError({ tr: 'Hız sınırı', en: 'Rate limited' }, 'rate-limit', 429);
+    });
+    await act(async () => studio.actions.clearView('top'));
+    await act(async () => studio.actions.clearView('bottom'));
+    await act(async () => studio.actions.generateMissing());
+    expect(mocks.generateViewImage).toHaveBeenCalledOnce();
+    expect(studio.state.viewsError?.en).toBe('Rate limited');
   });
 
   it('a view upload that finishes after a new front image is dropped', async () => {

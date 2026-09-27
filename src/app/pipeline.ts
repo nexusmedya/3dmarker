@@ -27,7 +27,7 @@ import type { DepthMap, Driver, DriverResult, Mask, ParamValues, Progress, RGBAI
 import { AbortError, throwIfAborted } from '../core/types';
 import type { FusionReport } from '../core/fusion/types';
 import { fitRGBA, hasTransparency, maskArea, maskFromAlpha } from '../core/image/ops';
-import { autoMaskFromBorder } from '../core/image/autoMask';
+import { autoMaskFromBorder, hasMeaningfulAlpha } from '../core/image/autoMask';
 import { loadImageFile } from '../core/image/load';
 import { removeBackground } from '../core/preprocess/removeBackground';
 import { buildGeometryFromDepth, type DepthMeshUserData } from '../core/mesh/buildFromDepth';
@@ -67,19 +67,26 @@ export async function prepareSource(
   return { name, file, image: fitRGBA(decoded, WORKING_MAX_SIDE) };
 }
 
-/** Why the preview has no mask: 'no-alpha' (auto, opaque image), 'border-failed', 'deferred' (AI runs on Generate). */
+/** Why the preview has no mask: 'no-alpha' (auto: neither alpha nor a plain background), 'border-failed', 'deferred' (AI runs on Generate). */
 export type MaskNote = 'no-alpha' | 'border-failed' | 'deferred' | null;
 
 /** Masks that are cheap enough to compute immediately (for the preview overlay). */
 export function quickMask(image: RGBAImage, mode: BackgroundMode): { mask: Mask | null; note: MaskNote } {
   switch (mode) {
     case 'auto':
-      return hasTransparency(image) ? { mask: nonEmpty(maskFromAlpha(image)), note: null } : { mask: null, note: 'no-alpha' };
     case 'border': {
-      // A transparent PNG already has the best mask: its alpha.
-      if (hasTransparency(image)) return { mask: nonEmpty(maskFromAlpha(image)), note: null };
+      // A transparent PNG already has the best mask: its alpha. Opaque images
+      // (JPEG, flattened PNG) fall back to the plain-background flood fill, as
+      // the silhouette drivers and extra views do.
+      if (hasMeaningfulAlpha(image)) return { mask: nonEmpty(maskFromAlpha(image)), note: null };
       const mask = autoMaskFromBorder(image);
-      return mask ? { mask, note: null } : { mask: null, note: 'border-failed' };
+      if (mask) return { mask, note: null };
+      // Only a few soft-alpha pixels: their alpha is still better than nothing.
+      if (hasTransparency(image)) {
+        const alpha = nonEmpty(maskFromAlpha(image));
+        if (alpha && maskArea(alpha) < alpha.width * alpha.height) return { mask: alpha, note: null };
+      }
+      return { mask: null, note: mode === 'auto' ? 'no-alpha' : 'border-failed' };
     }
     case 'ai':
       return { mask: null, note: 'deferred' };

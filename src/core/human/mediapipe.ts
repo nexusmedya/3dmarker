@@ -40,11 +40,27 @@ const NAMES: Record<HumanDetector, I18nText> = {
   pose: { tr: 'vücut', en: 'body' },
 };
 
+/** Common browser / network failures in plain words (both languages); anything else verbatim. */
+export function failureDetail(detail: string): I18nText {
+  const http = /\bHTTP (\d{3})\b/.exec(detail);
+  if (http) return { tr: `sunucu HTTP ${http[1]} yanıtı verdi`, en: `the server answered HTTP ${http[1]}` };
+  if (/timed out|timeout/i.test(detail)) return { tr: 'indirme zaman aşımına uğradı (bağlantı çok yavaş ya da kesildi)', en: 'the download timed out (connection too slow or dropped)' };
+  if (/failed to fetch|networkerror|load failed|network ?error|err_/i.test(detail)) {
+    return {
+      tr: 'model sunucusuna ulaşılamadı (ağ bağlantısı, güvenlik duvarı ya da içerik engelleyici)',
+      en: 'the model server could not be reached (network, firewall or a content blocker)',
+    };
+  }
+  if (/webgl|gpu|context/i.test(detail)) return { tr: `grafik hızlandırma (WebGL) başlatılamadı: ${detail}`, en: `graphics acceleration (WebGL) could not start: ${detail}` };
+  return { tr: detail, en: detail };
+}
+
 function failure(kind: HumanDetector, detail: string): LocalizedError {
   const n = NAMES[kind];
+  const d = failureDetail(detail);
   return new LocalizedError({
-    tr: `İnsan algılama (${n.tr}) modeli yüklenemedi: ${detail}`,
-    en: `Could not load the human detection (${n.en}) model: ${detail}`,
+    tr: `İnsan algılama (${n.tr}) modeli yüklenemedi: ${d.tr}`,
+    en: `Could not load the human detection (${n.en}) model: ${d.en}`,
   });
 }
 

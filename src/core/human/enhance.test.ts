@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { AbortError, type DepthMap, type Mask, type RGBAImage } from '../types';
 import {
+  humanDetailRegions,
+  withDetailRegions,
   applyField,
   enhanceHumanDepth,
   fitRange,
@@ -249,5 +251,39 @@ describe('applyField / fitRange', () => {
     expect(out[3]).toBe(0);
     expect(out[4]).toBeCloseTo(0.9, 6); // background untouched
     expect(out[1]).toBeLessThan(0.6);
+  });
+});
+
+describe('humanDetailRegions', () => {
+  it('covers faces (with room for the ears) and hands, scaled to the depth grid, skipping tiny ones', () => {
+    const face = syntheticFace(200, 150, 60, 80);
+    const hand = syntheticHand(320, 220, 40);
+    const tiny = syntheticFace(40, 40, 8, 10);
+    const a = fakeAnalysis(W, H, { faces: [face, tiny], hands: [hand] });
+    const r = humanDetailRegions(a, W, H);
+    expect(r.map((x) => x.kind)).toEqual(['face', 'hand']);
+    const [f, h] = r;
+    const side = Math.max(face.box.width, face.box.height);
+    expect(face.box.x - f.x).toBeGreaterThanOrEqual(0.19 * side);
+    expect(f.x + f.width - (face.box.x + face.box.width)).toBeGreaterThanOrEqual(0.19 * side);
+    expect(h.x).toBeLessThan(hand.box.x);
+    for (const b of r) {
+      expect(b.x).toBeGreaterThanOrEqual(0);
+      expect(b.y).toBeGreaterThanOrEqual(0);
+      expect(b.x + b.width).toBeLessThanOrEqual(W);
+      expect(b.y + b.height).toBeLessThanOrEqual(H);
+    }
+    // Half-size depth grid: half-size regions.
+    const half = humanDetailRegions(a, W / 2, H / 2);
+    expect(half[0].width).toBeCloseTo(f.width / 2, -0.5);
+  });
+
+  it('withDetailRegions shares the data and leaves the depth alone without regions', () => {
+    const depth: DepthMap = { width: 2, height: 1, data: new Float32Array(2) };
+    expect(withDetailRegions(depth, [])).toBe(depth);
+    const out = withDetailRegions(depth, [{ kind: 'hand', x: 0, y: 0, width: 1, height: 1 }]) as DepthMap & { detail?: unknown[] };
+    expect(out.data).toBe(depth.data);
+    expect(out.detail).toHaveLength(1);
+    expect('detail' in depth).toBe(false);
   });
 });

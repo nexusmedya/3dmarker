@@ -4,6 +4,7 @@
  * (Shift = smooth, Ctrl/Cmd = raise ↔ lower), radius / strength / falloff,
  * undo / redo, wheel zoom around the pointer, Space-drag or middle-drag pan,
  * a before / after toggle, Apply (onApply(newDepth), then onClose) / Cancel.
+ * Closing with edits (Esc, X, Cancel) asks first; Esc again keeps editing.
  * The brush maths live in src/sculpt/depthBrush.ts.
  */
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
@@ -48,6 +49,9 @@ const TEXT = {
   cancel: { tr: 'İptal', en: 'Cancel' },
   apply: { tr: 'Uygula', en: 'Apply' },
   edits: { tr: '{n} düzenleme', en: '{n} edits' },
+  discardAsk: { tr: '{n} düzenleme silinsin mi?', en: 'Discard {n} edits?' },
+  keepEditing: { tr: 'Düzenlemeye devam', en: 'Keep editing' },
+  discard: { tr: 'Vazgeç ve kapat', en: 'Discard' },
   help: {
     tr: 'Sürükle: boya · Shift: yumuşat · Ctrl/⌘: yükselt ↔ alçalt · [ ]: yarıçap · Tekerlek: yakınlaş · Boşluk + sürükle / orta tuş: kaydır · Ctrl/⌘ + Z: geri al',
     en: 'Drag: paint · Shift: smooth · Ctrl/⌘: raise ↔ lower · [ ]: radius · Wheel: zoom · Space + drag / middle button: pan · Ctrl/⌘ + Z: undo',
@@ -112,6 +116,8 @@ function DepthEditorDialog({ depth, mask, image, onApply, onClose }: Props) {
   const [maskOnly, setMaskOnly] = useState(true);
   const [before, setBefore] = useState(false);
   const [view, setView] = useState<View>({ zoom: 1, x: 0, y: 0 });
+  /** Closing with edits asks first (Esc / X / Cancel are easy to hit by accident). */
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [, setVersion] = useState(0);
   const bump = () => setVersion((v) => v + 1);
 
@@ -243,7 +249,7 @@ function DepthEditorDialog({ depth, mask, image, onApply, onClose }: Props) {
   };
 
   const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
-    if (paintRef.current || panRef.current) return;
+    if (paintRef.current || panRef.current || confirmDiscard) return;
     // The zoom / Fit HUD sits on the stage: its buttons neither paint nor lose their click to pointer capture.
     if (e.target instanceof Element && e.target.closest('.dme-hud, button, input, select')) return;
     const stage = stageRef.current!;
@@ -330,6 +336,23 @@ function DepthEditorDialog({ depth, mask, image, onApply, onClose }: Props) {
     onClose();
   };
 
+  // Back from the confirm: its buttons are gone, give the keys back to the dialog.
+  const asked = useRef(false);
+  useEffect(() => {
+    if (asked.current && !confirmDiscard) dialogRef.current?.focus();
+    asked.current = confirmDiscard;
+  }, [confirmDiscard]);
+
+  /** Esc / X / Cancel: close at once when nothing was edited, else ask. */
+  const requestClose = () => {
+    if (paintRef.current) {
+      paintRef.current = null;
+      if (edit.endStroke()) bump();
+    }
+    if (edit.strokes > 0) setConfirmDiscard(true);
+    else onClose();
+  };
+
   const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
     // Modal: shortcuts of the page (generate, sculpt) must not see these keys.
     e.stopPropagation();
@@ -338,14 +361,16 @@ function DepthEditorDialog({ depth, mask, image, onApply, onClose }: Props) {
     const mod = e.ctrlKey || e.metaKey;
     if (e.key === 'Escape') {
       e.preventDefault();
-      onClose();
+      // A second Esc answers "keep editing": pressing it twice never loses work.
+      if (confirmDiscard) setConfirmDiscard(false);
+      else requestClose();
       return;
     }
     if (e.key === 'Tab') {
       trapFocus(e, dialogRef.current);
       return;
     }
-    if (inField) return;
+    if (inField || confirmDiscard) return;
     if (mod && (e.key === 'z' || e.key === 'Z' || e.code === 'KeyZ')) {
       e.preventDefault();
       if (e.shiftKey) redo();
@@ -403,7 +428,7 @@ function DepthEditorDialog({ depth, mask, image, onApply, onClose }: Props) {
           <span className="muted small tabular">
             {w} × {h}
           </span>
-          <button type="button" className="icon-btn" onClick={onClose} aria-label={tx(TEXT.close)} title={tx(TEXT.close)} data-testid="depth-close">
+          <button type="button" className="icon-btn" onClick={requestClose} aria-label={tx(TEXT.close)} title={tx(TEXT.close)} data-testid="depth-close">
             <IconX size={18} />
           </button>
         </header>
@@ -575,12 +600,28 @@ function DepthEditorDialog({ depth, mask, image, onApply, onClose }: Props) {
           <span className="muted small tabular grow" data-testid="depth-edits" data-edits={edit.strokes}>
             {tx(TEXT.edits, { n: int(edit.strokes) })}
           </span>
-          <button type="button" className="btn btn-secondary" onClick={onClose} data-testid="depth-cancel">
-            {tx(TEXT.cancel)}
-          </button>
-          <button type="button" className="btn btn-primary" onClick={apply} data-testid="depth-apply">
-            {tx(TEXT.apply)}
-          </button>
+          {confirmDiscard ? (
+            <div className="dme-confirm" role="alertdialog" aria-labelledby={`${id}-discard`} data-testid="depth-discard-confirm">
+              <span id={`${id}-discard`} className="dme-confirm-text">
+                {tx(TEXT.discardAsk, { n: int(edit.strokes) })}
+              </span>
+              <button type="button" className="btn btn-secondary" autoFocus onClick={() => setConfirmDiscard(false)} data-testid="depth-keep">
+                {tx(TEXT.keepEditing)}
+              </button>
+              <button type="button" className="btn btn-secondary dme-discard" onClick={onClose} data-testid="depth-discard">
+                {tx(TEXT.discard)}
+              </button>
+            </div>
+          ) : (
+            <>
+              <button type="button" className="btn btn-secondary" onClick={requestClose} data-testid="depth-cancel">
+                {tx(TEXT.cancel)}
+              </button>
+              <button type="button" className="btn btn-primary" onClick={apply} data-testid="depth-apply">
+                {tx(TEXT.apply)}
+              </button>
+            </>
+          )}
         </footer>
       </div>
     </div>

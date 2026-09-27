@@ -4,6 +4,7 @@ import { LocalizedError } from '../../core/errors';
 import { computeMeshStats } from '../../core/mesh/stats';
 import { FUSION_TEXT } from '../../core/fusion/reconstruct';
 import { renderView, sphere } from '../../core/fusion/testing';
+import { localizeMlError } from '../ml/errors';
 import type { DepthJob, DepthPayload } from '../../workers/mlProtocol';
 import type { MlRequestOptions } from '../ml/workerClient';
 
@@ -142,6 +143,19 @@ describe('multiview-fusion driver', () => {
     expect(mockedRequest).toHaveBeenCalledTimes(1);
     expect(inp.progress.some((p) => p.label.en.includes(FUSION_TEXT.depthUnavailable.en))).toBe(true);
     expect(r.geometry.userData.multiview.warnings).toContainEqual({ tr: 'Yapay zekâ modeli indirilemedi', en: 'Could not download the AI model' });
+  });
+
+  it('reports a failed model download as the fusion\'s own offline note, not the drivers\' advice', async () => {
+    for (const failure of [new TypeError('Failed to fetch'), localizeMlError(new TypeError('Failed to fetch'), 'onnx-community/depth-anything-v2-small')]) {
+      mockedRequest.mockReset();
+      mockedRequest.mockRejectedValue(failure);
+      const r = await driver.run(input(['back', 'right', 'top']));
+      if (r.kind !== 'geometry') throw new Error('no geometry');
+      expect(mockedRequest).toHaveBeenCalledTimes(1);
+      const warnings = r.geometry.userData.multiview.warnings as { tr: string; en: string }[];
+      expect(warnings[0]).toEqual(FUSION_TEXT.depthOffline);
+      expect(warnings.some((w) => /Siluet şişirme|Failed to fetch/.test(w.tr) || /Silhouette inflate|Failed to fetch/.test(w.en))).toBe(false);
+    }
   });
 
   it('needs at least one extra view', async () => {

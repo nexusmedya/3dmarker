@@ -11,7 +11,7 @@ import {
   type GpuLike,
   type LoadRequest,
 } from './mlEngine';
-import { WEBGPU_FAILED_ERROR, type MlProgress } from './mlProtocol';
+import { modelStalledError, MODEL_STALLED_ERROR, WEBGPU_FAILED_ERROR, type MlProgress } from './mlProtocol';
 
 class ModelFileNotFoundError extends Error {
   constructor(message: string) {
@@ -199,6 +199,26 @@ describe('MlEngine', () => {
     warn.mockRestore();
   });
 
+  it('rethrows a stalled download on WebGPU as-is (no WASM retry), and a later run loads afresh', async () => {
+    let stall = true;
+    const loads: string[] = [];
+    const engine = new MlEngine<string>({
+      detectGpu: async () => ({ available: true, fp16: true }),
+      dispose: () => {},
+      load: async (req) => {
+        loads.push(`${req.device}|${req.dtype}`);
+        if (stall) throw modelStalledError('https://hf.example/config.json', 30_000);
+        return 'pipe';
+      },
+    });
+    const err = await engine.run(spec(), () => {}, async () => null).catch((e: unknown) => e);
+    expect((err as Error).name).toBe(MODEL_STALLED_ERROR);
+    expect(loads).toEqual(['webgpu|fp16']);
+    stall = false;
+    await expect(engine.run(spec(), () => {}, async (p) => p)).resolves.toMatchObject({ result: 'pipe', device: 'webgpu' });
+    expect(engine.cachedCount).toBe(1);
+  });
+
   it('propagates WASM errors (no infinite retries)', async () => {
     const { engine } = setup({ gpu: { available: false, fp16: false }, failLoad: ['wasm|q8'] });
     await expect(engine.run(spec(), () => {}, async () => null)).rejects.toThrow('load failed on wasm|q8');
@@ -216,11 +236,12 @@ describe('MlEngine', () => {
     expect(engine.cachedCount).toBe(0);
   });
 
-  it('emits load → download → load → inference progress', async () => {
+  it('emits download (at once, before any file event) → load → inference progress', async () => {
     const { engine } = setup();
     const events: MlProgress[] = [];
     await engine.run(spec(), (p) => events.push(p), async () => null);
-    expect(events.map((e) => e.stage)).toEqual(['load', 'download', 'download', 'load', 'load', 'inference']);
+    expect(events.map((e) => e.stage)).toEqual(['download', 'download', 'download', 'load', 'load', 'inference']);
+    expect(events[0]).toEqual({ stage: 'download', device: 'webgpu' });
     expect(events[2]).toMatchObject({ stage: 'download', ratio: 0.5, loadedBytes: 50, totalBytes: 100, device: 'webgpu' });
     // cached: only inference
     events.length = 0;

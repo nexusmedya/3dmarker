@@ -15,6 +15,7 @@
 import { Bone, Skeleton, Vector3 } from 'three';
 import type { Object3D } from 'three';
 import { bonesOfLayout, END_BONES, parentOf, primaryChild } from './bones';
+import type { ContactSample } from './contact';
 import type { HumanoidBone, JointLayout, Vec3 } from './types';
 
 export interface RestTransform {
@@ -42,6 +43,8 @@ export interface RigDescriptor {
   hipHeight: number;
   /** Sum of the thigh + shin lengths (averaged over both legs). */
   legLength: number;
+  /** Skinned-surface sample of a bound rig (clips are grounded on it; joints only without it). */
+  contact?: ContactSample;
 }
 
 const v = (p: Vec3) => new Vector3(p.x, p.y, p.z);

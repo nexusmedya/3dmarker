@@ -6,7 +6,7 @@
  * generation would discard, `discardWarning` says so under the button and
  * `confirming` swaps the button for an inline "Regenerate anyway" question.
  */
-import type { ReactNode } from 'react';
+import { useEffect, useRef, type ReactNode } from 'react';
 import type { I18nText, Progress } from '../core/types';
 import type { JobStatus } from '../app/store';
 import { useI18n } from './i18n';
@@ -33,6 +33,8 @@ interface Props {
   confirming?: boolean;
   onConfirm?: () => void;
   onCancelConfirm?: () => void;
+  /** A recovery button in the error alert (e.g. "Try Silhouette inflate"). */
+  errorAction?: { label: string; onClick: () => void } | null;
 }
 
 export function GeneratePanel({
@@ -52,12 +54,22 @@ export function GeneratePanel({
   confirming,
   onConfirm,
   onCancelConfirm,
+  errorAction,
 }: Props) {
   const { t, tx } = useI18n();
   const running = status === 'running';
   const asking = !running && canGenerate && !!confirming && !!discardWarning;
+  // Sticky on phones: focused controls keep clear of it (styles.css scroll-margin).
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => document.documentElement.style.setProperty('--generate-h', `${el.offsetHeight}px`));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   return (
-    <div className="generate-panel">
+    <div className="generate-panel" ref={ref}>
       {summary}
       {running ? (
         <div className="generate-row">
@@ -124,7 +136,16 @@ export function GeneratePanel({
           <IconAlert size={18} />
           <div className="alert-body">
             <strong>{errorTitle}</strong>
-            <p>{tx(error)}</p>
+            <ErrorText
+              text={tx(error)}
+              action={
+                errorAction && (
+                  <button type="button" className="btn btn-secondary btn-sm error-action" onClick={errorAction.onClick} data-testid="error-action">
+                    <IconSparkles size={14} /> {errorAction.label}
+                  </button>
+                )
+              }
+            />
           </div>
           <button type="button" className="icon-btn" onClick={onDismiss} aria-label={t('dismiss')} title={t('dismiss')}>
             <IconX size={16} />
@@ -132,6 +153,34 @@ export function GeneratePanel({
         </div>
       )}
     </div>
+  );
+}
+
+/** "Message. [technical detail]" → the message, and the detail for a disclosure. */
+export function splitErrorDetail(text: string): { message: string; detail: string | null } {
+  const m = /^([\s\S]*?)\s*\[([^\[\]]+)\]\s*$/.exec(text);
+  return m && m[1] ? { message: m[1], detail: m[2] } : { message: text, detail: null };
+}
+
+/** The message, then one row with the recovery action and the folded technical detail. */
+function ErrorText({ text, action }: { text: string; action?: ReactNode }) {
+  const { t } = useI18n();
+  const { message, detail } = splitErrorDetail(text);
+  return (
+    <>
+      <p>{message}</p>
+      {(action || detail) && (
+        <div className="error-extra">
+          {action}
+          {detail && (
+            <details className="error-detail" data-testid="error-detail">
+              <summary>{t('errorDetails')}</summary>
+              <code>{detail}</code>
+            </details>
+          )}
+        </div>
+      )}
+    </>
   );
 }
 

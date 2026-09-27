@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { Bone, Group, Mesh, MeshBasicMaterial, Ray, Skeleton, SkinnedMesh, Vector3 } from 'three';
 import { SculptSession } from './session';
 import { fakeHost, gridGeometry } from './testing';
+import { computeMeshStats } from '../core/mesh/stats';
+import { DEFAULT_EXTRUDE_OPTIONS, extrudeMask } from '../drivers/heuristic/extrude';
 
 const N = 32;
 const Z = new Vector3(0, 0, 1);
@@ -188,6 +190,81 @@ describe('SculptSession', () => {
     expect(session.geometries()).toEqual([next]);
     expect(events).toContain('edit');
     expect(session.applyStrokeAt(new Vector3(0, 0, 0), Z)).toBeGreaterThan(0);
+  });
+
+  it('refines a coarse mesh at session start so every brush reaches its flat faces', () => {
+    const coarse = () => new Mesh(gridGeometry(1), new MeshBasicMaterial()); // two triangles, no inner vertex
+    const plain = new SculptSession(fakeHost(), coarse(), { keyTarget: null, refine: false });
+    const events: string[] = [];
+    plain.subscribe((e) => events.push(e.type));
+    expect(plain.applyStrokeAt(new Vector3(0.3, 0.2, 0), Z)).toBe(0);
+    expect(events).toEqual(['empty-stroke']);
+    expect(plain.state.strokes).toBe(0);
+    expect(plain.medianEdgeLength).toBeGreaterThan(plain.worldRadius());
+
+    const mesh = coarse();
+    const geometry = mesh.geometry;
+    const session = new SculptSession(fakeHost(), mesh, { keyTarget: null });
+    expect(mesh.geometry).toBe(geometry); // refined in place
+    expect(session.refined).toMatchObject({ before: 2 });
+    expect(session.refined!.after).toBeGreaterThan(200);
+    expect(session.medianEdgeLength).toBeLessThan(session.worldRadius());
+    for (const brush of ['draw', 'inflate', 'crease', 'clay'] as const) {
+      session.setSettings({ brush });
+      expect(session.applyStrokeAt(new Vector3(0.3, 0.2, 0), Z), brush).toBeGreaterThan(0);
+    }
+    session.setSettings({ brush: 'grab' });
+    session.beginStroke(new Vector3(0.3, 0.2, 0), Z);
+    expect(session.grabTo(new Vector3(0.3, 0.2, 0.2))).toBeGreaterThan(0);
+    session.endStroke();
+    expect(session.state.strokes).toBe(5);
+    // Reset goes back to the refined, unedited surface.
+    expect(session.reset()).toBe(true);
+    const p = geometry.getAttribute('position');
+    for (let v = 0; v < p.count; v++) expect(p.getZ(v)).toBe(0);
+  });
+
+  it('refines an extruded star (earcut caps) so strokes on its front face count', () => {
+    const W = 128;
+    const star = (x: number, y: number) => {
+      const dx = x - W / 2, dy = y - W / 2;
+      const a = Math.atan2(dy, dx);
+      return Math.hypot(dx, dy) < W * (0.22 + 0.2 * Math.max(0, Math.cos(5 * a)));
+    };
+    const data = new Uint8Array(W * W);
+    for (let y = 0; y < W; y++) for (let x = 0; x < W; x++) data[y * W + x] = star(x + 0.5, y + 0.5) ? 1 : 0;
+    const geometry = extrudeMask({ width: W, height: W, data }, DEFAULT_EXTRUDE_OPTIONS);
+    const mesh = new Mesh(geometry, new MeshBasicMaterial());
+    const session = new SculptSession(fakeHost(), mesh, { keyTarget: null });
+    expect(session.refined).not.toBeNull();
+    expect(computeMeshStats(geometry).watertight).toBe(true);
+    const hit = session.raycast(new Ray(new Vector3(0.05, 0.03, 5), new Vector3(0, 0, -1)));
+    expect(hit).not.toBeNull();
+    for (const brush of ['draw', 'inflate', 'crease'] as const) {
+      session.setSettings({ brush });
+      expect(session.applyStrokeAt(hit!.point, hit!.normal), brush).toBeGreaterThan(0);
+    }
+    expect(session.state.strokes).toBe(3);
+  });
+
+  it('reports a stroke that reaches no vertex (brush smaller than the mesh spacing)', () => {
+    const { session } = setup({ settings: { radius: 0.01 } });
+    const events: string[] = [];
+    session.subscribe((e) => events.push(e.type));
+    // Between grid vertices (spacing 1/16), brush radius ~0.014.
+    expect(session.applyStrokeAt(new Vector3(1 / 32, 1 / 32, 0), Z)).toBe(0);
+    expect(events).toEqual(['empty-stroke']);
+    session.setSettings({ brush: 'grab' });
+    events.length = 0;
+    session.beginStroke(new Vector3(1 / 32, 1 / 32, 0), Z);
+    session.grabTo(new Vector3(1 / 32, 1 / 32, 0.1));
+    session.endStroke();
+    expect(events).toEqual(['empty-stroke']);
+    // A stroke that reaches vertices but changes nothing (smooth on a flat grid) is not "empty".
+    session.setSettings({ brush: 'smooth', radius: 0.2 });
+    events.length = 0;
+    session.applyStrokeAt(new Vector3(0, 0, 0), Z);
+    expect(events).toEqual([]);
   });
 
   it('dispose keeps the edits and releases the BVH', () => {

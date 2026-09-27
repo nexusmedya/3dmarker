@@ -49,6 +49,8 @@ export interface ResultInfo {
   sourceName: string;
   /** Multi-view fusion's consistency report (null for other drivers). */
   fusion: FusionReport | null;
+  /** Views present but switched off (trust 'off') when the fusion ran; the report itself skips them. */
+  fusionOff?: OtherViewId[];
 }
 
 /** The views besides the front (the front is always the source image). */
@@ -117,6 +119,8 @@ export interface AppState {
   error: I18nText | null;
   /** Heading for the error alert (image loading vs generation). */
   errorTitle: UIKey;
+  /** The last generation failed because a model could not be downloaded (offers an offline driver; only while status is 'error'). */
+  errorOffline: boolean;
   result: ResultInfo | null;
   view: ViewSettings;
   stlSizeMm: number;
@@ -150,6 +154,11 @@ export interface AppState {
   frontPrep: PrepOptions | null;
   /** The source before an accepted AI preparation ("Revert to original"). */
   original: SourceImage | null;
+  /**
+   * Undo slot of "Revert to original": the AI-prepared front and the AI views
+   * made from it (paid work), restorable while the original is still the front.
+   */
+  revertedAi: RevertedAi | null;
   views: ViewEntries;
   /**
    * Pre-run registration of each extra view against the current front
@@ -195,7 +204,7 @@ export type Action =
   | { type: 'jobStart' }
   | { type: 'jobProgress'; progress: Progress }
   | { type: 'jobDone'; result: ResultInfo; source: SourceImage; bgMode: BackgroundMode; inputMask: Mask | null }
-  | { type: 'jobFailed'; error: I18nText }
+  | { type: 'jobFailed'; error: I18nText; offline?: boolean }
   | { type: 'jobCancelled' }
   | { type: 'statsUpdated'; stats: MeshStats }
   | { type: 'setView'; view: Partial<ViewSettings> }
@@ -223,6 +232,7 @@ export type Action =
   | { type: 'prepDiscard' }
   | { type: 'prepAccept'; mask: Mask | null; maskNote: MaskNote }
   | { type: 'revertOriginal'; mask: Mask | null; maskNote: MaskNote }
+  | { type: 'restorePrepared'; mask: Mask | null; maskNote: MaskNote }
   | { type: 'dismissAiError'; kind: AiJobKind }
   // Views
   | { type: 'viewSet'; view: OtherViewId; entry: ViewEntry }
@@ -281,6 +291,7 @@ const freshSubject = (): Partial<AppState> => ({
     preparedWith: null,
     frontPrep: null,
     original: null,
+    revertedAi: null,
     human: null,
     aiJob: null,
     prepError: null,
@@ -313,6 +324,21 @@ function withoutAiViews(views: ViewEntries): ViewEntries {
     const v = views[id];
     if (v && v.origin !== 'ai') out[id] = v;
   }
+  return out;
+}
+
+/** What "Revert to original" set aside (see AppState.revertedAi). */
+export interface RevertedAi {
+  source: SourceImage;
+  /** The original that became the front again (restore only applies while it still is). */
+  original: SourceImage;
+  frontPrep: PrepOptions | null;
+  aiViews: ViewEntries;
+}
+
+function aiViewsOf(views: ViewEntries): ViewEntries {
+  const out: ViewEntries = {};
+  for (const id of OTHER_VIEWS) if (views[id]?.origin === 'ai') out[id] = views[id];
   return out;
 }
 
@@ -413,7 +439,7 @@ export function reducer(state: AppState, action: Action): AppState {
       return next;
     }
     case 'jobFailed':
-      return { ...state, status: 'error', progress: null, error: action.error, errorTitle: 'errorTitle' };
+      return { ...state, status: 'error', progress: null, error: action.error, errorTitle: 'errorTitle', errorOffline: !!action.offline };
     case 'jobCancelled':
       return { ...state, status: 'cancelled', progress: null };
     case 'statsUpdated':
@@ -474,7 +500,7 @@ export function reducer(state: AppState, action: Action): AppState {
     case 'dismissAiError':
       return action.kind === 'prep' ? { ...state, prepError: null } : { ...state, viewsError: null };
     case 'prepReady':
-      return { ...state, aiJob: null, prepError: null, prepared: action.prepared, preparedWith: action.options ?? null };
+      return { ...state, aiJob: null, prepError: null, prepared: action.prepared, preparedWith: action.options ?? null, revertedAi: null };
     case 'prepDiscard':
       return { ...state, prepared: null, preparedWith: null };
     case 'prepAccept': {
@@ -492,6 +518,7 @@ export function reducer(state: AppState, action: Action): AppState {
         viewsError: null,
         source: prepared,
         original: state.original ?? state.source,
+        revertedAi: null,
         prepared: null,
         preparedWith: null,
         frontPrep: state.preparedWith,
@@ -502,7 +529,7 @@ export function reducer(state: AppState, action: Action): AppState {
       };
     }
     case 'revertOriginal': {
-      if (!state.original) return state;
+      if (!state.original || !state.source) return state;
       return {
         ...state,
         views: withoutAiViews(state.views),
@@ -510,7 +537,28 @@ export function reducer(state: AppState, action: Action): AppState {
         viewsError: null,
         source: state.original,
         original: null,
+        revertedAi: { source: state.source, original: state.original, frontPrep: state.frontPrep, aiViews: aiViewsOf(state.views) },
         frontPrep: null,
+        mask: action.mask,
+        maskNote: action.maskNote,
+        aiMask: null,
+        human: null,
+      };
+    }
+    case 'restorePrepared': {
+      const r = state.revertedAi;
+      if (!r || state.source !== r.original) return state;
+      // Views uploaded after the revert keep their slots.
+      const views: ViewEntries = { ...r.aiViews, ...state.views };
+      return {
+        ...state,
+        views,
+        viewChecks: {},
+        viewsError: null,
+        source: r.source,
+        original: r.original,
+        frontPrep: r.frontPrep,
+        revertedAi: null,
         mask: action.mask,
         maskNote: action.maskNote,
         aiMask: null,
@@ -727,6 +775,7 @@ export function createInitialState(env: InitEnv): AppState {
     progress: null,
     error: null,
     errorTitle: 'errorTitle',
+    errorOffline: false,
     result: null,
     view,
     stlSizeMm: stl,
@@ -746,6 +795,7 @@ export function createInitialState(env: InitEnv): AppState {
     preparedWith: null,
     frontPrep: null,
     original: null,
+    revertedAi: null,
     views: {},
     viewChecks: {},
     sculptActive: false,

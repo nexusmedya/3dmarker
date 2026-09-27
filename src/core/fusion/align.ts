@@ -31,12 +31,19 @@
  * exception: its uncut axis keeps its own extent, so alignedBox (one scale)
  * reproduces such a fitBox on the cut (vertical) axis only.
  *
+ * Slot checks cap the score with a note saying why: a front / back image in a
+ * side / cap slot, a side view facing the wrong way, the front again as the
+ * back, the same image as the front or as another slot, a depth extent no
+ * view of this object can have or that contradicts the other views, a
+ * featureless blob (crossCheckViews compares the extra views with each other).
+ *
  * Results feed the hull (fitBox), the UI badge (score / level / notes) and
  * the overlay (guides). Pure and deterministic; Node-testable.
  */
 import type { I18nText, Lang, ViewId, ViewTrust } from '../types';
 import { DEFAULT_VIEW_ALIGN } from '../types';
 import type { MaskSource, PixelBox, PreparedView } from './frame';
+import { drain, type Steps } from './steps';
 import type {
   AlignCorrection,
   AlignLevel,
@@ -119,6 +126,52 @@ export const ALIGN = {
   /** Guides: strongest edges per axis, non-maximum suppression radius (fraction of the extent). */
   GUIDES: 6,
   GUIDE_NMS: 0.03,
+  /**
+   * Wrong slot: a side / cap view whose unshared extent ratio (see slotEvidence) is within SLOT_RATIO of
+   * the front's and whose unshared profile matches the front's (NCC ≥ SLOT_NCC) is a front / back image.
+   * Side slots also need the front of a figure: a neck, and ≥ SLOT_MULTI_RUN of its rows with a gap (legs,
+   * arms) — a lamp's or a square table's true side view looks exactly like its front.
+   */
+  SLOT_RATIO: [0.8, 1.25] as const,
+  SLOT_NCC: 0.9,
+  SLOT_MULTI_RUN: 0.05,
+  /** Facing (side views of a figure): feet + nose / face protrusion (fractions of the height) past this, the other way, → note 'facing'. */
+  FACING_MARGIN: 0.01,
+  /** Duplicate of the front: coverage IoU of the colour signatures at least this, and at most this share of cells changed. */
+  DUP_IOU: 0.95,
+  DUP_CHANGED: 0.015,
+  /** A signature cell has changed when a channel differs by more than this (0..1). */
+  DUP_CELL: 0.1,
+  /** Least share of the front's cells that differ from its mean colour (a plain front may have a look-alike back). */
+  DUP_DETAIL: 0.05,
+  /**
+   * Extent: the object depth a side / cap view implies (its unshared extent at the registered scale),
+   * as a multiple of the front's longest side, above which the view cannot show this object (a top
+   * image in a side slot); between views measuring the depth, a view off the others' median by more
+   * than EXTENT_OUTLIER (the others within EXTENT_AGREE of each other) contradicts them.
+   */
+  EXTENT_MAX: 3,
+  EXTENT_OUTLIER: 1.8,
+  EXTENT_AGREE: 1.4,
+  /**
+   * Featureless: a view whose silhouette has no structure along either axis (< STRUCTURE_MIN) while
+   * the front is a figure (a neck, rows with gaps) or is structured (≥ FEATURE_FRONT) and colour-detailed
+   * (≥ FEATURE_DETAIL of its cells) where the view is flat (< FEATURE_SHARE of the front's detail).
+   */
+  FEATURE_FRONT: 0.2,
+  FEATURE_DETAIL: 0.1,
+  FEATURE_SHARE: 0.25,
+  /**
+   * Score caps: wrong slot (poor), facing the wrong way (fair), a duplicate of the front as the back
+   * (fair), the same image as the front / another view in a side or cap slot (poor), an impossible or
+   * contradicting depth extent (poor), a featureless view (poor).
+   */
+  CAP_WRONG_SLOT: 30,
+  CAP_FACING: 70,
+  CAP_DUPLICATE: 79,
+  CAP_SAME_IMAGE: 30,
+  CAP_EXTENT: 35,
+  CAP_FEATURELESS: 40,
 } as const;
 
 /** Diagnostics sink for scripts / tests (null = silent). */
@@ -374,15 +427,36 @@ interface FrontRef {
   rows: RefAxis;
   cols: RefAxis;
   profiles: AxisProfiles;
+  /** Share of the silhouette's rows with more than one run (legs, arms beside the body): no solid of revolution. */
+  multiRun: number;
 }
 
 const frontCache = new WeakMap<PreparedView, FrontRef>();
+
+/** Share of the bbox rows whose silhouette has a gap of at least max(2 px, 1 % of the width) inside it. */
+function multiRunShare(view: PreparedView): number {
+  const { mask, bbox } = view;
+  const w = mask.width, minGap = Math.max(2, 0.01 * (bbox.x1 - bbox.x0));
+  let rows = 0;
+  for (let y = bbox.y0; y < bbox.y1; y++) {
+    let seen = false, gap = 0, split = false;
+    for (let x = bbox.x0; x < bbox.x1 && !split; x++) {
+      if (mask.data[y * w + x]) {
+        if (seen && gap >= minGap) split = true;
+        seen = true;
+        gap = 0;
+      } else if (seen) gap++;
+    }
+    if (split) rows++;
+  }
+  return rows / Math.max(1, bbox.y1 - bbox.y0);
+}
 
 function frontRef(front: PreparedView): FrontRef {
   let ref = frontCache.get(front);
   if (!ref) {
     const profiles = axisProfiles(front);
-    ref = { rows: refAxis(profiles.rows), cols: refAxis(profiles.cols), profiles };
+    ref = { rows: refAxis(profiles.rows), cols: refAxis(profiles.cols), profiles, multiRun: multiRunShare(front) };
     frontCache.set(front, ref);
   }
   return ref;
@@ -826,6 +900,8 @@ export function alignScore(a: {
   status: AlignStatus;
   id: ViewId;
   maskSource: MaskSource;
+  /** Upper bound from the slot checks (wrong slot, facing, duplicate). */
+  cap?: number;
 }): number {
   if (a.maskSource === 'none') return 0;
   const shared = SHARED_AXES[a.id];
@@ -837,7 +913,7 @@ export function alignScore(a: {
   const base = 100 * Math.min(1, Math.max(0, a.confidence)) * Math.max(0, fit);
   const cuts = (a.cut.top ? 1 : 0) + (a.cut.bottom ? 1 : 0) + (a.cut.left ? 1 : 0) + (a.cut.right ? 1 : 0);
   const pen = 8 * cuts + (a.status === 'stretched' ? 25 : 0);
-  return Math.round(Math.min(100, Math.max(0, base - pen)));
+  return Math.round(Math.min(100, a.cap ?? 100, Math.max(0, base - pen)));
 }
 
 export function alignLevel(score: number): AlignLevel {
@@ -848,7 +924,7 @@ export function alignLevel(score: number): AlignLevel {
 // Text
 
 export const ALIGN_TEXT = {
-  aligned: { tr: 'Önle hizalı', en: 'Aligned with the front' },
+  aligned: { tr: 'Ön görünümle hizalı', en: 'Aligned with the front' },
   autoAligned: { tr: 'Otomatik hizalandı: {what}', en: 'Auto-aligned: {what}' },
   lower: { tr: '%{n} aşağı', en: '{n} % down' },
   higher: { tr: '%{n} yukarı', en: '{n} % up' },
@@ -861,7 +937,7 @@ export const ALIGN_TEXT = {
   croppedLeft: { tr: 'Sol kenarda kesik', en: 'Cut off at the left edge' },
   croppedRight: { tr: 'Sağ kenarda kesik', en: 'Cut off at the right edge' },
   stretched: { tr: 'Kenarda kesik, ölçek bulunamadı; hizalama yaklaşık', en: 'Cut off at the edge, scale not found; alignment is approximate' },
-  weak: { tr: 'Önle eşleştirilemedi; çerçeve olduğu gibi kullanılıyor', en: 'Could not be matched to the front; using its frame as is' },
+  weak: { tr: 'Ön görünümle eşleştirilemedi; çerçeve olduğu gibi kullanılıyor', en: 'Could not be matched to the front; using its frame as is' },
   plain: { tr: 'Hizalanacak ayrıntı yok (düz siluet)', en: 'Nothing to align (a plain silhouette)' },
   aspect: { tr: 'En-boy oranı önden %{n} farklı; arka görünüm önle aynı oranda olmalı', en: 'Aspect differs from the front by {n} %; the back view should match the front\'s proportions' },
   sideBlind: { tr: 'Yan görünüm kol yüksekliğini doğrulayamaz; kollar kaybolursa "Yalnız renk"i deneyin', en: 'A side view cannot verify the arm height; if the arms vanish, try "Colour only"' },
@@ -870,7 +946,43 @@ export const ALIGN_TEXT = {
   colorOnly: { tr: 'Yalnız renk için kullanılıyor', en: 'Used for colour only' },
   off: { tr: 'Kapalı: birleştirmede kullanılmıyor', en: 'Off: not used in the fusion' },
   inconsistent: { tr: 'Ön görünümle tam örtüşmüyor; ince parçalar korundu', en: 'Does not quite match the front; thin parts were protected' },
-} satisfies Record<AlignNoteCode | 'lower' | 'higher' | 'leftOf' | 'rightOf' | 'scaled' | 'croppedTop' | 'croppedBottom' | 'croppedLeft' | 'croppedRight', I18nText>;
+  wrongSlot: {
+    tr: 'Bu bir ön/arka görünüm gibi görünüyor; yanlış yuvada mı? Doğru yuvaya yükleyin (şimdilik yalnız renk için kullanılıyor)',
+    en: 'This looks like a front/back view; is it in the wrong slot? Upload it into the right slot (used for colour only for now)',
+  },
+  facing: {
+    tr: 'Bu görünüm ters yöne bakıyor olabilir; "Yatay aynala"yı deneyin',
+    en: 'This view may face the wrong way; try "Flip horizontally"',
+  },
+  duplicate: {
+    tr: 'Ön görselle aynı görünüyor; yüz ve ön renkler arkaya geçer. Gerçek arka görünümü yükleyin',
+    en: 'Looks identical to the front; the face and front colours will appear on the back. Upload the real back view',
+  },
+  poor: {
+    tr: 'Ön görünümle uyuşmuyor; yanlış yuvada olabilir. Hizala panelinden düzeltin ya da güveni "Yalnız renk"/"Kapalı" yapın',
+    en: 'Does not match the front; it may be in the wrong slot. Fix it in the Align panel or set its trust to "Colour only"/"Off"',
+  },
+  sameImage: {
+    tr: 'Ön görselle aynı: ön görsel yanlışlıkla bu yuvaya yüklenmiş olabilir. Bu yönden çekilmiş görseli yükleyin ya da güveni "Yalnız renk"/"Kapalı" yapın (nesne her yönden gerçekten aynı görünüyorsa yok sayın)',
+    en: 'Same image as the front: the front may have been uploaded into this slot by mistake. Upload the image taken from this side or set its trust to "Colour only"/"Off" (ignore this if the object really looks the same from every side)',
+  },
+  sameImageOf: {
+    tr: '{other} görünümüyle aynı görsel: biri yanlış yuvada. Bu yönden çekilmiş görseli yükleyin ya da güveni "Yalnız renk"/"Kapalı" yapın',
+    en: 'Same image as the {other} view: one of them is in the wrong slot. Upload the image taken from this side or set its trust to "Colour only"/"Off"',
+  },
+  extent: {
+    tr: 'Boyutları bu yuvaya uymuyor: nesneyi önünün {n} katı derin gösteriyor (üst/alt görsel yan yuvada ya da tersi olabilir). Doğru yuvaya yükleyin; şimdilik yalnız renk için kullanılıyor',
+    en: 'Its proportions do not fit this slot: it makes the object {n}× as deep as the front is large (a top/bottom image in a side slot, or the other way round?). Upload it into the right slot; used for colour only for now',
+  },
+  extentOutlier: {
+    tr: 'Derinliği diğer görünümlerle çelişiyor ({n} kat farklı): yanlış yuvaya yüklenmiş olabilir. Doğru yuvaya yükleyin; şimdilik yalnız renk için kullanılıyor',
+    en: 'Its depth contradicts the other views ({n}× off): it may be in the wrong slot. Upload it into the right slot; used for colour only for now',
+  },
+  featureless: {
+    tr: 'Bu görünümde ayırt edici ayrıntı yok (düz bir leke ya da siluet); ön görünümle eşleştirilemez. Doğru görseli yükleyin ya da güveni "Yalnız renk"/"Kapalı" yapın',
+    en: 'This view has no distinguishing detail (a plain blob or silhouette); it cannot be matched to the front. Upload the right image or set its trust to "Colour only"/"Off"',
+  },
+} satisfies Record<AlignNoteCode | 'sameImageOf' | 'extentOutlier' | 'lower' | 'higher' | 'leftOf' | 'rightOf' | 'scaled' | 'croppedTop' | 'croppedBottom' | 'croppedLeft' | 'croppedRight', I18nText>;
 
 /** {n}: one decimal below 5, an integer above. */
 export function formatPercent(v: number): string {
@@ -994,14 +1106,19 @@ function resolveAxis(view: PreparedView, pair: Pair, fit: AxisFit, front: Prepar
 
 /** Registration of one view against the front (pure, deterministic). */
 export function alignView(front: PreparedView, view: PreparedView, o: Partial<AlignOptions> = {}): ViewAlignment {
+  return drain(alignViewSteps(front, view, o));
+}
+
+/** alignView as cooperative steps (a yield after every profile search and after the slot checks' profiles). */
+export function* alignViewSteps(front: PreparedView, view: PreparedView, o: Partial<AlignOptions> = {}): Steps<ViewAlignment> {
   const mode = o.mode ?? 'auto';
   const id = view.id;
   const shared = SHARED_AXES[id];
   const request = view.align ?? DEFAULT_VIEW_ALIGN;
   const manual = request.mode === 'manual';
-  const base = (status: AlignStatus, applied: AlignCorrection, suggested: AlignCorrection, confidence: number, fitBox: PixelBox, trust: ViewTrust, notes: AlignNote[]): ViewAlignment => {
+  const base = (status: AlignStatus, applied: AlignCorrection, suggested: AlignCorrection, confidence: number, fitBox: PixelBox, trust: ViewTrust, notes: AlignNote[], cap?: number): ViewAlignment => {
     const residual = alignResidual(suggested, applied);
-    const score = alignScore({ confidence, residual, cut: view.cut, status, id, maskSource: view.maskSource });
+    const score = alignScore({ confidence, residual, cut: view.cut, status, id, maskSource: view.maskSource, cap });
     const ref = frontRef(front);
     return {
       id, status, level: alignLevel(score), score, confidence, applied, suggested, residual,
@@ -1033,9 +1150,12 @@ export function alignView(front: PreparedView, view: PreparedView, o: Partial<Al
   const notes: AlignNote[] = [];
   const extraNotes: AlignNote[] = [];
   let confidence = 1;
+  yield;
   if (mode === 'auto') {
     let rows = rowsPair ? fitAxis(rowsPair, LOGK_GRID, true) : null;
+    if (rowsPair) yield;
     let cols = colsPair ? fitAxis(colsPair, LOGK_GRID, true) : null;
+    if (colsPair) yield;
     if (rows && cols && rowsPair && colsPair) {
       // Back: one content scale (the rows'); the columns re-fitted for their offset only — unless an
       // axis is cut, when each keeps its own evidence (see the header).
@@ -1047,11 +1167,13 @@ export function alignView(front: PreparedView, view: PreparedView, o: Partial<Al
         const logk = rows.status === 'aligned' ? rows.logk : cols.status === 'aligned' ? cols.logk : 0;
         if (cols.status === 'aligned' && Math.abs(cols.logk - logk) > 1e-9) cols = refitDelta(colsPair, logk, cols);
         if (rows.status === 'aligned' && Math.abs(rows.logk - logk) > 1e-9) rows = refitDelta(rowsPair, logk, rows);
+        yield;
       }
       // Mirrored back: the unmirrored columns fit wins clearly and the front is asymmetric.
       if (cols.status === 'aligned' && fref.cols.asymmetry >= ALIGN.MIRROR_ASYMMETRY) {
         const un = search({ ...colsPair, sign: 1 }, LOGK_GRID, true);
         if (un.st >= cols.st + ALIGN.MIRROR_MARGIN) extraNotes.push(alignNote('mirrored'));
+        yield;
       }
     }
     const ry = rows && rowsPair ? resolveAxis(view, rowsPair, rows, front, fref, 'rows') : null;
@@ -1105,8 +1227,393 @@ export function alignView(front: PreparedView, view: PreparedView, o: Partial<Al
     trust = request.trust;
   }
   if (id === 'left' || id === 'right') notes.push(alignNote('sideBlind'));
+  yield;
+  // Slot checks (most severe note first: the badge shows the first one).
+  let cap: number | undefined;
+  const flags: AlignNote[] = [];
+  const capAt = (c: number) => (cap = Math.min(cap ?? 100, c));
+  const same = id !== 'back' && sameImage(front, view);
+  if (same) {
+    flags.push(alignNote('sameImage'));
+    capAt(ALIGN.CAP_SAME_IMAGE);
+  }
+  if (wrongSlot(front, view, profiles)) {
+    // The same image says it more precisely; its geometry is still not this slot's.
+    if (!same) flags.push(alignNote('wrongSlot'));
+    capAt(ALIGN.CAP_WRONG_SLOT);
+    // Its unshared axis would set the object's depth (a T-pose becomes a slab): colour only, unless placed by hand.
+    if (!manual && trust === 'full') trust = 'color';
+  } else if (!same && facesWrongWay(view, profiles)) {
+    flags.push(alignNote('facing'));
+    capAt(ALIGN.CAP_FACING);
+  }
+  // A featureless view registers anywhere: its implied depth means nothing.
+  // (A weak match already says it could not be matched.)
+  const plainBlob = !same && status !== 'weak' && featureless(front, view, profiles);
+  const depth = same || plainBlob ? null : impliedDepth(front, view, fitBox);
+  if (depth !== null && depth > ALIGN.EXTENT_MAX) {
+    flags.push(extentNote(depth));
+    capAt(ALIGN.CAP_EXTENT);
+    if (!manual && trust === 'full') trust = 'color';
+  }
+  if (plainBlob) {
+    flags.push(alignNote('featureless'));
+    capAt(ALIGN.CAP_FEATURELESS);
+  }
+  if (id === 'back' && duplicatesFront(front, view)) {
+    flags.push(alignNote('duplicate'));
+    capAt(ALIGN.CAP_DUPLICATE);
+  }
+  notes.unshift(...flags);
   trustNotes(trust, notes);
-  return base(status, applied, suggested, confidence, fitBox, trust, notes);
+  return base(status, applied, suggested, confidence, fitBox, trust, notes, cap);
+}
+
+const SLOT_CAPS: Partial<Record<AlignNoteCode, number>> = {
+  wrongSlot: ALIGN.CAP_WRONG_SLOT,
+  facing: ALIGN.CAP_FACING,
+  duplicate: ALIGN.CAP_DUPLICATE,
+  sameImage: ALIGN.CAP_SAME_IMAGE,
+  extent: ALIGN.CAP_EXTENT,
+  featureless: ALIGN.CAP_FEATURELESS,
+};
+
+/** The score cap the slot notes of an alignment imply (undefined: none), e.g. for a score recomputed in the UI. */
+export function slotCap(notes: readonly AlignNote[]): number | undefined {
+  let cap: number | undefined;
+  for (const n of notes) {
+    const c = SLOT_CAPS[n.code];
+    if (c !== undefined) cap = Math.min(cap ?? 100, c);
+  }
+  return cap;
+}
+
+// ---------------------------------------------------------------------------
+// Slot checks
+
+/**
+ * Slot evidence of a side / cap view: its unshared axis measures the object's
+ * depth, which registration never looks at. `ratio` = the view's unshared /
+ * shared extent over the front's matching ratio (a side view: its width vs
+ * the front's width, both per height; a cap: its height vs the front's
+ * height, per width); `ncc` = the best NCC of the unshared profile with the
+ * front's along the same axis (either direction). Null for the front / back.
+ */
+export function slotEvidence(front: PreparedView, view: PreparedView, profiles: AxisProfiles = axisProfiles(view)): { ratio: number; ncc: number } | null {
+  const shared = SHARED_AXES[view.id];
+  if (shared.x && shared.y) return null;
+  const fref = frontRef(front);
+  const fb = front.bbox, vb = view.bbox;
+  const fw = fb.x1 - fb.x0, fh = fb.y1 - fb.y0, vw = vb.x1 - vb.x0, vh = vb.y1 - vb.y0;
+  const side = shared.y;
+  const ratio = side ? vw / vh / (fw / fh) : vh / vw / (fh / fw);
+  const prof = side ? profiles.cols : profiles.rows, ref = side ? fref.cols : fref.rows;
+  let ncc = 0;
+  if (ref.structure >= ALIGN.STRUCTURE_MIN) {
+    for (const sign of [1, -1] as const) ncc = Math.max(ncc, confidenceOf(ref, directDescriptor(makePair(prof, ref, sign, true, false), 0, 0), true, false));
+  }
+  return { ratio, ncc };
+}
+
+/**
+ * A front / back image in a side / cap slot: the front's extent ratio and the
+ * front's (structured) profile along the axis that should show the depth.
+ * A side slot also needs the front of a figure (a neck, and rows with gaps:
+ * legs, arms): the side view of a lamp or of a square table really is its
+ * front. Mirror swaps (a right view in the left
+ * slot, top ↔ bottom) look the same as the right view here: see
+ * facesWrongWay for the side views.
+ */
+function wrongSlot(front: PreparedView, view: PreparedView, profiles: AxisProfiles): boolean {
+  if (view.maskSource === 'none' || front.maskSource === 'none') return false;
+  const e = slotEvidence(front, view, profiles);
+  if (!e) return false;
+  if (SHARED_AXES[view.id].y) {
+    const fref = frontRef(front);
+    if (fref.multiRun < ALIGN.SLOT_MULTI_RUN || neckRow(fref.profiles.rows) === null) return false;
+  }
+  return e.ratio >= ALIGN.SLOT_RATIO[0] && e.ratio <= ALIGN.SLOT_RATIO[1] && e.ncc >= ALIGN.SLOT_NCC;
+}
+
+/**
+ * Which way a side view of a figure faces, from depth-asymmetric landmarks:
+ * the toes stick out to the front in the lowest rows (against the legs'
+ * centre) and the nose / face beyond the neck in the head rows. In fractions
+ * of the height, > 0 = the front is on the image left. Null when the view
+ * shows no head (no neck: not a figure).
+ */
+export function facingCue(view: PreparedView, profiles: AxisProfiles = axisProfiles(view)): number | null {
+  const { mask, bbox } = view;
+  const w = mask.width, H = bbox.y1 - bbox.y0;
+  if (H < 16) return null;
+  const neck = neckRow(profiles.rows);
+  if (neck === null || neck < 3) return null;
+  // Per bbox row: the leftmost and past-the-rightmost foreground column (lo > hi: empty).
+  const rowLo = new Int32Array(H).fill(bbox.x1), rowHi = new Int32Array(H).fill(bbox.x0 - 1);
+  for (let r = 0; r < H; r++) {
+    const row = (bbox.y0 + r) * w;
+    for (let x = bbox.x0; x < bbox.x1; x++) if (mask.data[row + x]) { rowLo[r] = x; break; }
+    for (let x = bbox.x1 - 1; x >= rowLo[r]; x--) if (mask.data[row + x]) { rowHi[r] = x + 1; break; }
+  }
+  const rows = (y0: number, y1: number): [number, number] => [Math.max(0, Math.round(y0 - bbox.y0)), Math.min(H, Math.round(y1 - bbox.y0))];
+  const extent = (y0: number, y1: number): [number, number] | null => {
+    let lo = Infinity, hi = -Infinity;
+    const [r0, r1] = rows(y0, y1);
+    for (let r = r0; r < r1; r++) if (rowLo[r] < rowHi[r]) {
+      lo = Math.min(lo, rowLo[r]);
+      hi = Math.max(hi, rowHi[r]);
+    }
+    return lo < hi ? [lo, hi] : null;
+  };
+  const centre = (y0: number, y1: number): number | null => {
+    const c: number[] = [];
+    const [r0, r1] = rows(y0, y1);
+    for (let r = r0; r < r1; r++) if (rowLo[r] < rowHi[r]) c.push((rowLo[r] + rowHi[r]) / 2);
+    c.sort((a, b) => a - b);
+    return c.length ? c[c.length >> 1] : null;
+  };
+  let cue = 0;
+  // Head: beyond the neck's centre, the face side reaches further (nose, chin) than the back of the head.
+  const nc = centre(bbox.y0 + neck - 1, bbox.y0 + neck + 2), head = extent(bbox.y0, bbox.y0 + neck);
+  if (nc !== null && head) cue += (nc - head[0] - (head[1] - nc)) / H;
+  // Feet: the toes point forward from the legs (unless the view is cut at the bottom).
+  if (!view.cut.bottom) {
+    const lc = centre(bbox.y0 + 0.55 * H, bbox.y0 + 0.9 * H), feet = extent(bbox.y1 - 0.06 * H, bbox.y1);
+    if (lc !== null && feet) cue += (lc - feet[0] - (feet[1] - lc)) / H;
+  }
+  return cue;
+}
+
+/** A left view shows the figure's front on the image left, a right view on the image right. */
+function facesWrongWay(view: PreparedView, profiles: AxisProfiles): boolean {
+  if (view.id !== 'left' && view.id !== 'right') return false;
+  if (view.maskSource === 'none') return false;
+  const cue = facingCue(view, profiles);
+  if (cue === null) return false;
+  return (view.id === 'left' ? cue : -cue) < -ALIGN.FACING_MARGIN;
+}
+
+const SIG_W = 24, SIG_H = 32;
+const signatureCache = new WeakMap<PreparedView, { rgb: Float32Array; cov: Float32Array }>();
+
+/** Mean colour (0..1) and mask coverage of the view on a SIG_W × SIG_H grid over its bbox. */
+function colourSignature(view: PreparedView): { rgb: Float32Array; cov: Float32Array } {
+  const { image, mask, bbox } = view;
+  const n = SIG_W * SIG_H;
+  const sum = new Float64Array(n * 3), on = new Float64Array(n), all = new Float64Array(n);
+  const bw = bbox.x1 - bbox.x0, bh = bbox.y1 - bbox.y0;
+  // Cell means need no more than ~4 × 4 samples per cell.
+  const step = Math.max(1, Math.floor(Math.min(bw / SIG_W, bh / SIG_H) / 4));
+  for (let y = bbox.y0; y < bbox.y1; y += step) {
+    const cy = Math.min(SIG_H - 1, Math.floor(((y - bbox.y0) * SIG_H) / bh));
+    for (let x = bbox.x0; x < bbox.x1; x += step) {
+      const c = cy * SIG_W + Math.min(SIG_W - 1, Math.floor(((x - bbox.x0) * SIG_W) / bw));
+      all[c]++;
+      const i = y * mask.width + x;
+      if (!mask.data[i]) continue;
+      on[c]++;
+      sum[3 * c] += image.data[4 * i];
+      sum[3 * c + 1] += image.data[4 * i + 1];
+      sum[3 * c + 2] += image.data[4 * i + 2];
+    }
+  }
+  const rgb = new Float32Array(n * 3), cov = new Float32Array(n);
+  for (let c = 0; c < n; c++) {
+    cov[c] = all[c] > 0 ? on[c] / all[c] : 0;
+    if (on[c] > 0) for (let k = 0; k < 3; k++) rgb[3 * c + k] = sum[3 * c + k] / on[c] / 255;
+  }
+  return { rgb, cov };
+}
+
+/**
+ * The front image uploaded again as the back (or the front mirrored, as an
+ * AI tool may return it): the same coverage and the same colours in nearly
+ * every cell of the bbox grid. A real back differs somewhere (hair instead of
+ * a face, the back of a shirt). A front without colour detail (a plain
+ * statue) is left alone: its back may well look the same.
+ */
+export function duplicatesFront(front: PreparedView, view: PreparedView): boolean {
+  if (view.maskSource === 'none' || front.maskSource === 'none') return false;
+  const a = signatureOf(front);
+  if (colourDetail(a) < ALIGN.DUP_DETAIL) return false;
+  return sameSignature(a, signatureOf(view));
+}
+
+/** Share of a signature's covered cells whose colour is away from its mean colour (0 = one flat colour). */
+function colourDetail(sig: { rgb: Float32Array; cov: Float32Array }): number {
+  const mean = [0, 0, 0];
+  let cells = 0, detail = 0;
+  for (let i = 0; i < sig.cov.length; i++) if (sig.cov[i] > 0) {
+    cells++;
+    for (let k = 0; k < 3; k++) mean[k] += sig.rgb[3 * i + k];
+  }
+  for (let k = 0; k < 3; k++) mean[k] /= Math.max(1, cells);
+  for (let i = 0; i < sig.cov.length; i++) if (sig.cov[i] > 0 && [0, 1, 2].some((k) => Math.abs(sig.rgb[3 * i + k] - mean[k]) > ALIGN.DUP_CELL)) detail++;
+  return detail / Math.max(1, cells);
+}
+
+function signatureOf(view: PreparedView): { rgb: Float32Array; cov: Float32Array } {
+  let sig = signatureCache.get(view);
+  if (!sig) signatureCache.set(view, (sig = colourSignature(view)));
+  return sig;
+}
+
+/** The same coverage and colours in nearly every cell of the bbox grids, as is or mirrored. */
+function sameSignature(a: { rgb: Float32Array; cov: Float32Array }, b: { rgb: Float32Array; cov: Float32Array }, mirrors: readonly boolean[] = [false, true]): boolean {
+  for (const mirror of mirrors) {
+    let inter = 0, union = 0, both = 0, changed = 0;
+    for (let y = 0; y < SIG_H; y++)
+      for (let x = 0; x < SIG_W; x++) {
+        const i = y * SIG_W + x, j = y * SIG_W + (mirror ? SIG_W - 1 - x : x);
+        const p = a.cov[i] >= 0.5, q = b.cov[j] >= 0.5;
+        if (p && q) inter++;
+        if (p || q) union++;
+        if (!(a.cov[i] > 0 && b.cov[j] > 0)) continue;
+        both++;
+        for (let k = 0; k < 3; k++)
+          if (Math.abs(a.rgb[3 * i + k] - b.rgb[3 * j + k]) > ALIGN.DUP_CELL) {
+            changed++;
+            break;
+          }
+      }
+    if (union > 0 && inter / union >= ALIGN.DUP_IOU && both > 0 && changed / both <= ALIGN.DUP_CHANGED) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether two views are (near-)identical images and that cannot be the
+ * object's own symmetry: the bbox aspects agree, the colour signatures match
+ * (as is or mirrored), and the first view is left-right asymmetric in its
+ * silhouette or carries colour detail (a plain sphere or cylinder really
+ * looks the same from every side; a stripe-painted vase is the accepted
+ * false positive, and the note says to ignore it then).
+ */
+function identicalViews(a: PreparedView, b: PreparedView, mirrors: readonly boolean[] = [false, true]): boolean {
+  if (a.maskSource === 'none' || b.maskSource === 'none') return false;
+  const ab = a.bbox, bb = b.bbox;
+  const ra = (ab.x1 - ab.x0) / Math.max(1, ab.y1 - ab.y0), rb = (bb.x1 - bb.x0) / Math.max(1, bb.y1 - bb.y0);
+  if (Math.abs(Math.log(ra / rb)) > Math.log(1.05)) return false;
+  const sa = signatureOf(a);
+  if (colourDetail(sa) < ALIGN.DUP_DETAIL && frontRef(a).cols.asymmetry < ALIGN.MIRROR_ASYMMETRY) return false;
+  return sameSignature(sa, signatureOf(b), mirrors);
+}
+
+/** A side / cap slot holding the front image itself (as is or mirrored). */
+export function sameImage(front: PreparedView, view: PreparedView): boolean {
+  const shared = SHARED_AXES[view.id];
+  if (shared.x && shared.y) return false;
+  return identicalViews(front, view);
+}
+
+/**
+ * Object depth a side / cap view implies, as a multiple of the front's
+ * longest side: its unshared extent at the scale that maps its fitted shared
+ * extent onto the front's. Null for the front / back, or when the unshared
+ * axis is cut at an image edge (the extent is then unknown).
+ */
+export function impliedDepth(front: PreparedView, view: PreparedView, fitBox: PixelBox = view.fitBox ?? view.bbox): number | null {
+  const shared = SHARED_AXES[view.id];
+  if (shared.x === shared.y || view.maskSource === 'none') return null;
+  const fb = front.bbox, vb = view.bbox;
+  const fw = fb.x1 - fb.x0, fh = fb.y1 - fb.y0;
+  const side = shared.y;
+  if (side ? view.cut.left || view.cut.right : view.cut.top || view.cut.bottom) return null;
+  const fit = side ? fitBox.y1 - fitBox.y0 : fitBox.x1 - fitBox.x0;
+  if (!(fit > 0)) return null;
+  const depth = side ? ((vb.x1 - vb.x0) * fh) / fit : ((vb.y1 - vb.y0) * fw) / fit;
+  return depth / Math.max(fw, fh);
+}
+
+const extentNote = (depth: number): AlignNote => alignNote('extent', fill(ALIGN_TEXT.extent, { n: depth.toFixed(1) }));
+
+/**
+ * A view without distinguishing detail: its silhouette has no structure along
+ * either axis (a blob, an ellipse, a rectangle) while the front is a figure,
+ * or while the front is structured and colour-detailed where the view is one
+ * flat colour. A plain object (sphere, box, a book's side) is left alone.
+ */
+export function featureless(front: PreparedView, view: PreparedView, profiles: AxisProfiles = axisProfiles(view)): boolean {
+  if (view.maskSource === 'none' || front.maskSource === 'none') return false;
+  const vs = Math.max(refAxis(profiles.rows).structure, refAxis(profiles.cols).structure);
+  if (vs >= ALIGN.STRUCTURE_MIN) return false;
+  const fref = frontRef(front);
+  if (fref.multiRun >= ALIGN.SLOT_MULTI_RUN && neckRow(fref.profiles.rows) !== null) return true;
+  if (Math.max(fref.rows.structure, fref.cols.structure) < ALIGN.FEATURE_FRONT) return false;
+  const fd = colourDetail(signatureOf(front));
+  return fd >= ALIGN.FEATURE_DETAIL && colourDetail(signatureOf(view)) < ALIGN.FEATURE_SHARE * fd;
+}
+
+/**
+ * Checks across the extra views (after each was registered to the front),
+ * applied to the alignments in place (notes, score cap, level, trust):
+ *  - the same image in two slots (not left / right: one is the other
+ *    mirrored for a symmetric subject, and facing covers the unmirrored
+ *    copy): the view that fits its slot worse is flagged;
+ *  - a depth extent that contradicts the other depth views: with three or
+ *    more, the one off the others' median (while those agree); with two
+ *    disagreeing, the one that registered worse. A contradicting view becomes
+ *    colour only unless placed by hand.
+ */
+export function crossCheckViews(views: PreparedView[], alignments: ViewAlignment[]): void {
+  const byId = new Map(alignments.map((a) => [a.id, a] as const));
+  const flag = (a: ViewAlignment, note: AlignNote, cap: number, demote: boolean) => {
+    if (a.notes.some((n) => n.code === note.code)) return;
+    a.notes.unshift(note);
+    a.score = Math.min(a.score, cap);
+    a.level = alignLevel(a.score);
+    if (demote && a.status !== 'manual' && a.trust === 'full') {
+      a.trust = 'color';
+      if (!a.notes.some((n) => n.code === 'colorOnly')) a.notes.push(alignNote('colorOnly'));
+    }
+  };
+  const extra = views.filter((v) => v.id !== 'front' && byId.has(v.id));
+  for (let i = 0; i < extra.length; i++)
+    for (let j = i + 1; j < extra.length; j++) {
+      const a = extra[i], b = extra[j];
+      const pair = new Set([a.id, b.id]);
+      if (pair.has('left') && pair.has('right')) continue;
+      if (!identicalViews(a, b) && !identicalViews(b, a)) continue;
+      const aa = byId.get(a.id)!, ab = byId.get(b.id)!;
+      const [worse, other] = ab.score <= aa.score ? [ab, a.id] : [aa, b.id];
+      flag(worse, alignNote('sameImage', sameImageOfText(other)), ALIGN.CAP_SAME_IMAGE, false);
+    }
+  const depths = extra
+    .map((v) => ({ v, a: byId.get(v.id)!, d: impliedDepth(views[0], v) }))
+    .filter((e): e is { v: PreparedView; a: ViewAlignment; d: number } => e.d !== null && e.a.trust === 'full' && !e.a.notes.some((n) => SKIP_DEPTH.has(n.code)));
+  if (depths.length >= 3) {
+    for (const e of depths) {
+      const others = depths.filter((o) => o !== e).map((o) => o.d).sort((x, y) => x - y);
+      if (others[others.length - 1] / others[0] > ALIGN.EXTENT_AGREE) continue;
+      const m = others[others.length >> 1];
+      const off = Math.max(e.d / m, m / e.d);
+      if (off > ALIGN.EXTENT_OUTLIER) flag(e.a, alignNote('extent', fill(ALIGN_TEXT.extentOutlier, { n: off.toFixed(1) })), ALIGN.CAP_EXTENT, true);
+    }
+  } else if (depths.length === 2) {
+    const [p, q] = depths;
+    const off = Math.max(p.d / q.d, q.d / p.d);
+    if (off > ALIGN.EXTENT_OUTLIER && p.a.score !== q.a.score) {
+      const worse = p.a.score < q.a.score ? p.a : q.a;
+      flag(worse, alignNote('extent', fill(ALIGN_TEXT.extentOutlier, { n: off.toFixed(1) })), ALIGN.CAP_EXTENT, true);
+    }
+  }
+}
+
+/** Views whose implied depth means nothing (already flagged, or registered anywhere). */
+const SKIP_DEPTH = new Set<AlignNoteCode>(['extent', 'sameImage', 'featureless', 'wrongSlot', 'weak']);
+
+const VIEW_NAMES: Record<ViewId, I18nText> = {
+  front: { tr: 'ön', en: 'front' },
+  back: { tr: 'arka', en: 'back' },
+  left: { tr: 'sol', en: 'left' },
+  right: { tr: 'sağ', en: 'right' },
+  top: { tr: 'üst', en: 'top' },
+  bottom: { tr: 'alt', en: 'bottom' },
+};
+
+function sameImageOfText(other: ViewId): I18nText {
+  const t = ALIGN_TEXT.sameImageOf, n = VIEW_NAMES[other];
+  return { tr: t.tr.replace('{other}', n.tr), en: t.en.replace('{other}', n.en) };
 }
 
 /** Re-fit the offset of an axis at a fixed scale (the back's columns at the rows' scale). */
@@ -1127,26 +1634,41 @@ function refitDelta(pair: Pair, logk: number, prev: AxisFit): AxisFit {
  * order. The front gets status 'bbox', score 100.
  */
 export function registerViews(views: PreparedView[], o: AlignOptions): ViewAlignment[] {
+  return drain(registerViewsSteps(views, o));
+}
+
+/** registerViews as cooperative steps (a yield after the front's reference and after every view). */
+export function* registerViewsSteps(views: PreparedView[], o: AlignOptions): Steps<ViewAlignment[]> {
   const front = views.find((v) => v.id === 'front');
   if (!front) throw new Error('registerViews: the front view is required');
   const fref = frontRef(front);
-  return views.map((view) => {
+  yield;
+  const out: ViewAlignment[] = [];
+  for (const view of views) {
     if (view.id === 'front') {
       view.fitBox = bboxFit(view);
       view.registration = 'bbox';
       view.trust = 'full';
       const notes: AlignNote[] = [];
       if (view.maskSource === 'none') notes.push(alignNote('noMask'));
-      return {
+      out.push({
         id: 'front', status: 'bbox', level: 'good', score: 100, confidence: 1, applied: IDENTITY, suggested: IDENTITY,
         residual: { dx: 0, dy: 0, scale: 1 }, cut: { ...view.cut }, fitBox: bboxFit(view), trust: 'full', notes,
         guides: { rows: fref.rows.guides.slice(), cols: fref.cols.guides.slice() },
-      };
+      });
+      continue;
     }
-    const a = alignView(front, view, o);
+    const a = yield* alignViewSteps(front, view, o);
     view.fitBox = { ...a.fitBox };
     view.registration = a.status;
     view.trust = a.trust;
-    return a;
-  });
+    out.push(a);
+    yield;
+  }
+  crossCheckViews(views, out);
+  for (const a of out) {
+    const view = views.find((v) => v.id === a.id);
+    if (view) view.trust = a.trust;
+  }
+  return out;
 }

@@ -129,6 +129,39 @@ async function bodyStats(page: Page): Promise<BodyStats> {
   });
 }
 
+/**
+ * Share of the hand vertices (|x| > 0.85 of the largest |x|) whose vertex colour is shirt blue (linear RGB
+ * b > 0.3 and b > 2r): the side views see the arms end-on in front of the torso, and the hull's extra depth
+ * there used to pick up the shirt behind them.
+ */
+async function handBlueShare(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    type Attr = { count: number; getX(i: number): number; getY(i: number): number; getZ(i: number): number };
+    type O = { isMesh?: boolean; geometry?: { getAttribute(n: string): Attr | undefined } };
+    const v = (window as unknown as { __3dmarkerViewer: { getObject(): { traverse(f: (o: O) => void): void } | null } }).__3dmarkerViewer;
+    const root = v.getObject();
+    if (!root) throw new Error('no model on screen');
+    let maxX = 0, hands = 0, blue = 0;
+    const meshes: { p: Attr; c: Attr }[] = [];
+    root.traverse((o) => {
+      const p = o.isMesh ? o.geometry?.getAttribute('position') : undefined;
+      const c = o.isMesh ? o.geometry?.getAttribute('color') : undefined;
+      if (!p || !c) return;
+      meshes.push({ p, c });
+      for (let i = 0; i < p.count; i++) maxX = Math.max(maxX, Math.abs(p.getX(i)));
+    });
+    if (!meshes.length) throw new Error('no vertex colours on screen');
+    for (const { p, c } of meshes)
+      for (let i = 0; i < p.count; i++) {
+        if (Math.abs(p.getX(i)) <= 0.85 * maxX) continue;
+        hands++;
+        const r = c.getX(i), b = c.getZ(i);
+        if (b > 0.3 && b > 2 * r) blue++;
+      }
+    return blue / Math.max(1, hands);
+  });
+}
+
 /** Sanity of a fused mannequin: arms out to the sides, a torso that is not bell-shaped. */
 function expectMannequin(s: BodyStats, label: string) {
   expect(s.sizeX / s.sizeY, `${label}: arm span / height`).toBeGreaterThanOrEqual(0.85);
@@ -165,6 +198,7 @@ test.describe('fusion of hand-drawn views', () => {
     await fuseSample(page, SAMPLE.tpose);
     ref = await bodyStats(page);
     expectMannequin(ref, 'consistent');
+    expect(await handBlueShare(page), 'shirt blue on the hands').toBeLessThan(0.05);
     await page.getByTestId('viewer').screenshot({ path: `${SHOTS}/fusion-consistent.png` });
     expect(errors).toEqual([]);
   });
@@ -204,6 +238,7 @@ test.describe('fusion of hand-drawn views', () => {
     // needs Areas A+B: the arms survive, the torso keeps its proportions, the cropped feet are filled in.
     const s = await bodyStats(page);
     expectMannequin(s, 'hand-drawn');
+    expect(await handBlueShare(page), 'shirt blue on the hands (hand-drawn views)').toBeLessThan(0.05);
     expect(Math.abs(s.hipWidth / s.chestWidth - ref.hipWidth / ref.chestWidth), 'hips / chest vs the consistent sample').toBeLessThanOrEqual(0.2);
     expect(Math.abs(s.sizeZ - ref.sizeZ), 'depth vs the consistent sample').toBeLessThanOrEqual(0.3 * ref.sizeZ);
     expect(Math.abs(s.minY - ref.minY), 'feet vs the consistent sample').toBeLessThanOrEqual(0.06);
@@ -218,6 +253,34 @@ test.describe('fusion of hand-drawn views', () => {
     await noHorizontalOverflow(page, '375 px, views step');
     expect(errors).toEqual([]);
   });
+});
+
+test.describe('views step on phones', () => {
+  for (const width of [375, 414]) {
+    test(`${width} px: slot names are never cut, action buttons stay on one row, long buttons wrap inside their border`, async ({ page, context }) => {
+      await offline(context);
+      await page.setViewportSize({ width, height: 860 });
+      await open(page, 'tr');
+      await loadSample(page, SAMPLE.sketch);
+      // A single-image driver: the views step then offers the long "Next: full 3D" button.
+      await step(page, '3d');
+      await page.getByTestId('driver-select').selectOption('silhouette-inflate');
+      await expectSketchViewsChecked(page);
+      for (const v of ['front', ...SKETCH_VIEWS, 'top', 'bottom']) {
+        const slot = page.getByTestId(`view-${v}`);
+        const name = await slot.locator('.ai-slot-name').evaluate((el) => ({ scroll: el.scrollWidth, client: el.clientWidth }));
+        expect(name.scroll, `${v}: slot name`).toBeLessThanOrEqual(name.client);
+        const tops = await slot.locator('.ai-slot-actions > button').evaluateAll((els) => els.map((el) => Math.round(el.getBoundingClientRect().top)));
+        expect(new Set(tops).size, `${v}: action rows`).toBeLessThanOrEqual(1);
+      }
+      const next = page.getByTestId('views-use-fusion');
+      await expect(next).toBeVisible();
+      const b = await next.evaluate((el) => ({ scroll: el.scrollWidth, client: el.clientWidth }));
+      expect(b.scroll, 'views-use-fusion label').toBeLessThanOrEqual(b.client);
+      await noHorizontalOverflow(page, `${width} px, views step`);
+      await page.getByTestId('views-panel').screenshot({ path: `${SHOTS}/views-${width}.png` });
+    });
+  }
 });
 
 test.describe('alignment controls', () => {

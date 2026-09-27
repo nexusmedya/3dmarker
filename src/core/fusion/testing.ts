@@ -339,6 +339,9 @@ export const CHARACTER_COLORS: Record<CharacterPart, [number, number, number]> =
   foot: [17, 24, 39],
 };
 
+/** Hair: a cap over the crown and the back of the head (the back view shows no face). */
+export const HAIR_COLOR: [number, number, number] = [74, 52, 38];
+
 const PART_ORDER: CharacterPart[] = ['hand', 'arm', 'head', 'foot', 'leg', 'torso'];
 
 /** The part whose surface a rendered point lies on (null off the figure). */
@@ -347,9 +350,18 @@ export function characterPartAt(ch: TposeCharacter, p: Vec3): CharacterPart | nu
   return null;
 }
 
-/** Per-part colouring for renderView. */
+/** Whether a point of the head is hair: the top of the crown, and the back of the head above the nape. */
+export function isHair(ch: TposeCharacter, p: Vec3): boolean {
+  const hs = ch.proportions.headScale;
+  return p[1] > ch.crownY - 0.045 * hs || (p[2] < -0.01 * hs && p[1] > ch.crownY - 0.13 * hs);
+}
+
+/** Per-part colouring for renderView (hair on the head, see isHair). */
 export function characterColor(ch: TposeCharacter): (p: Vec3) => [number, number, number] {
-  return (p) => CHARACTER_COLORS[characterPartAt(ch, p) ?? 'torso'];
+  return (p) => {
+    const part = characterPartAt(ch, p) ?? 'torso';
+    return part === 'head' && isHair(ch, p) ? HAIR_COLOR : CHARACTER_COLORS[part];
+  };
 }
 
 /** How one view's drawing differs from the reference framing / figure. */
@@ -366,6 +378,8 @@ export interface ViewPerturbation {
   padding?: number;
   /** This view's own drawing proportions (over the set's base proportions). */
   proportions?: Partial<CharacterProportions>;
+  /** Per-channel gain on the drawn sRGB colours (another exposure / white balance), clamped to 255. */
+  tint?: [number, number, number];
 }
 
 export interface CharacterViewsOptions {
@@ -427,7 +441,9 @@ export function renderCharacterViews(views: ViewId[], o: CharacterViewsOptions =
     const pad = Math.round((pert.padding ?? 0) * refPx);
     const w = size + 2 * pad, h = size + 2 * pad;
     const offset: [number, number] = [(pert.dx ?? 0) * refPx, (pert.dy ?? 0) * refPx];
-    let r = renderView(ch.solid, id, { width: w, height: h, scale, offset, color: characterColor(ch), background: o.background });
+    const paint = characterColor(ch), tint = pert.tint;
+    const color = tint ? (p: Vec3) => paint(p).map((c, k) => Math.min(255, Math.round(c * tint[k]))) as [number, number, number] : paint;
+    let r = renderView(ch.solid, id, { width: w, height: h, scale, offset, color, background: o.background });
     let cy = h / 2 + offset[1];
     if (pert.cropTop || pert.cropBottom) {
       const bb = maskBBox(r.mask);
@@ -484,14 +500,20 @@ export function artistProportions(rng: () => number, spread = 0.08): CharacterPr
 /**
  * A view set drawn by independent artists: every view has its own framing
  * (zoom 0.85..1.15, shift up to ±4 % of the height) and every view but the
- * front its own proportions (artistProportions). Deterministic per seed.
+ * front its own proportions (artistProportions) and, with `tint` > 0, its own
+ * exposure / white balance (a per-channel gain within ±tint, from a separate
+ * stream so the shapes do not change). Deterministic per seed.
  */
-export function independentArtistViews(views: ViewId[], seed: number, o: CharacterViewsOptions & { spread?: number } = {}): CharacterViews {
-  const rng = seededRandom(seed);
+export function independentArtistViews(views: ViewId[], seed: number, o: CharacterViewsOptions & { spread?: number; tint?: number } = {}): CharacterViews {
+  const rng = seededRandom(seed), tintRng = seededRandom(seed * 7919 + 17);
   const perturb: Partial<Record<ViewId, ViewPerturbation>> = {};
   for (const id of views) {
     const framing: ViewPerturbation = { scale: 0.85 + 0.3 * rng(), dx: 0.08 * rng() - 0.04, dy: 0.08 * rng() - 0.04 };
     perturb[id] = id === 'front' ? framing : { ...framing, proportions: artistProportions(rng, o.spread ?? 0.08) };
+    if (id !== 'front' && o.tint) {
+      const g = () => 1 + o.tint! * (2 * tintRng() - 1);
+      perturb[id]!.tint = [g(), g(), g()];
+    }
   }
   return renderCharacterViews(views, { ...o, perturb: { ...perturb, ...o.perturb } });
 }

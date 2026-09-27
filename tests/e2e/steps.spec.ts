@@ -167,11 +167,18 @@ test.describe('AI provider flows (mocked OpenAI)', () => {
     expect(material).toEqual({ vertexColors: true, color: true, map: false });
     await page.screenshot({ path: `${SHOTS}/steps-multiview-fusion.png` });
 
-    // Revert drops the AI views made from the prepared front; the key never reached localStorage.
+    // Revert drops the AI views made from the prepared front, after asking; it can be undone. The key never reached localStorage.
     await step(page, 'image');
-    await page.locator('#step-panel-image [data-testid="revert-original"]').click();
-    await expect(page.locator('#step-panel-image [data-testid="revert-original"]')).toHaveCount(0);
+    const panel = page.locator('#step-panel-image');
+    await panel.getByTestId('revert-original').click();
+    await expect(panel.getByTestId('revert-original-confirm')).toContainText('5 views');
+    await expect(page.getByTestId('step-views')).toContainText('6/6'); // nothing dropped yet
+    await panel.getByTestId('revert-original-go').click();
+    await expect(panel.getByTestId('revert-original')).toHaveCount(0);
     await expect(page.getByTestId('step-views')).toContainText('1/6');
+    await panel.getByTestId('restore-prepared').click();
+    await expect(page.getByTestId('step-views')).toContainText('6/6');
+    await expect(panel.getByTestId('revert-original')).toBeVisible();
     expect(await page.evaluate(() => JSON.stringify(Object.entries(localStorage)))).not.toContain('sk-e2e-test');
   });
 });
@@ -180,7 +187,7 @@ test.describe('edit and rig', () => {
   test('sculpt edits pause live re-meshing until discarded; the depth editor rebuilds the model', async ({ page, context }) => {
     await offline(context);
     await openWithMascot(page);
-    const tris = await generateInflate(page);
+    await generateInflate(page);
 
     await step(page, 'edit');
     await page.getByTestId('sculpt-toggle').click();
@@ -192,6 +199,9 @@ test.describe('edit and rig', () => {
     for (let i = 0; i <= 12; i++) await page.mouse.move(cx - 60 + i * 10, cy + (i % 2) * 4);
     await page.mouse.up();
     await expect(page.getByTestId('step-edit')).toHaveAttribute('data-done', 'true');
+    // The sculpted mesh's size (sculpting may subdivide long edges when it starts).
+    const tris = Number(await page.getByTestId('mesh-stats').getAttribute('data-triangles'));
+    expect(tris).toBeGreaterThan(0);
 
     await step(page, '3d');
     await expect(page.getByTestId('mesh-paused')).toBeVisible();

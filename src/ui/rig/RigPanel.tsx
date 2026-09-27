@@ -24,7 +24,7 @@ import type * as RigEngine from '../../rig/engine';
 import { ANIMATION_CATEGORIES, type AnimationCategory, type HumanoidBone, type JointLayout, type RigClip } from '../../rig/types';
 import { useI18n } from '../i18n';
 import { ProgressBar } from '../GeneratePanel';
-import { IconAlert, IconCheck, IconInfo, IconX } from '../icons';
+import { IconAlert, IconCheck, IconInfo, IconUndo, IconX } from '../icons';
 import { IconBone, IconImport, IconLoop, IconMove, IconPause, IconPlay, IconSearch, IconStop } from './icons';
 import './rig.css';
 
@@ -53,9 +53,24 @@ export const RIG_PANEL_TEXT = {
   bones: { tr: '{n} kemik', en: '{n} bones' },
   weighted: { tr: '{n} köşe ağırlıklandı', en: '{n} vertices weighted' },
   methodPose: { tr: 'vücut noktalarından', en: 'from body landmarks' },
-  methodSilhouette: { tr: 'T-pozu silüetinden', en: 'from the T-pose silhouette' },
-  methodArmsDown: { tr: 'kollar aşağıda silüetinden — eklemleri kontrol edin', en: 'from the arms-down silhouette — check the joints' },
+  methodSilhouette: { tr: 'T-pozu siluetinden', en: 'from the T-pose silhouette' },
+  methodArmsDown: { tr: 'kollar aşağıda siluetinden — eklemleri kontrol edin', en: 'from the arms-down silhouette — check the joints' },
   methodProportional: { tr: 'oranlardan (insan algılanmadı) — eklemleri düzenleyin', en: 'from proportions (no person detected) — adjust the joints' },
+  methodProportionalPlain: { tr: 'oranlardan — eklemleri düzenleyin', en: 'from proportions — adjust the joints' },
+  methodUncertain: { tr: 'siluetten (emin değil) — eklemleri kontrol edin', en: 'from the silhouette (uncertain) — check the joints' },
+  detectFailed: {
+    tr: 'İnsan algılama modeli yüklenemedi (ağ ya da tarayıcı); eklemler algılama olmadan yerleştirildi — kontrol edin.',
+    en: 'The person-detection model could not load (network or browser); the joints were placed without it — check them.',
+  },
+  detectTimeout: { tr: 'Model indirmesi yanıt vermedi.', en: 'The model download stopped responding.' },
+  retry: { tr: 'Tekrar dene', en: 'Retry' },
+  notHuman: {
+    tr: 'Bu model insan figürüne benzemiyor; animasyonlar modeli yırtabilir. Eklemleri kontrol edin.',
+    en: 'This does not look like a human figure; animations may tear the mesh. Check the joints.',
+  },
+  undo: { tr: 'Geri al', en: 'Undo' },
+  redo: { tr: 'Yinele', en: 'Redo' },
+  resetJoints: { tr: 'Otomatik konuma sıfırla', en: 'Reset to automatic' },
   showSkeleton: { tr: 'İskeleti göster', en: 'Show skeleton' },
   editJoints: { tr: 'Eklemleri düzenle', en: 'Edit joints' },
   mirror: { tr: 'Simetrik', en: 'Mirror' },
@@ -116,6 +131,72 @@ interface RigInfo {
   bones: number;
   vertices: number;
   method: JointMethod;
+  detection: Detection;
+  /** Why detection was unavailable (the loader's localized reason). */
+  detectDetail?: I18nText;
+  plausibility: number;
+}
+
+/**
+ * How the person detection went: 'unavailable' = the models could not load /
+ * run (network filter, offline, no WebGL / wasm), unlike 'none' (ran, found
+ * nobody); 'skipped' = no front image.
+ */
+export type Detection = 'ok' | 'none' | 'unavailable' | 'skipped';
+
+export interface RigDetection {
+  pose: PoseResult | null;
+  hands: HandResult[];
+  detection: Detection;
+  detail?: I18nText;
+}
+
+/** No progress from the detector for this long (a stalled model download): rig without it. */
+export const RIG_DETECT_BUDGET_MS = 10_000;
+
+/**
+ * Person detection for the rig, under its own stall budget (the loader's own
+ * stall timeout is 30 s): aborting `signal` rejects with AbortError; a stall,
+ * a load failure or an error resolve as 'unavailable' so rigging goes on.
+ */
+export async function detectForRig(image: RGBAImage, signal: AbortSignal, onProgress?: (p: Progress) => void, budgetMs = RIG_DETECT_BUDGET_MS): Promise<RigDetection> {
+  const child = new AbortController();
+  const stop = () => child.abort();
+  signal.addEventListener('abort', stop, { once: true });
+  let stalled = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const arm = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      stalled = true;
+      child.abort();
+    }, budgetMs);
+  };
+  arm();
+  try {
+    const a = await analyzeHuman(image, {
+      signal: child.signal,
+      onProgress: (p) => {
+        arm();
+        onProgress?.(p);
+      },
+      detect: { pose: true, hands: true, faces: false },
+    });
+    // The main subject: the largest detected body.
+    const pose = a.poses.reduce<PoseResult | null>((best, p) => (!best || p.box.width * p.box.height > best.box.width * best.box.height ? p : best), null);
+    if (!pose && (a.unavailableReason || a.unavailableText || a.failed?.pose)) {
+      const detail = a.unavailableText ?? (a.unavailableReason ? { tr: a.unavailableReason, en: a.unavailableReason } : undefined);
+      return { pose: null, hands: [], detection: 'unavailable', detail };
+    }
+    return { pose, hands: a.hands, detection: pose ? 'ok' : 'none' };
+  } catch (e) {
+    if (signal.aborted) throw isAbort(e) ? e : new DOMException('Aborted', 'AbortError');
+    console.warn('[rig] human analysis unavailable, using the silhouette', e);
+    return { pose: null, hands: [], detection: 'unavailable', detail: stalled ? T.detectTimeout : errorToText(e) };
+  } finally {
+    if (timer) clearTimeout(timer);
+    signal.removeEventListener('abort', stop);
+  }
 }
 
 /** Skinned meshes that did not come from our rig (a rigged GLB). */
@@ -127,6 +208,7 @@ export function hasForeignSkin(model: BuiltModel | null): boolean {
   return found;
 }
 
+const cloneLayout = (l: JointLayout): JointLayout => Object.fromEntries(Object.entries(l).map(([b, p]) => [b, { ...p! }]));
 const isAbort = (e: unknown) => typeof e === 'object' && e !== null && (e as { name?: unknown }).name === 'AbortError';
 const fmt = (t: number) => t.toFixed(2);
 
@@ -145,6 +227,11 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
   const pending = useRef<{ patch: JointLayout; timer: ReturnType<typeof setTimeout> | null }>({ patch: {}, timer: null });
   const modelRef = useRef(model);
   modelRef.current = model;
+  /** What auto-rig placed (reset target), its mesh data and silhouette (drag clamp), for the rigged model. */
+  const autoRef = useRef<{ layout: JointLayout; data: RigEngine.MeshData; silhouette: RigEngine.Silhouette } | null>(null);
+  /** Joint-edit history: each entry holds the previous positions of the bones one edit moved. */
+  const undoRef = useRef<JointLayout[]>([]);
+  const redoRef = useRef<JointLayout[]>([]);
   const cbRef = useRef({ onModelChanged, onActiveChange });
   cbRef.current = { onModelChanged, onActiveChange };
 
@@ -170,6 +257,8 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
   const [crossFade, setCrossFade] = useState(true);
   const [importing, setImporting] = useState(false);
   const [importError, setImportError] = useState<I18nText | null>(null);
+  const [history, setHistory] = useState({ undo: 0, redo: 0 });
+  const [retrying, setRetrying] = useState(false);
   const mirrorRef = useRef(mirror);
   mirrorRef.current = mirror;
   const showSkeletonRef = useRef(showSkeleton);
@@ -214,6 +303,10 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
     pending.current = { patch: {}, timer: null };
     editorRef.current?.dispose();
     editorRef.current = null;
+    autoRef.current = null;
+    undoRef.current = [];
+    redoRef.current = [];
+    setHistory({ undo: 0, redo: 0 });
     playerRef.current?.dispose();
     playerRef.current = null;
     const h = handleRef.current;
@@ -280,20 +373,12 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
     setProgress({ label: T.loading });
     try {
       const engine = await loadEngine();
-      let pose: PoseResult | null = null;
-      let hands: HandResult[] = [];
+      let det: RigDetection = { pose: null, hands: [], detection: 'skipped' };
       if (frontImage) {
         setProgress({ label: T.detecting });
-        try {
-          const a = await analyzeHuman(frontImage, { signal: ac.signal, onProgress: setProgress, detect: { pose: true, hands: true, faces: false } });
-          // The main subject: the largest detected body.
-          pose = a.poses.reduce<PoseResult | null>((best, p) => (!best || p.box.width * p.box.height > best.box.width * best.box.height ? p : best), null);
-          hands = a.hands;
-        } catch (e) {
-          if (isAbort(e)) throw e;
-          console.warn('[rig] human analysis unavailable, using the silhouette', e);
-        }
+        det = await detectForRig(frontImage, ac.signal, setProgress);
       }
+      const { pose, hands } = det;
       if (ac.signal.aborted) throw new DOMException('Aborted', 'AbortError');
       setProgress({ label: T.placing });
       const data = engine.collectMeshData(m.object);
@@ -312,13 +397,17 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
         return;
       }
       handleRef.current = handle;
+      autoRef.current = { layout: cloneLayout(auto.layout), data, silhouette: auto.silhouette };
+      undoRef.current = [];
+      redoRef.current = [];
+      setHistory({ undo: 0, redo: 0 });
       if (originalAnimsRef.current?.model !== m) originalAnimsRef.current = { model: m, animations: m.animations };
       playerRef.current = makePlayer(engine, core, m);
       const lib = engine.buildLibrary(handle.descriptor);
       setBuiltins(lib);
       setImported([]);
       setExportSel(new Set(lib.map((c) => c.info.id)));
-      setInfo({ bones: handle.bones.size, vertices: data.positions.length / 3, method: auto.method });
+      setInfo({ bones: handle.bones.size, vertices: data.positions.length / 3, method: auto.method, detection: det.detection, detectDetail: det.detail, plausibility: auto.plausibility });
       handle.setSkeletonVisible(showSkeletonRef.current);
       setPhase('rigged');
       cbRef.current.onActiveChange(true);
@@ -366,9 +455,15 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
     setImported((prev) => prev.map((e) => ({ ...e, rig: engine.retargetAnimation(e.source, desc, { id: e.id }) })));
   };
 
-  const commitJoints = async (patch: JointLayout) => {
+  const commitJoints = async (patch: JointLayout, record: 'undo' | 'redo' | 'new' = 'new') => {
     const h = handleRef.current, engine = engineRef.current;
     if (!h || !engine) return;
+    // History: the previous positions of the bones this edit moves (undo / redo move entries between the stacks).
+    const prev: JointLayout = {};
+    for (const b of Object.keys(patch) as HumanoidBone[]) if (h.layout[b]) prev[b] = { ...h.layout[b]! };
+    if (record === 'new') redoRef.current = [];
+    (record === 'undo' ? redoRef : undoRef).current.push(prev);
+    setHistory({ undo: undoRef.current.length, redo: redoRef.current.length });
     // A newer edit supersedes the running re-weight (the rig merges its patch into the newer one).
     reweighRef.current?.abort();
     const ac = new AbortController();
@@ -392,6 +487,83 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
   const commitRef = useRef(commitJoints);
   commitRef.current = commitJoints;
 
+  /** Drop nudges not committed yet (the markers go back); true when there were any. */
+  const dropPending = () => {
+    if (!pending.current.timer) return false;
+    clearTimeout(pending.current.timer);
+    pending.current = { patch: {}, timer: null };
+    if (handleRef.current) editorRef.current?.setLayout(handleRef.current.layout);
+    return true;
+  };
+  const undo = () => {
+    if (reweighRef.current || dropPending()) return;
+    const entry = undoRef.current.pop();
+    if (entry) void commitJoints(entry, 'undo');
+  };
+  const redo = () => {
+    if (reweighRef.current) return;
+    dropPending();
+    const entry = redoRef.current.pop();
+    if (entry) void commitJoints(entry, 'redo');
+  };
+  const resetJoints = () => {
+    const auto = autoRef.current;
+    if (!auto || reweighRef.current) return;
+    dropPending();
+    void commitJoints(cloneLayout(auto.layout));
+  };
+  const historyRef = useRef({ undo, redo });
+  historyRef.current = { undo, redo };
+
+  // Ctrl/Cmd+Z, Ctrl+Shift+Z / Ctrl+Y while editing joints (not while typing).
+  useEffect(() => {
+    if (!editing || phase !== 'rigged') return;
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+      const k = e.key.toLowerCase();
+      if (k === 'z' && !e.shiftKey) historyRef.current.undo();
+      else if ((k === 'z' && e.shiftKey) || k === 'y') historyRef.current.redo();
+      else return;
+      e.preventDefault();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [editing, phase]);
+
+  /** Run person detection again (after a load failure) and re-place the joints if a person turns up (one undoable edit). */
+  const retryDetect = async () => {
+    const engine = engineRef.current, h = handleRef.current, auto = autoRef.current, m = model;
+    if (!engine || !h || !auto || !frontImage || !m || retrying) return;
+    const ac = new AbortController();
+    jobRef.current = ac;
+    setRetrying(true);
+    try {
+      const det = await detectForRig(frontImage, ac.signal);
+      if (handleRef.current !== h) return;
+      if (det.pose) {
+        const next = engine.autoPlaceJointsDetailed(m.object, {
+          pose: det.pose,
+          hands: det.hands,
+          imageSize: { width: frontImage.width, height: frontImage.height },
+          imageMask: frontMask,
+          meshData: auto.data,
+        });
+        autoRef.current = { ...auto, layout: cloneLayout(next.layout) };
+        setInfo((i) => i && { ...i, method: next.method, detection: det.detection, detectDetail: undefined, plausibility: next.plausibility });
+        await commitJoints(cloneLayout(next.layout));
+      } else {
+        setInfo((i) => i && { ...i, detection: det.detection, detectDetail: det.detail });
+      }
+    } catch (e) {
+      if (!isAbort(e)) setError(errorToText(e));
+    } finally {
+      if (jobRef.current === ac) jobRef.current = null;
+      setRetrying(false);
+    }
+  };
+
   useEffect(() => {
     if (!editing || phase !== 'rigged') return;
     const core = coreRef.current, h = handleRef.current, engine = engineRef.current;
@@ -406,6 +578,8 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
       mirror: () => mirrorRef.current,
       onSelect: setSelected,
       onCommit: (patch) => void commitRef.current(patch),
+      // Dropped joints stay inside the body (the rest-pose front silhouette).
+      clamp: (_bone, p) => (autoRef.current ? engine.clampToSilhouette(autoRef.current.silhouette, p) : p),
     });
     editorRef.current = editor;
     return () => {
@@ -526,7 +700,17 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
     });
 
   const busy = !enabled || phase === 'working' || !!reweighting;
-  const methodText = info ? (info.method === 'pose' ? T.methodPose : info.method === 'silhouette' ? T.methodSilhouette : info.method === 'arms-down' ? T.methodArmsDown : T.methodProportional) : null;
+  const doubtful = !!info && info.method !== 'pose' && info.plausibility < 0.5;
+  const methodText = !info
+    ? null
+    : info.method === 'pose'
+      ? T.methodPose
+      : info.method === 'silhouette'
+        ? doubtful ? T.methodUncertain : T.methodSilhouette
+        : info.method === 'arms-down'
+          ? T.methodArmsDown
+          // "No person detected" only when detection actually ran.
+          : info.detection === 'none' ? T.methodProportional : T.methodProportionalPlain;
 
   const renderItem = (c: RigClip) => (
     <li key={c.info.id} className={`rig-item${current === c.info.id ? ' is-current' : ''}`}>
@@ -599,9 +783,28 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
             <span className="status status-ok">
               <IconCheck size={13} /> <strong>{tx(T.bones, { n: int(info?.bones ?? 0) })}</strong>
             </span>
-            <span>{tx(T.weighted, { n: int(info?.vertices ?? 0) })}</span>
-            {methodText && <span>· {tx(methodText)}</span>}
+            <span>
+              {tx(T.weighted, { n: int(info?.vertices ?? 0) })}
+              {methodText && ` (${tx(methodText)})`}
+            </span>
           </div>
+          {info?.detection === 'unavailable' && (
+            <p className="note small rig-warn" data-testid="rig-detect-warning" title={info.detectDetail ? tx(info.detectDetail) : undefined}>
+              <IconAlert size={14} />
+              <span>
+                {tx(T.detectFailed)}
+                {info.detectDetail && <span className="muted"> {tx(info.detectDetail)}</span>}{' '}
+                <button type="button" className="btn btn-ghost btn-sm" onClick={() => void retryDetect()} disabled={busy || retrying || !frontImage} data-testid="rig-detect-retry">
+                  {retrying && <span className="spinner spinner-sm" aria-hidden="true" />} {tx(T.retry)}
+                </button>
+              </span>
+            </p>
+          )}
+          {doubtful && (
+            <p className="note small rig-warn" data-testid="rig-shape-warning">
+              <IconAlert size={14} /> {tx(T.notHuman)}
+            </p>
+          )}
           <div className="rig-toggles">
             <Switch label={tx(T.showSkeleton)} checked={showSkeleton || editing} disabled={editing} onChange={setShowSkeleton} testId="rig-skeleton" />
             <Switch label={tx(T.editJoints)} checked={editing} disabled={!enabled} onChange={setEditing} testId="rig-edit-joints" />
@@ -614,6 +817,17 @@ export function RigPanel({ coreRef, model, frontImage, frontMask, enabled, onMod
               <div className="rig-row">
                 <span className="small grow truncate">{selected ? tx(T.selectedJoint, { name: tx(boneLabel(selected)) }) : tx(T.noJoint)}</span>
                 <Switch label={tx(T.mirror)} checked={mirror} onChange={setMirror} testId="rig-mirror" />
+              </div>
+              <div className="rig-row">
+                <button type="button" className="btn btn-secondary btn-sm" onClick={undo} disabled={!!reweighting || history.undo === 0} title={`${tx(T.undo)} (Ctrl+Z)`} data-testid="rig-undo">
+                  <IconUndo size={14} /> {tx(T.undo)}
+                </button>
+                <button type="button" className="btn btn-secondary btn-sm" onClick={redo} disabled={!!reweighting || history.redo === 0} title={`${tx(T.redo)} (Ctrl+Shift+Z)`} data-testid="rig-redo">
+                  <IconUndo size={14} style={{ transform: 'scaleX(-1)' }} /> {tx(T.redo)}
+                </button>
+                <button type="button" className="btn btn-ghost btn-sm" onClick={resetJoints} disabled={!!reweighting || !autoRef.current} data-testid="rig-reset-joints">
+                  {tx(T.resetJoints)}
+                </button>
               </div>
               {selected && (
                 <div className="rig-nudge-grid">

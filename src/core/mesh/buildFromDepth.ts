@@ -27,7 +27,10 @@
  *
  * Masked outlines are softened: outline vertices move up to 0.45 cell along
  * their boundary loop (rounding the grid's pixel staircase, UVs follow), and
- * in the closed modes the depth is smoothed along the rim.
+ * in the closed modes the depth is smoothed along the rim. In double mode a
+ * depth that falls to 0 just outside the outline (inflation) is taken to 0 on
+ * it, so the rim band really is `rim` high, and the rim shades as one rounded
+ * seam (front, wall and back share normals there).
  *
  * Front, back and walls use separate vertices (hard edges between them; wall
  * normals are smoothed along the outline except at corners ≥ 60°) and
@@ -38,7 +41,7 @@ import { BufferAttribute, BufferGeometry } from 'three';
 import type { DepthMap, I18nText, Mask } from '../types';
 import { LocalizedError } from '../errors';
 import { blurFloat, resizeMask, sampleBilinear } from '../image/ops';
-import type { MeshMode, MeshOptions } from './options';
+import type { DetailedDepth, DetailRegion, MeshMode, MeshOptions } from './options';
 
 /** Thrown by buildGeometryFromDepth when a non-empty mask leaves no triangle on the grid. */
 export const EMPTY_MESH: I18nText = {
@@ -190,6 +193,9 @@ export function buildGeometryFromDepth(depth: DepthMap, mask: Mask | null, opts:
   const grid = sampleDepthGrid(depth, opts.useMask ? mask : null, gw, gh);
   const fg = grid.fg;
   const d = shapeDepth(grid.depth, fg, gw, gh, opts);
+  // Face / hand regions: unsmoothed full-resolution depth, refined grid (below).
+  const detail = planDetail(depth, opts.useMask ? mask : null, gw, gh, opts);
+  if (detail) sharpenDetail(d, gw, gh, detail);
   const mode = opts.mode;
   const closed = mode !== 'relief';
 
@@ -245,24 +251,54 @@ export function buildGeometryFromDepth(depth: DepthMap, mask: Mask | null, opts:
   // Soften the grid staircase of masked outlines: depth along the rim (closed
   // modes; a relief rim may be a torn cliff) and the outline's XY position.
   const outline = outlineOf(triV, triE, alive, edgeUse, gw * gh);
+  if (mode === 'double') taperOutlineDepth(d, outline.deg, triV, alive, gw, gh);
   if (closed) smoothOutlineDepth(d, outline);
   const offset = tear === Infinity ? relaxOutline(outline, gw, gh, triV, alive) : null;
 
   // --- Compact: keep only referenced grid vertices ---------------------------
   const vmap = new Int32Array(gw * gh).fill(-1);
-  let nTri = 0, nWall = 0;
+  let nTri = 0, nBnd = 0;
   for (let s = 0; s < alive.length; s++) {
     if (!alive[s]) continue;
     nTri++;
     const o = s * 3;
     vmap[triV[o]] = vmap[triV[o + 1]] = vmap[triV[o + 2]] = 0;
-    if (closed) for (let k = 0; k < 3; k++) if (edgeUse[triE[o + k]] === 1) nWall++;
+    for (let k = 0; k < 3; k++) if (edgeUse[triE[o + k]] === 1) nBnd++;
   }
   // The majority vote per grid vertex erases silhouettes thinner than about
   // 1.5 cells; say so rather than returning an invisible, empty model.
   if (nTri === 0 && fg && mask && mask.data.some((v) => v !== 0)) throw new LocalizedError(EMPTY_MESH);
   let nF = 0;
   for (let k = 0; k < vmap.length; k++) if (vmap[k] === 0) vmap[k] = nF++;
+
+  // Front surface in grid coordinates (cells, outline offsets applied).
+  let front: FrontMesh = {
+    x: new Float64Array(nF), y: new Float64Array(nF), d: new Float64Array(nF),
+    tri: new Int32Array(3 * nTri), bnd: new Int32Array(2 * nBnd),
+  };
+  for (let k = 0; k < vmap.length; k++) {
+    const v = vmap[k];
+    if (v < 0) continue;
+    const i = k % gw, j = (k - i) / gw;
+    front.x[v] = offset ? i + offset[2 * k] : i;
+    front.y[v] = offset ? j + offset[2 * k + 1] : j;
+    front.d[v] = d[k];
+  }
+  // Boundary edge p→q with the interior on its left seen from +Z (wall order = slot order).
+  for (let s = 0, t = 0, b = 0; s < alive.length; s++) {
+    if (!alive[s]) continue;
+    const o = s * 3;
+    front.tri[t++] = vmap[triV[o]]; front.tri[t++] = vmap[triV[o + 1]]; front.tri[t++] = vmap[triV[o + 2]];
+    for (let k = 0; k < 3; k++) {
+      if (edgeUse[triE[o + k]] !== 1) continue;
+      front.bnd[b++] = vmap[triV[o + k]];
+      front.bnd[b++] = vmap[triV[o + ((k + 1) % 3)]];
+    }
+  }
+  if (detail && detail.levels > 0) front = refineFront(front, detail);
+  nF = front.x.length;
+  nTri = front.tri.length / 3;
+  const nWall = closed ? front.bnd.length / 2 : 0;
 
   // --- Vertex buffers --------------------------------------------------------
   const nVerts = closed ? 2 * nF + 4 * nWall : nF;
@@ -279,15 +315,9 @@ export function buildGeometryFromDepth(depth: DepthMap, mask: Mask | null, opts:
   const lift = mode === 'double' ? gap / 2 : 0;
   const zBase = -gap; // solid back plane
 
-  for (let k = 0; k < vmap.length; k++) {
-    const v = vmap[k];
-    if (v < 0) continue;
-    let i = k % gw, j = (k - i) / gw;
-    if (offset) {
-      i += offset[2 * k];
-      j += offset[2 * k + 1];
-    }
-    const x = -hw + i * sx, y = hh - j * sy, z = d[k] * S + lift;
+  for (let v = 0; v < nF; v++) {
+    const i = front.x[v], j = front.y[v];
+    const x = -hw + i * sx, y = hh - j * sy, z = front.d[v] * S + lift;
     const u = i / qw, t = 1 - j / qh;
     pos[v * 3] = x; pos[v * 3 + 1] = y; pos[v * 3 + 2] = z;
     uv[v * 2] = u; uv[v * 2 + 1] = t;
@@ -299,43 +329,30 @@ export function buildGeometryFromDepth(depth: DepthMap, mask: Mask | null, opts:
   }
 
   // --- Indices: front, back (reversed), walls --------------------------------
-  let n = 0;
+  const ft = front.tri;
+  idx.set(ft, 0);
+  let n = ft.length;
   let wallEnds: Int32Array | null = null; // front vertex ids (p, q) of each wall quad
-  for (let s = 0; s < alive.length; s++) {
-    if (!alive[s]) continue;
-    const o = s * 3;
-    idx[n++] = vmap[triV[o]]; idx[n++] = vmap[triV[o + 1]]; idx[n++] = vmap[triV[o + 2]];
-  }
   if (closed) {
-    for (let s = 0; s < alive.length; s++) {
-      if (!alive[s]) continue;
-      const o = s * 3;
-      idx[n++] = vmap[triV[o]] + nF; idx[n++] = vmap[triV[o + 2]] + nF; idx[n++] = vmap[triV[o + 1]] + nF;
+    for (let t = 0; t < ft.length; t += 3) {
+      idx[n++] = ft[t] + nF; idx[n++] = ft[t + 2] + nF; idx[n++] = ft[t + 1] + nF;
     }
-    // Boundary edge p→q (interior on its left seen from +Z): quad pF, qF, pB, qB facing outwards.
-    let w = 2 * nF;
-    wallEnds = new Int32Array(2 * nWall);
-    for (let s = 0; s < alive.length; s++) {
-      if (!alive[s]) continue;
-      const o = s * 3;
-      for (let k = 0; k < 3; k++) {
-        if (edgeUse[triE[o + k]] !== 1) continue;
-        const p = vmap[triV[o + k]], q = vmap[triV[o + ((k + 1) % 3)]];
-        wallEnds[(w - 2 * nF) / 2] = p;
-        wallEnds[(w - 2 * nF) / 2 + 1] = q;
-        copyVertex(pos, uv, p, w);
-        copyVertex(pos, uv, q, w + 1);
-        copyVertex(pos, uv, p + nF, w + 2);
-        copyVertex(pos, uv, q + nF, w + 3);
-        idx[n++] = w; idx[n++] = w + 2; idx[n++] = w + 3;
-        idx[n++] = w; idx[n++] = w + 3; idx[n++] = w + 1;
-        w += 4;
-      }
+    // Boundary edge p→q: quad pF, qF, pB, qB facing outwards.
+    wallEnds = front.bnd;
+    for (let e = 0, w = 2 * nF; e < nWall; e++, w += 4) {
+      const p = wallEnds[2 * e], q = wallEnds[2 * e + 1];
+      copyVertex(pos, uv, p, w);
+      copyVertex(pos, uv, q, w + 1);
+      copyVertex(pos, uv, p + nF, w + 2);
+      copyVertex(pos, uv, q + nF, w + 3);
+      idx[n++] = w; idx[n++] = w + 2; idx[n++] = w + 3;
+      idx[n++] = w; idx[n++] = w + 3; idx[n++] = w + 1;
     }
   }
 
   const normals = vertexNormals(pos, idx);
   if (wallEnds) smoothWallNormals(pos, normals, wallEnds, nF, 2 * nF);
+  if (wallEnds && mode === 'double') roundDoubleRim(pos, normals, wallEnds, nF, 2 * nF, gap);
 
   const geometry = new BufferGeometry();
   geometry.setAttribute('position', new BufferAttribute(pos, 3));
@@ -352,6 +369,193 @@ export function buildGeometryFromDepth(depth: DepthMap, mask: Mask | null, opts:
   geometry.computeBoundingBox();
   geometry.computeBoundingSphere();
   return geometry;
+}
+
+/** Front surface in grid coordinates before it becomes buffers. */
+interface FrontMesh {
+  /** Vertex position (grid cells, fractional after outline relaxing / refinement) and shaped depth. */
+  x: Float64Array;
+  y: Float64Array;
+  d: Float64Array;
+  /** CCW triangles seen from +Z. */
+  tri: Int32Array;
+  /** Boundary edges p→q (interior on the left), one wall quad each in the closed modes. */
+  bnd: Int32Array;
+}
+
+/**
+ * Target vertex spacing inside detail regions: 1/DETAIL_CELLS_PER_REGION of
+ * the smallest region's longest side (a finger is ~1/8 of a hand box, so a
+ * finger gets about 7 vertices across), but never below DETAIL_SPACING_PX
+ * depth-map pixels. For a finger 8 px wide: ~95 % of its ridge height
+ * survives at 1.25 px spacing, ~80 % at 2 px, ~3 % at the default grid.
+ */
+export const DETAIL_SPACING_PX = 1.25;
+const DETAIL_CELLS_PER_REGION = 56;
+/** At most this many halvings of the grid spacing inside detail regions. */
+export const DETAIL_MAX_LEVELS = 3;
+/** Budget of extra triangles for the refinement (the level count drops until it fits). */
+export const DETAIL_TRIANGLE_BUDGET = 250_000;
+/** Detail weight fades from 1 on a region box to 0 this many grid cells outside it. */
+const DETAIL_FEATHER = 2;
+/** At most this many regions (largest first). */
+const DETAIL_MAX_REGIONS = 16;
+
+interface DetailPlan {
+  /** Region boxes in grid cells [x0, y0, x1, y1]. */
+  boxes: number[][];
+  /** Grid-spacing halvings inside the regions (0 = only unsmoothed sampling). */
+  levels: number;
+  /** Detail weight in [0, 1] at grid position (x, y). */
+  weight: (x: number, y: number) => number;
+  /** Shaped full-resolution depth at grid position (x, y). */
+  sample: (x: number, y: number) => number;
+}
+
+/** Valid detail regions of a depth map, clamped to it, largest first. */
+export function detailRegionsOf(depth: DepthMap): DetailRegion[] {
+  const list = (depth as DepthMap & DetailedDepth).detail;
+  if (!Array.isArray(list)) return [];
+  const out: DetailRegion[] = [];
+  for (const r of list) {
+    if (!r || !(r.width > 0) || !(r.height > 0) || !Number.isFinite(r.x) || !Number.isFinite(r.y)) continue;
+    const x0 = Math.max(0, r.x), y0 = Math.max(0, r.y);
+    const x1 = Math.min(depth.width, r.x + r.width), y1 = Math.min(depth.height, r.y + r.height);
+    if (x1 - x0 < 1 || y1 - y0 < 1) continue;
+    out.push({ kind: r.kind, x: x0, y: y0, width: x1 - x0, height: y1 - y0 });
+  }
+  return out.sort((a, b) => b.width * b.height - a.width * a.height).slice(0, DETAIL_MAX_REGIONS);
+}
+
+function planDetail(depth: DepthMap, mask: Mask | null, gw: number, gh: number, opts: MeshOptions): DetailPlan | null {
+  const regions = detailRegionsOf(depth);
+  if (regions.length === 0) return null;
+  const { width: W, height: H, data } = depth;
+  const fx = W / (gw - 1), fy = H / (gh - 1);
+  const boxes = regions.map((r) => [r.x / fx, r.y / fy, (r.x + r.width) / fx, (r.y + r.height) / fy]);
+  const weight = (x: number, y: number): number => {
+    let best = 0;
+    for (const [x0, y0, x1, y1] of boxes) {
+      const dx = Math.max(x0 - x, 0, x - x1), dy = Math.max(y0 - y, 0, y - y1);
+      if (dx === 0 && dy === 0) return 1;
+      const t = 1 - Math.hypot(dx, dy) / DETAIL_FEATHER;
+      if (t > best) best = t;
+    }
+    return best * best * (3 - 2 * best);
+  };
+  const m = mask ? (mask.width === W && mask.height === H ? mask.data : resizeMask(mask, W, H).data) : null;
+  const gamma = opts.gamma > 0 ? opts.gamma : 1;
+  const sample = (x: number, y: number): number => {
+    const px = x * fx, py = y * fy;
+    let v = m ? sampleMasked(data, m, W, H, px, py) : sampleBilinear(data, W, H, px, py);
+    if (opts.invert) v = 1 - v;
+    v = v >= 0 ? (v > 1 ? 1 : v) : 0;
+    return gamma === 1 ? v : Math.pow(v, gamma);
+  };
+  // Halvings until the spacing reaches DETAIL_SPACING_PX, within the triangle budget
+  // (each level quadruples the triangles of the refined cells).
+  const spacing = Math.max(DETAIL_SPACING_PX, Math.min(...regions.map((r) => Math.max(r.width, r.height))) / DETAIL_CELLS_PER_REGION);
+  let levels = Math.max(0, Math.min(DETAIL_MAX_LEVELS, Math.ceil(Math.log2(Math.max(fx, fy) / spacing))));
+  let cells = 0;
+  for (const [x0, y0, x1, y1] of boxes) cells += (x1 - x0 + 2 * DETAIL_FEATHER) * (y1 - y0 + 2 * DETAIL_FEATHER);
+  while (levels > 0 && 2 * cells * (4 ** levels - 1) > DETAIL_TRIANGLE_BUDGET) levels--;
+  return { boxes, levels, weight, sample };
+}
+
+/** Inside detail regions, replace the box-filtered, smoothed grid depth by the full-resolution depth (feathered). */
+function sharpenDetail(d: Float32Array, gw: number, gh: number, plan: DetailPlan): void {
+  for (const [x0, y0, x1, y1] of plan.boxes) {
+    const i0 = Math.max(0, Math.floor(x0 - DETAIL_FEATHER)), i1 = Math.min(gw - 1, Math.ceil(x1 + DETAIL_FEATHER));
+    const j0 = Math.max(0, Math.floor(y0 - DETAIL_FEATHER)), j1 = Math.min(gh - 1, Math.ceil(y1 + DETAIL_FEATHER));
+    for (let j = j0; j <= j1; j++) {
+      for (let i = i0; i <= i1; i++) {
+        const k = j * gw + i;
+        const w = plan.weight(i, j);
+        // Overlapping boxes visit a vertex twice: the second pass sees the sharpened value and keeps it.
+        if (w > 0) d[k] += w * (plan.sample(i, j) - d[k]);
+      }
+    }
+  }
+}
+
+/**
+ * Halve the edges of every triangle whose centroid lies in a detail region,
+ * `plan.levels` times (1 → 4 split; neighbours with one or two split edges
+ * are bisected / split in three, so the surface stays crack-free and a
+ * closed mesh stays closed). A new vertex on an interior edge takes the
+ * full-resolution depth (weighted towards the edge's mean by the detail
+ * weight); on a boundary edge it takes the mean, keeping the smoothed outline.
+ * Boundary edges are split along, so walls follow.
+ */
+function refineFront(src: FrontMesh, plan: DetailPlan): FrontMesh {
+  const x = Array.from(src.x), y = Array.from(src.y), d = Array.from(src.d);
+  let tri = Array.from(src.tri), bnd = Array.from(src.bnd);
+  const K = 2 ** 26;
+  const key = (a: number, b: number) => (a < b ? a * K + b : b * K + a);
+  let border = new Set<number>();
+  for (let e = 0; e < bnd.length; e += 2) border.add(key(bnd[e], bnd[e + 1]));
+
+  for (let level = 0; level < plan.levels; level++) {
+    const mid = new Map<number, number>();
+    const nextBorder = new Set<number>();
+    const split = (a: number, b: number) => {
+      const k = key(a, b);
+      if (mid.has(k)) return;
+      const mx = (x[a] + x[b]) / 2, my = (y[a] + y[b]) / 2, mean = (d[a] + d[b]) / 2;
+      const id = x.length;
+      x.push(mx); y.push(my);
+      if (border.has(k)) {
+        d.push(mean);
+        nextBorder.add(key(a, id)).add(key(id, b));
+      } else d.push(mean + plan.weight(mx, my) * (plan.sample(mx, my) - mean));
+      mid.set(k, id);
+    };
+    for (let t = 0; t < tri.length; t += 3) {
+      const a = tri[t], b = tri[t + 1], c = tri[t + 2];
+      if (plan.weight((x[a] + x[b] + x[c]) / 3, (y[a] + y[b] + y[c]) / 3) <= 0) continue;
+      split(a, b); split(b, c); split(c, a);
+    }
+    if (mid.size === 0) break;
+    const out: number[] = [];
+    const len2 = (p: number, q: number) => (x[p] - x[q]) ** 2 + (y[p] - y[q]) ** 2;
+    for (let t = 0; t < tri.length; t += 3) {
+      let a = tri[t], b = tri[t + 1], c = tri[t + 2];
+      let ab = mid.get(key(a, b)), bc = mid.get(key(b, c)), ca = mid.get(key(c, a));
+      const n = +(ab !== undefined) + +(bc !== undefined) + +(ca !== undefined);
+      if (n === 0) { out.push(a, b, c); continue; }
+      if (n === 3) {
+        out.push(a, ab!, ca!, ab!, b, bc!, ca!, bc!, c, ab!, bc!, ca!);
+        continue;
+      }
+      // Rotate (keeping the winding) so that ab is split and, for two splits, bc too.
+      for (let r = 0; r < 3 && !(ab !== undefined && (n === 1 || bc !== undefined)); r++) {
+        [a, b, c] = [b, c, a];
+        [ab, bc, ca] = [bc, ca, ab];
+      }
+      if (n === 1) {
+        out.push(a, ab!, c, ab!, b, c);
+      } else {
+        out.push(ab!, b, bc!);
+        // Quad a, ab, bc, c: cut along the shorter diagonal.
+        if (len2(a, bc!) <= len2(ab!, c)) out.push(a, ab!, bc!, a, bc!, c);
+        else out.push(a, ab!, c, ab!, bc!, c);
+      }
+    }
+    tri = out;
+    const nb: number[] = [];
+    for (let e = 0; e < bnd.length; e += 2) {
+      const p = bnd[e], q = bnd[e + 1], m = mid.get(key(p, q));
+      if (m === undefined) nb.push(p, q);
+      else nb.push(p, m, m, q);
+    }
+    bnd = nb;
+    for (const k of border) if (!mid.has(k)) nextBorder.add(k);
+    border = nextBorder;
+  }
+  return {
+    x: Float64Array.from(x), y: Float64Array.from(y), d: Float64Array.from(d),
+    tri: Int32Array.from(tri), bnd: Int32Array.from(bnd),
+  };
 }
 
 function copyVertex(pos: Float32Array, uv: Float32Array, from: number, to: number): void {
@@ -495,6 +699,51 @@ function smoothOutlineDepth(d: Float32Array, { nb, verts }: Outline): void {
   }
 }
 
+/** Extrapolated edge distance (cells) up to which an outline vertex counts as the silhouette itself… */
+const TAPER_NEAR = 10;
+/** …and from which its depth is kept (a slab edge, e.g. ML depth). */
+const TAPER_FAR = 20;
+
+/**
+ * Double mode: the outline vertex sits up to a cell inside the silhouette and
+ * the grid sampling / blur average in interior depth, so an inflated balloon
+ * (depth ∝ √distance, steep at the edge) keeps ~15 % of its height on the
+ * outline and front and back meet in a tall, stepped wall. Extrapolate the
+ * depth outwards along its steepest inward rise (to the highest interior
+ * neighbour): if it reaches 0 within TAPER_NEAR cells the outline vertex
+ * stands in for the silhouette and gets depth 0; from TAPER_FAR on (flat or
+ * slowly falling depth) it is left alone, smoothstep in between.
+ */
+function taperOutlineDepth(d: Float32Array, deg: Uint8Array, triV: Int32Array, alive: Uint8Array, gw: number, gh: number): void {
+  const used = new Uint8Array(gw * gh);
+  for (let s = 0; s < alive.length; s++) {
+    if (!alive[s]) continue;
+    const o = s * 3;
+    used[triV[o]] = used[triV[o + 1]] = used[triV[o + 2]] = 1;
+  }
+  const next = new Float32Array(d.length);
+  const changed: number[] = [];
+  for (let v = 0; v < deg.length; v++) {
+    if (!deg[v]) continue;
+    const i = v % gw, j = (v - i) / gw;
+    const dOut = d[v];
+    let rise = 0; // largest depth gain per cell towards an interior neighbour
+    for (let dj = -1; dj <= 1; dj++) {
+      for (let di = -1; di <= 1; di++) {
+        const x = i + di, y = j + dj;
+        if (x < 0 || y < 0 || x >= gw || y >= gh) continue;
+        const u = y * gw + x;
+        if (used[u] && !deg[u]) rise = Math.max(rise, (d[u] - dOut) / (di && dj ? Math.SQRT2 : 1));
+      }
+    }
+    if (!(rise > 1e-6)) continue; // flat, falling inwards, or a thin strip without interior
+    const t = Math.min(1, Math.max(0, (TAPER_FAR - dOut / rise) / (TAPER_FAR - TAPER_NEAR)));
+    next[v] = dOut * (1 - t * t * (3 - 2 * t));
+    changed.push(v);
+  }
+  for (const v of changed) d[v] = next[v];
+}
+
 /**
  * Per-vertex XY offsets (grid cells, [di, dj] per grid vertex) that round off
  * the outline's pixel staircase — the 90° notches left by cells with two
@@ -603,6 +852,57 @@ function smoothWallNormals(pos: Float32Array, nrm: Float32Array, ends: Int32Arra
       }
     }
   }
+}
+
+/**
+ * Double mode: front, wall and back have separate vertices, so the rim shades
+ * as two hard creases. Where the rim is thin (the front outline at most one
+ * rim height above the seam, fading out by two), give the front outline
+ * vertex and the wall's top the same normal, halfway between the front
+ * surface and the horizontal wall direction, and mirror it for the back and
+ * the wall's bottom: the rim reads as one rounded seam.
+ */
+function roundDoubleRim(pos: Float32Array, nrm: Float32Array, ends: Int32Array, nF: number, firstWall: number, rim: number): void {
+  const nWall = ends.length / 2;
+  const acc = new Float32Array(nF * 2);
+  for (let e = 0; e < nWall; e++) {
+    for (let side = 0; side < 2; side++) {
+      const k = (firstWall + 4 * e + side) * 3, v = ends[2 * e + side];
+      acc[2 * v] += nrm[k]; acc[2 * v + 1] += nrm[k + 1];
+    }
+  }
+  const seam = new Float32Array(nF * 3);
+  const done = new Uint8Array(nF);
+  for (let e = 0; e < nWall; e++) {
+    for (let side = 0; side < 2; side++) {
+      const v = ends[2 * e + side];
+      const w = Math.min(1, Math.max(0, 2 - pos[v * 3 + 2] / rim));
+      if (w <= 0) continue;
+      if (!done[v]) {
+        done[v] = 1;
+        const hl = Math.hypot(acc[2 * v], acc[2 * v + 1]) || 1;
+        const hx = acc[2 * v] / hl, hy = acc[2 * v + 1] / hl;
+        const f = v * 3;
+        let sx = hx + nrm[f], sy = hy + nrm[f + 1], sz = nrm[f + 2];
+        const sl = Math.hypot(sx, sy, sz) || 1;
+        sx /= sl; sy /= sl; sz /= sl;
+        seam[f] = sx; seam[f + 1] = sy; seam[f + 2] = sz;
+        setNormal(nrm, v, nrm[f] + (sx - nrm[f]) * w, nrm[f + 1] + (sy - nrm[f + 1]) * w, nrm[f + 2] + (sz - nrm[f + 2]) * w, 1);
+        setNormal(nrm, v + nF, nrm[f], nrm[f + 1], nrm[f + 2], -1);
+      }
+      const f = v * 3;
+      for (const o of [side, side + 2]) {
+        const k = firstWall + 4 * e + o, kk = k * 3;
+        setNormal(nrm, k, nrm[kk] + (seam[f] - nrm[kk]) * w, nrm[kk + 1] + (seam[f + 1] - nrm[kk + 1]) * w, seam[f + 2] * w, o < 2 ? 1 : -1);
+      }
+    }
+  }
+}
+
+/** Store the normalised (x, y, z·zSign) as vertex v's normal. */
+function setNormal(nrm: Float32Array, v: number, x: number, y: number, z: number, zSign: number): void {
+  const l = Math.hypot(x, y, z) || 1;
+  nrm[v * 3] = x / l; nrm[v * 3 + 1] = y / l; nrm[v * 3 + 2] = (z * zSign) / l;
 }
 
 /** Area-weighted smooth vertex normals (per part, since parts don't share vertices). */

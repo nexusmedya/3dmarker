@@ -29,6 +29,6 @@ describe('Viewer empty state', () => {
     expect(render(false)).toContain('Upload an image, pick a driver');
     const loaded = render(true);
     expect(loaded).not.toContain('Upload an image');
-    expect(loaded).toContain('Image loaded — finish the steps on the left');
+    expect(loaded).toContain('Image loaded — finish the steps and press');
   });
 });

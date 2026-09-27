@@ -18,15 +18,20 @@
  */
 import {
   ACESFilmicToneMapping,
+  Bone,
   Box3,
+  BoxGeometry,
   Color,
   DataTexture,
   DirectionalLight,
   DoubleSide,
+  Float32BufferAttribute,
+  FrontSide,
   GridHelper,
   Group,
   Mesh,
   MeshMatcapMaterial,
+  MeshStandardMaterial,
   PCFShadowMap,
   PerspectiveCamera,
   PlaneGeometry,
@@ -35,11 +40,14 @@ import {
   SRGBColorSpace,
   Scene,
   ShadowMaterial,
+  Skeleton,
+  SkinnedMesh,
   Sphere,
+  Uint16BufferAttribute,
   Vector3,
   WebGLRenderer,
 } from 'three';
-import type { Material, Object3D, SkinnedMesh, Texture, WebGLRenderTarget } from 'three';
+import type { Material, Object3D, Texture, WebGLRenderTarget } from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { rebindSkinnedClones } from '../core/export/exporters';
@@ -65,6 +73,21 @@ const BACKGROUND = { dark: 0x0f1218, light: 0xeef0f4 };
 const GRID_COLORS = { dark: [0x3b4252, 0x232833], light: [0xaab1bf, 0xd3d7df] } as const;
 /** Initial camera direction: slightly right and above the front (+Z) view. */
 const VIEW_DIR = new Vector3(0.42, 0.28, 1).normalize();
+
+/** Camera presets, in the fusion's view conventions (src/core/fusion/frame.ts: the left view's camera sits at +X). */
+export type ViewPreset = 'front' | 'back' | 'left' | 'right' | 'top';
+export const VIEW_PRESETS: ViewPreset[] = ['front', 'back', 'left', 'right', 'top'];
+const PRESET_DIRS: Record<ViewPreset, Vector3> = {
+  front: new Vector3(0, 0, 1),
+  back: new Vector3(0, 0, -1),
+  left: new Vector3(1, 0, 0),
+  right: new Vector3(-1, 0, 0),
+  // A hair towards the front keeps OrbitControls off the pole (the subject's front at the screen bottom).
+  top: new Vector3(0, 1, 0.001).normalize(),
+};
+
+/** Touch screens: one-finger vertical swipes scroll the page, horizontal ones orbit. */
+const coarsePointer = (): boolean => typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
 
 /**
  * Procedural clay matcap (warm diffuse + soft specular + rim), 128² sRGB.
@@ -135,8 +158,12 @@ export class ViewerCore {
   private readonly overlays = new Group();
   private lastTick = 0;
   private disposed = false;
+  /** Warm-up materials kept so their compiled programs stay in three.js' cache (see warmUpShaders). */
+  private warmMaterials: { mats: Material[]; tex: DataTexture } | null = null;
   private readonly resizeObserver: ResizeObserver | null = null;
   private readonly intersectionObserver: IntersectionObserver | null = null;
+  /** Canvas pixels at the top covered by floating UI (the toolbar); framing keeps the model below them. */
+  private insetTop = 0;
 
   constructor(
     private readonly container: HTMLElement,
@@ -154,7 +181,9 @@ export class ViewerCore {
     renderer.domElement.style.display = 'block';
     renderer.domElement.style.width = '100%';
     renderer.domElement.style.height = '100%';
-    renderer.domElement.style.touchAction = 'none';
+    this.setTouchScroll(true);
+    // Info-log queries force every shader program to link synchronously; only worth it while developing.
+    renderer.debug.checkShaderErrors = !!import.meta.env?.DEV;
     container.appendChild(renderer.domElement);
 
     const pmrem = new PMREMGenerator(renderer);
@@ -203,6 +232,79 @@ export class ViewerCore {
     }
     this.resize();
     renderer.setAnimationLoop(this.tick);
+    this.warmUpShaders();
+  }
+
+  /**
+   * Compile the programs of the usual model materials (textured / vertex
+   * colours, front / double sided, skinned, clay) in the background, so the
+   * first model on screen does not stall the page while they link. The
+   * throwaway meshes sit far outside the view and leave once compiled; their
+   * materials stay alive (until dispose) so three.js keeps the programs cached
+   * and a new model (e.g. a re-run fusion replacing the old one) does not
+   * relink them on its first frame.
+   */
+  private warmUpShaders(): void {
+    const compileAsync = (this.renderer as { compileAsync?: WebGLRenderer['compileAsync'] }).compileAsync;
+    if (typeof compileAsync !== 'function' || typeof this.renderer.compile !== 'function') return;
+    const tex = new DataTexture(new Uint8Array([128, 128, 128, 255]), 1, 1, RGBAFormat);
+    tex.colorSpace = SRGBColorSpace;
+    tex.needsUpdate = true;
+    const geo = new BoxGeometry(0.01, 0.01, 0.01);
+    geo.setAttribute('color', geo.getAttribute('position').clone());
+    const mats: Material[] = [];
+    const std = (p: ConstructorParameters<typeof MeshStandardMaterial>[0]) => {
+      const m = new MeshStandardMaterial({ roughness: 0.8, metalness: 0, ...p });
+      mats.push(m);
+      return m;
+    };
+    const group = new Group();
+    group.position.set(1e6, 1e6, 1e6); // never inside the frustum
+    const meshes: Mesh[] = [
+      new Mesh(geo, std({ map: tex, side: FrontSide })),
+      new Mesh(geo, std({ map: tex, side: DoubleSide })),
+      new Mesh(geo, std({ vertexColors: true, side: FrontSide })),
+      new Mesh(geo, std({ vertexColors: true, side: DoubleSide })),
+      new Mesh(geo, this.clay),
+    ];
+    const bone = new Bone();
+    const skinned = new SkinnedMesh(geo.clone(), std({ map: tex, side: DoubleSide }));
+    const n = skinned.geometry.getAttribute('position').count;
+    skinned.geometry.setAttribute('skinIndex', new Uint16BufferAttribute(new Uint16Array(n * 4), 4));
+    skinned.geometry.setAttribute('skinWeight', new Float32BufferAttribute(new Float32Array(n * 4).fill(0.25), 4));
+    skinned.add(bone);
+    skinned.bind(new Skeleton([bone]));
+    meshes.push(skinned);
+    for (const m of meshes) {
+      m.castShadow = true;
+      group.add(m);
+    }
+    this.scene.add(group);
+    const done = () => {
+      this.scene.remove(group);
+      geo.dispose();
+      skinned.geometry.dispose();
+      skinned.skeleton.dispose();
+      if (this.disposed) {
+        for (const m of mats) m.dispose();
+        tex.dispose();
+      } else this.warmMaterials = { mats, tex };
+    };
+    if (this.renderer.extensions.has('KHR_parallel_shader_compile')) {
+      compileAsync.call(this.renderer, this.scene, this.camera).then(done, done);
+      return;
+    }
+    // No parallel compile: issue the compiles once the page is idle (without error
+    // checks nothing waits for them to finish; the driver links in the background).
+    const idle = (cb: () => void) => (typeof requestIdleCallback === 'function' ? requestIdleCallback(cb, { timeout: 2000 }) : setTimeout(cb, 200));
+    idle(() => {
+      try {
+        if (!this.disposed) this.renderer.compile(this.scene, this.camera);
+      } catch {
+        // Warm-up only.
+      }
+      done();
+    });
   }
 
   private readonly tick = (time?: number) => {
@@ -347,6 +449,27 @@ export class ViewerCore {
     this.dirty = true;
   }
 
+  /** Look at the model straight from one side (orthogonal to it), refitted. */
+  viewFrom(preset: ViewPreset): void {
+    this.fitCamera(PRESET_DIRS[preset]);
+  }
+
+  /**
+   * Floating UI over the canvas: the top `top` px stay free of the model when
+   * framing (fit / reset / presets). Applies from the next fit.
+   */
+  setFrameInsets({ top }: { top: number }): void {
+    this.insetTop = Number.isFinite(top) ? Math.max(0, top) : 0;
+  }
+
+  /**
+   * Whether a one-finger vertical swipe may scroll the page (touch screens
+   * only; tools that need every touch, like sculpting, turn it off).
+   */
+  setTouchScroll(allow: boolean): void {
+    this.renderer.domElement.style.touchAction = allow && coarsePointer() ? 'pan-y' : 'none';
+  }
+
   /**
    * Clone of the current object (sharing geometries / textures) carrying the
    * original materials, whatever the display mode — for the exporters.
@@ -375,6 +498,11 @@ export class ViewerCore {
     this.controls.dispose();
     this.clay.dispose();
     this.clayMatcap.dispose();
+    if (this.warmMaterials) {
+      for (const m of this.warmMaterials.mats) m.dispose();
+      this.warmMaterials.tex.dispose();
+      this.warmMaterials = null;
+    }
     this.ground.geometry.dispose();
     this.ground.material.dispose();
     this.disposeGrid();
@@ -486,18 +614,27 @@ export class ViewerCore {
     light.target.updateMatrixWorld();
   }
 
-  private fitCamera(): void {
+  private fitCamera(dir: Vector3 = VIEW_DIR): void {
     const box = this.bounds();
     const sphere = box.getBoundingSphere(new Sphere());
     const r = Math.max(sphere.radius, 0.05);
     const vFov = (this.camera.fov * Math.PI) / 180;
     const hFov = 2 * Math.atan(Math.tan(vFov / 2) * this.camera.aspect);
-    const dist = (r / Math.sin(Math.min(vFov, hFov) / 2)) * 1.08;
-    this.camera.position.copy(sphere.center).addScaledVector(VIEW_DIR, dist);
+    // Only the canvas below the floating toolbar counts vertically.
+    const h = this.container.clientHeight;
+    const free = h > 0 ? Math.min(1, Math.max(0.5, (h - this.insetTop) / h)) : 1;
+    const vFit = 2 * Math.atan(Math.tan(vFov / 2) * free);
+    const dist = (r / Math.sin(Math.min(vFit, hFov) / 2)) * 1.08;
+    // Centre the model in the free area: raise the view by half the inset.
+    const shift = dist * Math.tan(vFov / 2) * (1 - free);
+    const up = this.camera.up.clone().addScaledVector(dir, -dir.dot(this.camera.up));
+    if (up.lengthSq() > 1e-12) up.normalize();
+    const target = sphere.center.clone().addScaledVector(up, shift);
+    this.camera.position.copy(target).addScaledVector(dir, dist);
     this.camera.near = Math.max(0.001, dist / 100);
     this.camera.far = dist * 100;
     this.camera.updateProjectionMatrix();
-    this.controls.target.copy(sphere.center);
+    this.controls.target.copy(target);
     this.controls.minDistance = r * 0.25;
     this.controls.maxDistance = dist * 6;
     this.controls.update();

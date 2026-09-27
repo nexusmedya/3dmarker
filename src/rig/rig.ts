@@ -20,9 +20,11 @@ import { LocalizedError } from '../core/errors';
 import { AbortError, type I18nText, type Progress } from '../core/types';
 import { yieldToPaint } from '../core/yield';
 import { autoPlaceJointsDetailed, completeLayout } from './autoJoints';
+import { buildContactSample } from './contact';
 import { collectMeshData, isRigPlaceholder, RIG_PLACEHOLDER, skinnableMeshes, type MeshData } from './meshData';
 import { applyLayout, boneSegments, buildSkeleton, describeRig, missingBones, resetToRest, type RigDescriptor, type RigSkeleton } from './skeleton';
-import { computeSkinWeights, prepareSkinning, type SkinningOptions, type SkinPrep } from './skinning';
+import type { SkinningOptions, SkinWeights } from './skinning';
+import { createSkinWeigher, type SkinWeigher } from './weigher';
 import type { HumanoidBone, JointLayout, Vec3 } from './types';
 
 /** The part of ViewerCore the rig uses (structural, so tests can pass a fake). */
@@ -153,19 +155,26 @@ export async function rigModel(core: RigViewer | null, model: BuiltModel, opts: 
     check();
   }
   const rig = buildSkeleton(layout);
-  const prep = prepareSkinning(data.positions, data.index);
-  check();
+  // Welding, adjacency, BVH and the weights run in the geometry worker when there is one.
+  const weigher = await createSkinWeigher(data.positions, data.index, signal);
 
   const weigh = async (lay: JointLayout, sig?: AbortSignal, prog?: (p: Progress) => void) => {
     const segs = boneSegments(rig.names, lay);
-    return computeSkinWeights(prep, segs, {
+    return weigher.weigh(segs, {
       ...opts.skinning,
       signal: sig,
       onProgress: (r) => prog?.({ label: RIG_TEXT.weights, ratio: r }),
     });
   };
-  const weights = await weigh(layout, signal, onProgress);
-  check();
+  let weights: SkinWeights;
+  try {
+    check();
+    weights = await weigh(layout, signal, onProgress);
+    check();
+  } catch (e) {
+    weigher.dispose();
+    throw e;
+  }
   onProgress?.({ label: RIG_TEXT.binding });
 
   // Swap meshes for skinned copies.
@@ -222,7 +231,7 @@ export async function rigModel(core: RigViewer | null, model: BuiltModel, opts: 
   core?.rescanObject ? core.rescanObject() : core?.refresh();
   core?.invalidate();
 
-  return createHandle(core, model, rig, swaps, helper, prep, weigh, layout, savedRemesh);
+  return createHandle(core, model, rig, swaps, helper, weigher, weigh, layout, savedRemesh, data.positions, weights);
 }
 
 /** Put `next` where `prev` is among its parent's children (same index). */
@@ -240,14 +249,18 @@ function createHandle(
   rig: RigSkeleton,
   swaps: Swap[],
   helper: SkeletonHelper,
-  prep: SkinPrep,
-  weigh: (layout: JointLayout, signal?: AbortSignal, onProgress?: (p: Progress) => void) => ReturnType<typeof computeSkinWeights>,
+  weigher: SkinWeigher,
+  weigh: (layout: JointLayout, signal?: AbortSignal, onProgress?: (p: Progress) => void) => Promise<SkinWeights>,
   initialLayout: JointLayout,
   savedRemesh: BuiltModel['remesh'],
+  positions: Float32Array,
+  initialWeights: SkinWeights,
 ): RigHandle {
   const root = model.object;
   let layout: JointLayout = structuredCloneLayout(initialLayout);
-  let descriptor = describeRig(layout);
+  // Clips built from the descriptor are grounded on the skinned surface.
+  const describe = (l: JointLayout, w: SkinWeights): RigDescriptor => ({ ...describeRig(l), contact: buildContactSample(positions, w) });
+  let descriptor = describe(layout, initialWeights);
   let visible = false;
   let disposed = false;
   let seq = 0;
@@ -283,7 +296,7 @@ function createHandle(
     if (disposed || my !== seq) return false; // superseded by a newer edit (which includes this patch)
     pending = null;
     layout = next;
-    descriptor = describeRig(layout);
+    descriptor = describe(layout, w);
     applyLayout(rig, layout);
     rebind();
     for (const s of swaps) {
@@ -362,7 +375,7 @@ function createHandle(
       }
       rig.skeleton.dispose();
       model.remesh = savedRemesh;
-      prep.bvh = null;
+      weigher.dispose();
       core?.rescanObject ? core.rescanObject() : core?.refresh();
       core?.invalidate();
     },
@@ -376,7 +389,7 @@ function createHandle(
         s.skinned.geometry.dispose();
       }
       rig.skeleton.dispose();
-      prep.bvh = null;
+      weigher.dispose();
     },
   };
   return handle;

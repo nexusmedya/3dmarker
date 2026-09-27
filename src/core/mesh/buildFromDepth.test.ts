@@ -5,6 +5,7 @@ import { LocalizedError } from '../errors';
 import { buildGeometryFromDepth, EMPTY_MESH, gridSize, MIN_THICKNESS, sampleDepthGrid } from './buildFromDepth';
 import { DEFAULT_MESH_OPTIONS, type MeshMode, type MeshOptions } from './options';
 import { computeMeshStats } from './stats';
+import { DEFAULT_INFLATE_OPTIONS, inflateDepth } from '../../drivers/heuristic/inflate';
 
 const opts = (o: Partial<MeshOptions> = {}): MeshOptions => ({ ...DEFAULT_MESH_OPTIONS, resolution: 48, smoothing: 0, ...o });
 
@@ -136,6 +137,44 @@ describe('buildGeometryFromDepth', () => {
     for (let i = 2; i < p.length; i += 3) if (p[i] > 0) minFrontZ = Math.min(minFrontZ, p[i]);
     expect(minFrontZ).toBeGreaterThanOrEqual(0.01 - 1e-6);
     expect(computeMeshStats(g).watertight).toBe(true);
+  });
+
+  it('double mode closes an inflated silhouette with a thin rounded rim, not a tall wall band', () => {
+    // Default Silhouette inflate depth of an ellipse at the default resolution.
+    const W = 512, cx = 256, cy = 256;
+    const ellipse = maskOf(W, W, (x, y) => ((x - cx) / 200) ** 2 + ((y - cy) / 150) ** 2 <= 1);
+    const depth = inflateDepth(ellipse, null, DEFAULT_INFLATE_OPTIONS);
+    const o: MeshOptions = { ...DEFAULT_MESH_OPTIONS, mode: 'double' };
+    const g = buildGeometryFromDepth(depth, ellipse, o);
+    expect(computeMeshStats(g).watertight).toBe(true);
+    const rim = o.baseThickness * 2;
+    const walls = g.groups[2], idx = g.getIndex()!.array, p = attr(g, 'position'), n = attr(g, 'normal');
+    let wallZ = 0;
+    for (let t = walls.start; t < walls.start + walls.count; t++) wallZ = Math.max(wallZ, Math.abs(p[idx[t] * 3 + 2]));
+    expect(wallZ).toBeLessThan(rim / 2 + 0.01); // was ≈ 0.115 (a 0.23-high flat band)
+    expect(g.boundingBox!.max.z).toBeGreaterThan(0.4); // still a full balloon
+
+    // No shading seam: every wall vertex has a front/back vertex at the same place with the same normal.
+    const key = (v: number) => `${p[v * 3].toFixed(5)},${p[v * 3 + 1].toFixed(5)},${p[v * 3 + 2].toFixed(5)}`;
+    const surf = new Map<string, number>();
+    for (let t = 0; t < walls.start; t++) surf.set(key(idx[t]), idx[t]);
+    for (let t = walls.start; t < walls.start + walls.count; t++) {
+      const w = idx[t], s = surf.get(key(w));
+      expect(s).toBeDefined();
+      const dot = n[w * 3] * n[s! * 3] + n[w * 3 + 1] * n[s! * 3 + 1] + n[w * 3 + 2] * n[s! * 3 + 2];
+      expect(dot).toBeGreaterThan(0.999);
+    }
+  });
+
+  it('double mode keeps a flat (ML-style) slab edge at full thickness', () => {
+    const flat = depthOf(N, N, () => 0.6);
+    const o = opts({ mode: 'double' });
+    const g = buildGeometryFromDepth(flat, SHAPES.circle, o);
+    expect(g.boundingBox!.max.z).toBeCloseTo(0.6 * o.depthScale * 2 + o.baseThickness, 5);
+    const walls = g.groups[2], idx = g.getIndex()!.array, p = attr(g, 'position');
+    for (let t = walls.start; t < walls.start + walls.count; t++) {
+      expect(Math.abs(p[idx[t] * 3 + 2])).toBeCloseTo(0.6 * o.depthScale * 2 + o.baseThickness, 5);
+    }
   });
 
   it('wall normals are smooth along a round outline and hard at real corners', () => {

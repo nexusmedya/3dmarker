@@ -1,7 +1,8 @@
 /**
  * Sculpt session on the viewer's model: finds the editable meshes (skinned /
  * instanced ones are skipped: sculpting is off for rigged models), prepares
- * a SculptMesh per geometry, and turns pointer input on the viewer canvas
+ * a SculptMesh per geometry (coarse ones are subdivided first, in place:
+ * brushes can only move existing vertices), and turns pointer input on the viewer canvas
  * into brush dabs (spacing, pen pressure, Ctrl/Cmd = invert, Shift = smooth,
  * X symmetry in the model's local frame). Strokes only start on the mesh:
  * drags in empty space still orbit. Undo / redo per stroke, a surface-aligned
@@ -18,6 +19,7 @@ import { BRUSH_IDS, DEFAULT_BRUSH, type BrushId, type BrushSettings, type Sculpt
 import { SculptMesh, isSculptable } from './sculptMesh';
 import { DabScratch, applyDab, applyGrab, captureGrab, type GrabCapture } from './brushes';
 import { SculptHistory } from './history';
+import { edgeLengths, refineGeometry } from './refine';
 import { BrushCursor, type CursorTone } from './cursor';
 import { sanitizeBrushSettings, stepRadius, stepStrength } from './settings';
 
@@ -35,6 +37,8 @@ export interface SculptSessionOptions {
   spacing?: number;
   /** Ignore vertices facing away from the brush (thin shells). Default true. */
   frontOnly?: boolean;
+  /** Split the edges of coarse meshes at session start so brushes have vertices to move (default true). */
+  refine?: boolean;
   /** Where keyboard shortcuts are listened for while active (default: window). */
   keyTarget?: EventTarget | null;
 }
@@ -43,7 +47,9 @@ export type SculptEvent =
   | { type: 'state'; state: SculptState }
   | { type: 'settings'; settings: BrushSettings }
   /** The geometry changed (stroke end, undo, redo, reset). */
-  | { type: 'edit'; state: SculptState };
+  | { type: 'edit'; state: SculptState }
+  /** A stroke ended without the brush reaching any vertex (mesh too coarse for the brush). */
+  | { type: 'empty-stroke' };
 
 export interface SculptHit {
   /** World-space hit point. */
@@ -103,6 +109,8 @@ interface Stroke {
   /** DOM strokes: the pointer that drives it (touch strokes can be cancelled by a second finger). */
   pointer: StrokePointer | null;
   dabs: number;
+  /** Vertices (welded) inside the brush over the whole stroke; grab: captured ones. */
+  touched: number;
 }
 
 interface StrokePointer {
@@ -125,6 +133,14 @@ interface StrokePointer {
  */
 const TOUCH_CANCEL_MS = 300;
 const TOUCH_CANCEL_PX = 12;
+
+/**
+ * Coarse meshes are refined to edges of at most REFINE_EDGE × the model's
+ * bounding radius (half the default brush radius) when their longest edge
+ * exceeds REFINE_TRIGGER × that.
+ */
+const REFINE_EDGE = DEFAULT_BRUSH.radius / 2;
+const REFINE_TRIGGER = 1.5;
 
 /** Hard cap on dabs per pointer sample (a jump across the model with a tiny brush). */
 const MAX_DABS_PER_SAMPLE = 256;
@@ -175,6 +191,9 @@ export class SculptSession {
   private readonly mirror = new Matrix4();
   private readonly mirrorN = new Matrix3();
   private modelRadius = 1;
+  private medianEdge = 0;
+  private refinedInfo: { before: number; after: number } | null = null;
+  private readonly refine: boolean;
   private brush: BrushSettings;
   private stroke: Stroke | null = null;
   private count = 0;
@@ -197,6 +216,7 @@ export class SculptSession {
     this.history = new SculptHistory(opts.maxHistory, opts.maxHistoryBytes);
     this.spacing = Math.max(0.02, opts.spacing ?? 0.25);
     this.frontOnly = opts.frontOnly !== false;
+    this.refine = opts.refine !== false;
     this.keyTarget = opts.keyTarget !== undefined ? opts.keyTarget : typeof window !== 'undefined' ? window : null;
     this.build();
   }
@@ -209,12 +229,26 @@ export class SculptSession {
     const kept = new Set<SculptMesh>();
     this.targets.length = 0;
     this.root.updateWorldMatrix(true, true);
+    const meshes: Mesh[] = [];
     this.root.traverse((o) => {
       const m = o as Mesh & { isSkinnedMesh?: boolean; isInstancedMesh?: boolean; isBatchedMesh?: boolean };
       if (!m.isMesh || m.isSkinnedMesh || m.isInstancedMesh || m.isBatchedMesh) return;
       if (!m.geometry || !isSculptable(m.geometry)) return;
+      meshes.push(m);
+    });
+    // Size of the editable part (skinned / helper objects excluded). Refining
+    // only adds points on the surface, so the bounds stay the same.
+    const box = new Box3();
+    for (const m of meshes) {
+      const g = m.geometry;
+      if (!g.boundingBox) g.computeBoundingBox();
+      box.union(_box.copy(g.boundingBox!).applyMatrix4(m.matrixWorld));
+    }
+    this.modelRadius = box.isEmpty() ? 1 : Math.max(1e-6, box.getBoundingSphere(new Sphere()).radius);
+    for (const m of meshes) {
       let data = byGeometry.get(m.geometry);
       if (!data) {
+        if (this.refine) this.refineCoarse(m);
         data = new SculptMesh(m.geometry);
         byGeometry.set(m.geometry, data);
       }
@@ -229,19 +263,42 @@ export class SculptSession {
         scale: 1,
         sphere: new Sphere(),
       });
-    });
+    }
     for (const d of this.datas) if (!kept.has(d)) d.dispose();
     this.datas.length = 0;
     this.datas.push(...kept);
-    // Size of the editable part (skinned / helper objects excluded).
-    const box = new Box3();
-    for (const t of this.targets) {
-      const g = t.data.geometry;
-      if (!g.boundingBox) g.computeBoundingBox();
-      box.union(_box.copy(g.boundingBox!).applyMatrix4(t.mesh.matrixWorld));
-    }
-    this.modelRadius = box.isEmpty() ? 1 : Math.max(1e-6, box.getBoundingSphere(new Sphere()).radius);
     this.updateTransforms();
+    // Typical edge in world units (sampled per geometry, largest median wins).
+    let median = 0;
+    for (const t of this.targets) median = Math.max(median, edgeLengths(t.data.geometry, 6000).median * t.scale);
+    this.medianEdge = median;
+  }
+
+  /**
+   * Brushes only move existing vertices: split the edges of a coarse mesh
+   * (an extrusion's flat caps, a low-poly GLB) so the default brush always
+   * has points to move. Dense meshes are left as they are.
+   */
+  private refineCoarse(m: Mesh): void {
+    const scale = Math.max(1e-12, m.matrixWorld.getMaxScaleOnAxis());
+    const target = (REFINE_EDGE * this.modelRadius) / scale;
+    if (edgeLengths(m.geometry).max <= REFINE_TRIGGER * target) return;
+    const r = refineGeometry(m.geometry, { maxEdge: target });
+    if (!r) return;
+    const acc = this.refinedInfo ?? { before: 0, after: 0 };
+    acc.before += r.trianglesBefore;
+    acc.after += r.trianglesAfter;
+    this.refinedInfo = acc;
+  }
+
+  /** Triangle counts before / after the coarse meshes were refined at session start (null: none was). */
+  get refined(): { before: number; after: number } | null {
+    return this.refinedInfo;
+  }
+
+  /** Median edge length of the edited meshes, world units (vs. worldRadius(): is the mesh too coarse for the brush?). */
+  get medianEdgeLength(): number {
+    return this.medianEdge;
   }
 
   /** Cache world transforms (the model does not move during a stroke). */
@@ -415,12 +472,14 @@ export class SculptSession {
       pointerId: null,
       pointer: null,
       dabs: 0,
+      touched: 0,
     };
     this.stroke = stroke;
     this.lastDabMoved = 0;
     for (const d of this.datas) d.beginStroke();
     if (brush === 'grab') {
       stroke.grab = this.captureGrab(point, stroke.lastNormal, stroke.sideSign);
+      for (const part of stroke.grab) stroke.touched += part.cap.groups.length;
       const toCamera = _v.copy(this.core.camera.position).sub(point);
       stroke.grabPlane = new Plane().setFromNormalAndCoplanarPoint(toCamera.lengthSq() > 0 ? toCamera.normalize() : stroke.lastNormal, point);
     } else {
@@ -507,7 +566,10 @@ export class SculptSession {
     }
     this.updateTransforms(); // bounding spheres grew / shrank
     this.core.invalidate();
-    if (deltas.length === 0) return false;
+    if (deltas.length === 0) {
+      if ((st.dabs > 0 || st.grab) && st.touched === 0) this.emit({ type: 'empty-stroke' });
+      return false;
+    }
     this.core.refresh?.();
     this.history.push(SculptHistory.record(deltas, this.count, this.count + 1));
     this.count++;
@@ -594,6 +656,7 @@ export class SculptSession {
         },
         this.scratch,
       );
+      st.touched += this.scratch.gathered.count;
     }
     return moved;
   }

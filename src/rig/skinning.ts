@@ -14,8 +14,9 @@
  *     over the welded adjacency (sparse, ≤ 8 influences while smoothing),
  *     top 4 kept and normalised.
  *
- * Runs on the main thread but time-sliced (yields every ~25 ms). 100k
- * vertices take ~1–3 s.
+ * Time-sliced (yields every ~25 ms). The app runs it in the geometry worker
+ * (./weigher.ts, src/workers/geometry.worker.ts), else on the main thread.
+ * 100k vertices take ~1–3 s.
  */
 import { BufferAttribute, BufferGeometry, DoubleSide, Ray, Vector3 } from 'three';
 import { MeshBVH } from 'three-mesh-bvh';

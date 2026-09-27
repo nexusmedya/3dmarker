@@ -6,7 +6,7 @@
  * state and a before / after comparison with Accept / Discard.
  * Pure: the shell owns every value and runs the job.
  */
-import { useId } from 'react';
+import { useCallback, useEffect, useId, useRef } from 'react';
 import type { I18nText, Progress, RGBAImage } from '../../core/types';
 import type { HumanAnalysis } from '../../core/human/types';
 import type { PrepOptions, ProviderConfig, SubjectKind } from '../../ai/types';
@@ -59,6 +59,15 @@ export const PREP_TEXT = {
     tr: 'Yalnızca insan ve insansı karakterler için: “İnsan” ya da “Karakter” seçin veya otomatik algılamanın bir kişi bulmasını bekleyin.',
     en: 'Only for people and humanoid characters: choose Human or Character, or let auto-detect find a person.',
   },
+  humanoidOnlyNoDetect: {
+    tr: 'Otomatik algılama kullanılamıyor: T-poz için Konu’yu “İnsan” ya da “Karakter” yapın.',
+    en: 'Auto-detect is unavailable: set Subject to Human or Character to use T-pose.',
+  },
+  humanoidOnlyNotFound: {
+    tr: 'Otomatik algılama bir kişi bulamadı: görseldeki bir insan ya da insansı karakterse, T-poz için Konu’yu “İnsan” ya da “Karakter” yapın.',
+    en: 'Auto-detect found no person: if the image shows a person or humanoid character, set Subject to Human or Character to use T-pose.',
+  },
+  setHuman: { tr: 'İnsan olarak ayarla', en: 'Set as human' },
   completeBody: { tr: 'Eksik gövdeyi tamamla', en: 'Complete the full body' },
   completeBodyHint: {
     tr: 'Gövdenin bir kısmı görünüyorsa (ör. yalnızca baş) yapay zekâ tam boy bedeni çizer.',
@@ -138,6 +147,8 @@ function providerOptionLabel(p: ProviderConfig): string {
 export function AiPrepPanel(p: Props) {
   const { tx, lang } = useI18n();
   const id = useId();
+  const { onPrep } = p;
+  const onStyle = useCallback((styleId: string | null) => onPrep({ styleId }), [onPrep]);
   const running = p.status === 'running';
   const lock = !!p.disabled || running;
   const hasProvider = p.providers.length > 0;
@@ -158,6 +169,35 @@ export function AiPrepPanel(p: Props) {
           ? T.needOption
           : null;
   const canRun = !lock && !blocked;
+  const tPoseHint = humanoid
+    ? T.tPoseHint
+    : p.prep.subject !== 'auto'
+      ? T.humanoidOnly
+      : detection.kind === 'unavailable'
+        ? T.humanoidOnlyNoDetect
+        : detection.kind === 'not-human'
+          ? T.humanoidOnlyNotFound
+          : T.humanoidOnly;
+
+  // Error and result render under the run button, often below the fold
+  // (and behind the sticky footer): bring them into view when they appear.
+  const errRef = useRef<HTMLDivElement>(null);
+  const resultRef = useRef<HTMLDivElement>(null);
+  const showError = !!p.error && !running;
+  useEffect(() => {
+    if (!showError) return;
+    const raf = requestAnimationFrame(() => {
+      errRef.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
+      errRef.current?.focus({ preventScroll: true });
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [showError, p.error]);
+  const preparedImage = p.prepared?.image;
+  useEffect(() => {
+    if (!preparedImage) return;
+    const raf = requestAnimationFrame(() => resultRef.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' }));
+    return () => cancelAnimationFrame(raf);
+  }, [preparedImage]);
 
   const countsText =
     detection.kind === 'human'
@@ -257,12 +297,17 @@ export function AiPrepPanel(p: Props) {
                 <IconAlert size={13} /> {tx(T.unavailable)}
               </span>
               {detection.reason && <span className="muted small ai-detect-reason">{tx(detection.reason)}</span>}
+              {p.prep.subject === 'auto' && !lock && (
+                <button type="button" className="btn btn-secondary btn-sm" onClick={() => p.onPrep({ subject: 'human' })} data-testid="ai-prep-set-human">
+                  <IconPerson size={13} /> {tx(T.setHuman)}
+                </button>
+              )}
             </>
           )}
         </div>
       </div>
 
-      <StylePicker value={p.prep.styleId} onChange={(styleId) => p.onPrep({ styleId })} disabled={lock} />
+      <StylePicker value={p.prep.styleId} onChange={onStyle} disabled={lock} />
 
       <div className="ai-toggles">
         <div className="field">
@@ -276,7 +321,7 @@ export function AiPrepPanel(p: Props) {
             testId="ai-prep-tpose"
           />
           <p id={`${id}-tpose-hint`} className="field-hint">
-            {tx(humanoid ? T.tPoseHint : T.humanoidOnly)}
+            {tx(tPoseHint)}
           </p>
         </div>
         <div className="field">
@@ -357,18 +402,19 @@ export function AiPrepPanel(p: Props) {
         )}
       </div>
 
-      {p.error && !running && (
-        <div className="alert alert-danger" role="alert" data-testid="ai-prep-error">
+      {showError && (
+        <div className="alert alert-danger" role="alert" tabIndex={-1} ref={errRef} data-testid="ai-prep-error">
           <IconAlert size={18} />
           <div className="alert-body">
             <strong>{tx(T.errorTitle)}</strong>
-            <p>{tx(p.error)}</p>
+            {/* Provider errors put the provider's own reply on a second line. */}
+            <p style={{ whiteSpace: 'pre-line' }}>{tx(p.error!)}</p>
           </div>
         </div>
       )}
 
       {p.prepared && (
-        <div className="ai-result" data-testid="ai-prep-result">
+        <div className="ai-result" ref={resultRef} data-testid="ai-prep-result">
           <div className="ai-result-head">
             <strong className="small">{tx(T.resultTitle)}</strong>
             <span className="muted small truncate" title={p.prepared.name}>

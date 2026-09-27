@@ -70,6 +70,8 @@ export class GuardField {
     readonly half: Float32Array,
     readonly zBox: Float32Array,
     readonly columns: number,
+    /** Thin parts and which views cannot see their depth (colouring, depth cap); null = none recorded. */
+    readonly parts: ThinPartInfo | null = null,
   ) {}
 
   /** Guard occupancy at voxel (i, j, k); 0 where the column is not guarded. */
@@ -105,6 +107,122 @@ export class GuardField {
       }
     return added;
   }
+
+  /**
+   * The front columns within `reach` voxels of a point (world coords of the
+   * grid) that belong to a thin part hidden from the view looking along
+   * `axis` (0: left / right, 1: top / bottom; see ThinPartInfo): calls
+   * `f(column, part gate)`.
+   */
+  private hiddenColumns(p: ArrayLike<number>, axis: 0 | 1, reach: number, f: (c: number, g: number) => void): void {
+    const parts = this.parts;
+    if (!parts) return;
+    const { grid } = this;
+    const [nx, ny] = grid.dims;
+    const ic = Math.round((p[0] - grid.origin[0]) / grid.spacing), jc = Math.round((p[1] - grid.origin[1]) / grid.spacing);
+    for (let j = Math.max(0, jc - reach); j <= Math.min(ny - 1, jc + reach); j++) {
+      if (axis === 0 && !parts.rowHidden[j]) continue;
+      for (let i = Math.max(0, ic - reach); i <= Math.min(nx - 1, ic + reach); i++) {
+        if (axis === 1 && !parts.colHidden[i]) continue;
+        const c = i + nx * j;
+        if (parts.gate[c] > 0) f(c, parts.gate[c]);
+      }
+    }
+  }
+
+  /**
+   * How far the view looking along `axis` (0: left / right, 1: top / bottom)
+   * may colour a surface point (world coords of the grid): 1, except on a thin
+   * part hidden from it, where it fades to 1 − gate within `margin` voxels
+   * outside the part's round cross-section around the tube centre: beyond it
+   * the hull only has the depth of whatever lies behind the part in that view
+   * (see ColorOptions.thin). The least over the columns within `reach` voxels: the smoothed surface sits a
+   * voxel or two outside the front silhouette.
+   */
+  colorSupport(p: ArrayLike<number>, axis: 0 | 1, margin = 1.5, reach = 2): number {
+    const parts = this.parts;
+    if (!parts) return 1;
+    const k = (p[2] - this.grid.origin[2]) / this.grid.spacing;
+    let support = 1;
+    this.hiddenColumns(p, axis, reach, (c, g) => {
+      const t = Math.min(1, Math.max(0, (Math.abs(k - this.center[c]) - parts.radius[c]) / margin));
+      support = Math.min(support, 1 - g * t * t * (3 - 2 * t));
+    });
+    return support;
+  }
+
+  /** The largest part gate of the columns within `reach` voxels of the point (world coords); 0 = not thin. */
+  gateAt(p: ArrayLike<number>, reach = 2): number {
+    const parts = this.parts;
+    if (!parts) return 0;
+    const { grid } = this;
+    const [nx, ny] = grid.dims;
+    const ic = Math.round((p[0] - grid.origin[0]) / grid.spacing), jc = Math.round((p[1] - grid.origin[1]) / grid.spacing);
+    let g = 0;
+    for (let j = Math.max(0, jc - reach); j <= Math.min(ny - 1, jc + reach); j++)
+      for (let i = Math.max(0, ic - reach); i <= Math.min(nx - 1, ic + reach); i++) g = Math.max(g, parts.gate[i + nx * j]);
+    return g;
+  }
+
+  /**
+   * Without depth maps nothing narrows a thin part whose depth every profile
+   * view reads off a bigger part behind it (a T-pose arm: the side views see
+   * the chest there, so the hull keeps the chest's depth — a plank). Caps such
+   * columns to a round cross-section: field = min(field, ramp at
+   * ROUND_SLACK · radius + 0.5 voxel around the tube centre), the thicker the
+   * part the looser (1 − gate adds the rest of the profile interval). Returns
+   * the voxels that dropped below 0.5.
+   */
+  capHidden(field: Float32Array): number {
+    const parts = this.parts;
+    if (!parts || (!parts.hasZY && !parts.hasXZ)) return 0;
+    const [nx, ny, nz] = this.grid.dims;
+    let removed = 0;
+    for (let j = 1; j < ny - 1; j++) {
+      if (parts.hasZY && !parts.rowHidden[j]) continue;
+      for (let i = 1; i < nx - 1; i++) {
+        if (parts.hasXZ && !parts.colHidden[i]) continue;
+        const c = i + nx * j;
+        const g = parts.gate[c];
+        if (!(g > 0)) continue;
+        const r = ROUND_SLACK * parts.radius[c] + (1 - g) * parts.span[c], kc = this.center[c];
+        for (let k = 1; k < nz - 1; k++) {
+          const v0 = r - Math.abs(k - kc) + 0.5;
+          if (v0 >= 1) continue;
+          const v = v0 <= 0 ? 0 : v0;
+          const q = i + nx * (j + ny * k);
+          if (field[q] > v) {
+            if (field[q] > 0.5 && v <= 0.5) removed++;
+            field[q] = v;
+          }
+        }
+      }
+    }
+    return removed;
+  }
+}
+
+/** capHidden keeps this multiple of the round half-thickness (a limb is rarely exactly round). */
+export const ROUND_SLACK = 1.25;
+
+/**
+ * Thin parts of the front silhouette, per front column (i + nx·j) of the
+ * guard grid, and which profile views see behind them. A left / right view
+ * sees front row j in one piece, so where that row also holds a thicker part
+ * (the chest beside a T-pose arm) its depth there belongs to that part
+ * (`rowHidden`); likewise a top / bottom view and front column i
+ * (`colHidden`: the head above the shoulders).
+ */
+export interface ThinPartInfo {
+  /** 0..1 per column: how much it belongs to a thin PART (thinPartGate). */
+  gate: Float32Array;
+  /** Round cross-section's half-thickness min(h3, zhalf) and the profile interval's half length, voxels. */
+  radius: Float32Array;
+  span: Float32Array;
+  rowHidden: Uint8Array;
+  colHidden: Uint8Array;
+  hasZY: boolean;
+  hasXZ: boolean;
 }
 
 /** Interval of entries ≥ 0.5 (with zBox > 0) of a line read through `get`, or null. */
@@ -116,6 +234,47 @@ function interval(n: number, get: (k: number) => number, zBox: Float32Array): [n
       b = k;
     }
   return a < 0 ? null : [a, b];
+}
+
+/** Area / (largest local thickness)² of a thin region below which it is a corner sliver, not a part. */
+export const PART_MIN_AREA = 0.3;
+
+/**
+ * The thin PARTS of the front silhouette: columns whose guard gate is above ½
+ * (local thickness below 3δL; a thick torso near 4δL fades the guard in but
+ * is no part), ramped to 1 at ¾, in connected regions (4-neighbours) that are
+ * not mere corner slivers — the corners of a thick silhouette have a small
+ * local thickness too (only small discs fit there), but their region's area
+ * is ≈ 0.05 τ², while a limb (elongated) or a head (a disc, ≈ 0.8 τ²) has
+ * at least PART_MIN_AREA · (its largest τ)².
+ */
+export function thinPartGate(gate: Float32Array, tau: Float32Array, w: number, h: number): Float32Array {
+  const out = new Float32Array(w * h);
+  const label = new Int32Array(w * h).fill(-1);
+  const stack: number[] = [];
+  const members: number[] = [];
+  const thin = (c: number) => gate[c] > 0.5;
+  for (let c0 = 0; c0 < w * h; c0++) {
+    if (!thin(c0) || label[c0] >= 0) continue;
+    members.length = 0;
+    stack.push(c0);
+    label[c0] = c0;
+    let tmax = 0;
+    while (stack.length) {
+      const c = stack.pop()!;
+      members.push(c);
+      tmax = Math.max(tmax, tau[c]);
+      const x = c % w, y = (c - x) / w;
+      for (const d of [x > 0 ? c - 1 : -1, x < w - 1 ? c + 1 : -1, y > 0 ? c - w : -1, y < h - 1 ? c + w : -1]) {
+        if (d < 0 || label[d] >= 0 || !thin(d)) continue;
+        label[d] = c0;
+        stack.push(d);
+      }
+    }
+    if (members.length < PART_MIN_AREA * tmax * tmax) continue;
+    for (const c of members) out[c] = Math.min(1, 4 * (gate[c] - 0.5));
+  }
+  return out;
 }
 
 export function buildGuard(planes: HullPlanes, box: ObjectBox, grid: Grid, o: GuardOptions): GuardField {
@@ -133,6 +292,7 @@ export function* buildGuardSteps(planes: HullPlanes, box: ObjectBox, grid: Grid,
   const deltaVox = (o.delta * Math.max(box.size[0], box.size[1])) / grid.spacing;
   const zBox = extentCoverage(grid, 2, box.size[2] / 2);
   const center = new Float32Array(nx * ny), half = new Float32Array(nx * ny);
+  const gates = new Float32Array(nx * ny), radius = new Float32Array(nx * ny), span = new Float32Array(nx * ny);
   // Profile intervals along Z: per row from the side views' plane, per column from the caps' plane.
   const zyLo = new Int32Array(ny).fill(-1), zyHi = new Int32Array(ny).fill(-1);
   if (planes.hasZY)
@@ -179,7 +339,19 @@ export function* buildGuardSteps(planes: HullPlanes, box: ObjectBox, grid: Grid,
       if (p <= 0) continue;
       center[c] = (k0 + k1) / 2;
       half[c] = p;
+      gates[c] = gate;
+      radius[c] = Math.min(h3[c], zhalf);
+      span[c] = zhalf;
       columns++;
     }
-  return new GuardField(grid, center, half, zBox, columns);
+  const partGate = thinPartGate(gates, tau, nx, ny);
+  // A front pixel of no thin part (a thicker part, or a corner of one) hides its row / column's parts.
+  const rowHidden = new Uint8Array(ny), colHidden = new Uint8Array(nx);
+  for (let j = 0; j < ny; j++)
+    for (let i = 0; i < nx; i++) {
+      const c = i + nx * j;
+      if (bin[c] && !(partGate[c] > 0)) rowHidden[j] = colHidden[i] = 1;
+    }
+  const parts: ThinPartInfo = { gate: partGate, radius, span, rowHidden, colHidden, hasZY: planes.hasZY, hasXZ: planes.hasXZ };
+  return new GuardField(grid, center, half, zBox, columns, parts);
 }

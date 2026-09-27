@@ -9,7 +9,11 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SourceImage } from '../app/pipeline';
 
-const mocks = vi.hoisted(() => ({ prepareSource: vi.fn(), runPipeline: vi.fn(), resolveMask: vi.fn(), quickMask: vi.fn() }));
+const mocks = vi.hoisted(() => ({ prepareSource: vi.fn(), runPipeline: vi.fn(), resolveMask: vi.fn(), quickMask: vi.fn(), renderSample: vi.fn() }));
+vi.mock('../app/samples', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../app/samples')>();
+  return { ...actual, renderSample: mocks.renderSample };
+});
 vi.mock('../app/pipeline', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../app/pipeline')>();
   mocks.quickMask.mockImplementation(actual.quickMask);
@@ -19,6 +23,7 @@ vi.mock('../app/pipeline', async (importOriginal) => {
 import { Object3D } from 'three';
 import type { PipelineResult } from '../app/pipeline';
 import { useStudio, type Studio } from './useStudio';
+import { SAMPLES } from '../app/samples';
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -66,6 +71,7 @@ beforeEach(() => {
   mocks.prepareSource.mockReset();
   mocks.runPipeline.mockReset();
   mocks.resolveMask.mockReset();
+  mocks.renderSample.mockReset();
 });
 
 const STATS = { vertices: 3, triangles: 1, watertight: false };
@@ -284,6 +290,74 @@ describe('useStudio view uploads', () => {
     await vi.waitFor(() => expect(studio.state.views.back?.mask).toBe(cut));
     expect(mocks.resolveMask).toHaveBeenCalledOnce();
     expect(studio.state.aiJob).toBeNull();
+  });
+});
+
+describe('useStudio model download failure', () => {
+  it('flags an offline failure and "try the offline driver" switches and regenerates', async () => {
+    await mount();
+    await act(async () => studio.actions.selectDriver('silhouette-extrude'));
+    await loadNow('a.png');
+    mocks.runPipeline.mockImplementationOnce(async () => {
+      throw new Error('Failed to fetch');
+    });
+    await act(async () => studio.actions.generate());
+    expect(studio.state.status).toBe('error');
+    expect(studio.state.errorOffline).toBe(true);
+
+    mocks.runPipeline.mockImplementation(async () => pipelineResult());
+    await act(async () => studio.actions.generateOffline());
+    expect(studio.state.driverId).toBe('silhouette-inflate');
+    expect(mocks.runPipeline).toHaveBeenCalledTimes(2);
+    expect(studio.state.status).toBe('done');
+  });
+
+  it('other failures are not offline', async () => {
+    await mount();
+    await act(async () => studio.actions.selectDriver('silhouette-extrude'));
+    await loadNow('a.png');
+    mocks.runPipeline.mockImplementationOnce(async () => {
+      throw new Error('boom');
+    });
+    await act(async () => studio.actions.generate());
+    expect(studio.state.errorOffline).toBe(false);
+  });
+});
+
+describe('useStudio samples', () => {
+  const sample = (id: string) => SAMPLES.find((x) => x.id === id)!;
+
+  it('selects the sample\'s recommended driver', async () => {
+    await mount();
+    await act(async () => studio.actions.selectDriver('depth-anything-v2-small'));
+    mocks.renderSample.mockImplementation(async () => new Blob());
+    mocks.prepareSource.mockImplementation(async (_b: Blob, name: string) => sourceOf(name));
+    await act(async () => studio.actions.loadSample(sample('mascot')));
+    expect(studio.state.source?.name).toBe(sample('mascot').fileName);
+    expect(studio.state.driverId).toBe('silhouette-inflate');
+  });
+
+  it('blocks Generate while the sample renders, and the last pick wins', async () => {
+    await withModel();
+    const slow = deferred<Blob>();
+    mocks.renderSample.mockImplementationOnce(() => slow.promise).mockImplementationOnce(async () => new Blob());
+    mocks.prepareSource.mockImplementation(async (_b: Blob, name: string) => sourceOf(name));
+    let first!: Promise<unknown>;
+    await act(async () => {
+      first = studio.actions.loadSample(sample('landscape'));
+    });
+    expect(studio.state.loadingImage).toBe(true);
+    await ctrlEnter();
+    await act(async () => studio.actions.generate());
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+
+    await act(async () => studio.actions.loadSample(sample('mascot')));
+    await act(async () => {
+      slow.resolve(new Blob());
+      await first;
+    });
+    expect(studio.state.source?.name).toBe(sample('mascot').fileName);
+    expect(studio.state.loadingImage).toBe(false);
   });
 });
 

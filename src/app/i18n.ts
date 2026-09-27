@@ -43,13 +43,13 @@ export const UI = {
 
   // Background
   bgTitle: { tr: 'Arka plan', en: 'Background' },
-  bgAuto: { tr: 'PNG saydamlığını kullan (otomatik)', en: 'Use PNG transparency (auto)' },
+  bgAuto: { tr: 'Otomatik (saydamlık ya da düz arka plan)', en: 'Auto (transparency or plain background)' },
   bgBorder: { tr: 'Düz arka planı otomatik ayır', en: 'Auto from plain background' },
   bgAi: { tr: 'Yapay zekâ ile arka plan kaldır', en: 'AI background removal' },
   bgNone: { tr: 'Yok (tüm görsel)', en: 'None (full image)' },
   bgAutoNoAlpha: {
-    tr: 'Görselde saydamlık yok; tüm görsel kullanılacak.',
-    en: 'The image has no transparency; the whole image is used.',
+    tr: 'Saydamlık ya da düz arka plan bulunamadı; tüm görsel kullanılacak. Yapay zekâ ile arka plan kaldırmayı deneyin.',
+    en: 'No transparency or plain background found; the whole image is used. Try AI background removal.',
   },
   bgBorderFail: {
     tr: 'Düz bir arka plan rengi bulunamadı; tüm görsel kullanılacak.',
@@ -107,6 +107,8 @@ export const UI = {
   errorTitle: { tr: 'Oluşturma başarısız', en: 'Generation failed' },
   imageErrorTitle: { tr: 'Görsel yüklenemedi', en: 'Could not load the image' },
   dismiss: { tr: 'Kapat', en: 'Dismiss' },
+  errorDetails: { tr: 'Ayrıntılar', en: 'Details' },
+  tryOfflineDriver: { tr: '{driver} ile dene', en: 'Try {driver}' },
 
   // Viewer
   viewerLabel: { tr: '3D görüntüleyici', en: '3D viewer' },
@@ -116,8 +118,8 @@ export const UI = {
     en: 'Upload an image, pick a driver and press “Generate 3D”.',
   },
   viewerReadyBody: {
-    tr: 'Görsel yüklendi — soldaki adımları tamamlayıp “3D Oluştur”a basın.',
-    en: 'Image loaded — finish the steps on the left and press “Generate 3D”.',
+    tr: 'Görsel yüklendi — adımları tamamlayıp “3D Oluştur”a basın.',
+    en: 'Image loaded — finish the steps and press “Generate 3D”.',
   },
   noWebgl: {
     tr: 'Bu tarayıcıda WebGL kullanılamıyor; 3D önizleme gösterilemiyor.',
@@ -128,13 +130,19 @@ export const UI = {
   viewClay: { tr: 'Kil görünüm', en: 'Clay' },
   viewAutoRotate: { tr: 'Otomatik döndür', en: 'Auto-rotate' },
   viewReset: { tr: 'Görünümü sıfırla', en: 'Reset view' },
+  viewPresets: { tr: 'Hazır bakış açıları', en: 'Camera presets' },
+  viewFront: { tr: 'Önden', en: 'Front' },
+  viewBack: { tr: 'Arkadan', en: 'Back' },
+  viewLeft: { tr: 'Soldan', en: 'Left' },
+  viewRight: { tr: 'Sağdan', en: 'Right' },
+  viewTop: { tr: 'Üstten', en: 'Top' },
   viewBackground: { tr: 'Arka plan açık/koyu', en: 'Light/dark background' },
   viewDepth: { tr: 'Derinlik haritası', en: 'Depth map' },
   depthAlt: { tr: 'Derinlik haritası önizlemesi (açık = yakın)', en: 'Depth map preview (bright = near)' },
   controlsHint: { tr: 'Sürükle: döndür · Sağ tık: kaydır · Tekerlek: yakınlaş', en: 'Drag: orbit · Right-drag: pan · Wheel: zoom' },
 
   // Stats / export
-  vertices: { tr: 'vertex', en: 'vertices' },
+  vertices: { tr: 'köşe', en: 'vertices' },
   triangles: { tr: 'üçgen', en: 'triangles' },
   watertight: { tr: 'Kapalı (watertight)', en: 'Watertight' },
   openMesh: { tr: 'Açık yüzey', en: 'Open surface' },
@@ -188,9 +196,9 @@ export const UI = {
   hintWorking: { tr: 'Çalışıyor…', en: 'Working…' },
   hintReview: { tr: 'Onaylayın', en: 'To review' },
   hintPrepared: { tr: 'Hazırlandı', en: 'Prepared' },
-  hintOptional: { tr: 'Opsiyonel', en: 'Optional' },
+  hintOptional: { tr: 'İsteğe bağlı', en: 'Optional' },
   hintViews: { tr: '{n}/6 görünüm', en: '{n}/6 views' },
-  hintModel: { tr: 'Model hazır', en: 'Model ready' },
+  hintModel: { tr: 'Hazır', en: 'Ready' },
   hintSculpted: { tr: 'Düzenlendi', en: 'Sculpted' },
   hintRigged: { tr: 'Kemikli', en: 'Rigged' },
   hintNeedsModel: { tr: 'Model yok', en: 'No model' },
@@ -218,6 +226,14 @@ export const UI = {
   removingViewBg: { tr: 'Görünümün arka planı kaldırılıyor…', en: 'Removing the view’s background…' },
   preparedInUse: { tr: 'Yapay zekâ ile hazırlanan görsel kullanılıyor.', en: 'Using the AI-prepared image.' },
   revertOriginal: { tr: 'Orijinale dön', en: 'Revert to original' },
+  revertConfirm: {
+    tr: 'Orijinale dönülürse yapay zekâ ile hazırlanan görsel ve ondan üretilen {n} görünüm kaldırılır (yüklediğiniz görünümler kalır). Devam edilsin mi?',
+    en: 'Reverting removes the AI-prepared image and the {n} views generated from it (uploaded views stay). Continue?',
+  },
+  revertKeep: { tr: 'Vazgeç', en: 'Cancel' },
+  originalInUse: { tr: 'Orijinal görsel kullanılıyor.', en: 'Using the original image.' },
+  restorePrepared: { tr: 'Yapay zekâ görseline dön', en: 'Back to the AI image' },
+  restorePreparedViews: { tr: 'Yapay zekâ görseline dön (+{n} görünüm)', en: 'Back to the AI image (+{n} views)' },
 
   // Generate guards
   blockedAiBusy: { tr: 'Yapay zekâ işi bitince oluşturabilirsiniz.', en: 'Wait for the AI job to finish.' },
@@ -234,7 +250,7 @@ export const UI = {
   },
   useFusion: { tr: 'Çok görünümlü birleştirmeye geç', en: 'Switch to multi-view fusion' },
   regenDiscardsSculpt: { tr: 'Yeniden oluşturmak heykel düzenlemelerinizi atar.', en: 'Regenerating discards your sculpt edits.' },
-  regenDiscardsRig: { tr: 'Yeniden oluşturmak iskeleti ve animasyonları atar.', en: 'Regenerating discards the rig and its animations.' },
+  regenDiscardsRig: { tr: 'Yeniden oluşturmak kemikleri ve animasyonları atar.', en: 'Regenerating discards the rig and its animations.' },
   regenDiscardsDepth: { tr: 'Yeniden oluşturmak derinlik haritası düzenlemenizi atar.', en: 'Regenerating discards your depth map edit.' },
   regenAnyway: { tr: 'Yine de oluştur', en: 'Regenerate anyway' },
   keepEdits: { tr: 'Vazgeç', en: 'Keep my edits' },
@@ -296,6 +312,7 @@ export const UI = {
   // Multi-view fusion report (step 3D)
   fusionReport: { tr: 'Birleştirme raporu', en: 'Fusion report' },
   fusionColorOnly: { tr: 'yalnız renk', en: 'colour only' },
+  fusionOff: { tr: 'kapalı', en: 'off' },
 
   // Export
   exportAnimations: { tr: 'GLB {n} animasyon içerir', en: 'GLB includes {n} animations' },

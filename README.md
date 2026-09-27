@@ -1,14 +1,18 @@
 # 3D Marker — Görselden 3D'ye (tarayıcıda)
 
 > **English summary.** 3D Marker is a browser-based image-to-3D SaaS prototype (in the spirit of tripo3d.ai).
-> A six-step studio: **1** upload an image (background from PNG alpha, a plain border or an in-browser AI matte) →
+> A six-step studio: **1** upload an image or pick a sample (which also selects its driver; the "auto" background uses PNG
+> alpha, else a plain border colour; an in-browser AI matte is optional) →
 > **2** optional AI preparation with your own provider keys (60 style presets, T-pose, completing a cropped body,
 > transparent background) → **3** the other views (back / left / right / top / bottom), uploaded or AI-generated →
 > **4** a *driver* turns them into a mesh: in-browser depth models (Depth Anything V2, MiDaS; faces, noses, lips,
 > ears, hands and fingers get extra relief from MediaPipe landmarks), instant heuristics, **multi-view fusion**
 > (a closed, vertex-coloured full-3D mesh from several views, entirely in the browser; hand-made views are registered
 > to the front by their silhouette profiles, cropped edges are detected and thin parts such as T-pose arms are
-> guarded, with a per-view consistency badge, an Align panel, trust modes and a "copy prompt") or cloud models (Tripo3D,
+> guarded, with a per-view consistency badge, an Align panel, trust modes and a "copy prompt"; wrong-slot, duplicate,
+> mirrored and featureless views are flagged as poor; colours are exposure-matched per view and chosen by a visibility-checked
+> vote so side views no longer bleed onto arms and hands; fusion and skin weighting run in a Web Worker so the page stays
+> responsive) or cloud models (Tripo3D,
 > Tripo multi-view, any image-to-3D model of a provider you added) → **5** Blender-style sculpting on the mesh and a
 > depth-map painter → **6** automatic humanoid rig (Mixamo bone names), 45 built-in animations, BVH / FBX / GLB
 > import, animated GLB export (OBJ / STL / PLY too). AI providers are a dynamic list (OpenAI, Gemini, Stability,
@@ -26,7 +30,7 @@ Stüdyo altı adımdan oluşur (sol paneldeki numaralı sekmeler; klavyeyle ←/
 
 | Adım | Ne yapar |
 |---|---|
-| **1 Görsel** | Görsel yükleme / yapıştırma / örnekler; arka plan: PNG alfa, düz kenar rengi, yapay zekâ (MODNet) ya da yok |
+| **1 Görsel** | Görsel yükleme / yapıştırma / örnekler (her örnek kendi önerilen sürücüsünü seçer); arka plan: **otomatik** (PNG alfa, yoksa düz kenar rengi — beyaz / düz fonlu JPEG'ler de kesilir), düz kenar rengi, yapay zekâ (MODNet) ya da yok |
 | **2 AI hazırlık** (isteğe bağlı) | Kendi sağlayıcınızla görseli **60 stilden** birine çevirme, **T-poz**, **eksik gövdeyi tamamlama** (ör. yalnızca kafa → tam boy), saydam arka plan; önce/sonra karşılaştırma, kabul et / vazgeç / orijinale dön |
 | **3 Görünümler** | Tam 3B için **arka, sol, sağ, üst, alt** görünümler: elle yükleyin ya da yapay zekâya ürettirin ("Eksikleri üret") |
 | **4 3D** | Sürücü seçimi, parametreler, canlı mesh ayarları; "3D Oluştur" her adımdan erişilebilir (Ctrl/⌘ + Enter; heykel modunda ve metin alanlarında devre dışı). Heykel / rig / derinlik düzenlemesi taşıyan modeli yeniden oluşturmadan önce onay istenir |
@@ -38,7 +42,10 @@ Stüdyo altı adımdan oluşur (sol paneldeki numaralı sekmeler; klavyeyle ←/
 - **Çok görünümlü füzyon** (`multiview-fusion`): ön + diğer görünümlerden kapalı (watertight), köşe renkli tam 3B mesh — tamamen tarayıcıda.
   Elle yüklenen / başka araçta üretilen görünümler ön görünüme **otomatik hizalanır** (ölçek, kayma, kenarda kesik çerçeve),
   ince parçalar (T-pozdaki kollar) korunur; her görünüm için **tutarlılık rozeti**, **Hizala** paneli, güven modu
-  ("Şekil + renk" / "Yalnız renk" / "Kapalı") ve **İstemi kopyala** vardır.
+  ("Şekil + renk" / "Yalnız renk" / "Kapalı") ve **İstemi kopyala** vardır. Yanlış yuvaya konmuş, ön görselin kopyası,
+  ters yöne bakan ya da ayrıntısız görünümler "zayıf" puan alır ve raporda ne yapılacağı söylenir. Renkler görünüm başına
+  pozlama eşitlenerek ve görünürlük kontrollü oylamayla seçilir (yan görünüm renkleri kollara / ellere taşmaz). Füzyon ve
+  deri ağırlıklandırma ayrı bir **Web Worker**'da çalışır: sayfa bu sırada donmaz, İptal hemen etkilidir.
 - **Yapay zekâ sağlayıcıları** dinamik bir listedir: istediğiniz kadar sağlayıcı / anahtar / model ekleyin (OpenAI, Google Gemini, Stability AI, Replicate, fal.ai, Tripo3D, OpenAI uyumlu, özel HTTP). Anahtarlar tarayıcıda kalır ya da sunucuda tutulur.
 - Arayüz Türkçe ve İngilizce; açık/koyu tema; ayarlar tarayıcıda saklanır (gizli anahtarlar yalnızca "hatırla" açıksa).
 
@@ -183,7 +190,12 @@ seçilebilir (görsel düzenleme, arka plan kaldırma, görselden 3B, çok gör�
   öncelikli olarak verilir. Stability'nin düzenleme uç noktaları kompozisyonu korur: T-poz / tamamlama ve yeni görünümler için
   kullanılamaz (yalnızca stil); Görünümler adımı bu durumda görünüm üretebilen başka bir sağlayıcıyı kullanır.
 - Sonuç önce/sonra kaydırıcısıyla gösterilir; **Bu görseli kullan** kaynağı değiştirir (görünümler bu görselden, aynı stil /
-  ek talimatlar tekrarlanarak üretilir), **Orijinale dön** her zaman mümkündür.
+  ek talimatlar tekrarlanarak üretilir), **Orijinale dön** her zaman mümkündür: yapay zekâ görünümleri silinecekse önce onay
+  istenir ve **Yapay zekâ görseline dön** ile hazırlanan görsel ve görünümleri geri gelir (ücretli sonuçlar kaybolmaz).
+- Model indirilemediğinde (çevrimdışı, engelli ağ) hata kutusu **Siluet şişirme ile dene** düğmesini sunar; teknik ayrıntı
+  "Ayrıntılar" altında katlanır. Görüntüleyicide **Önden / Arkadan / Soldan / Sağdan / Üstten** hazır bakış açıları vardır.
+- Telefonda: oluşturma bitince sayfa modele kayar, Düzenle / Rig adımlarında görüntüleyici ekranın altına sabitlenir, görüntüleyici
+  üzerinde dikey kaydırma sayfayı kaydırır (heykel modu hariç), adım sekmeleri kaydırılabilir olduğunu kenar solmasıyla gösterir.
 
 ## Çok görünümlü iş akışı
 
@@ -199,7 +211,20 @@ seçilebilir (görsel düzenleme, arka plan kaldırma, görselden 3B, çok gör�
    aynasıdır; yalnızca yan / üst / alt görünümler derinliği sınırlar) — ve **ince parça koruması** (`guard.ts`) ön görünümde ince olan
    kolları / bacakları diğer görünümler uyuşmasa da yerinde tutar; (3) isteğe bağlı olarak her görünümde Depth Anything ile oyma
    (model inemezse siluet gövdesine düşer ve uyarır; derinlik ölçeği sabit noktalı, sağlam bir medyanla kalibre edilir, oyma asla
-   korumanın altına inmez); (4) marching cubes + Taubin yumuşatma ile kapalı mesh, görünürlük kontrollü köşe renkleri.
+   korumanın altına inmez; model inmezse yalnızca yan görünümlerde gövdenin önünde görünen ince parçalar — T-pozdaki kollar —
+   yuvarlak kesite kırpılır, "tahta kol" oluşmaz); (4) marching cubes + Taubin yumuşatma ile kapalı mesh ve köşe renkleri
+   (`color.ts`): her görünüm son mesh'in kendi derinlik görüntüsünü çizer, başka bir parçanın arkasında kalan (ya da onun
+   kenarına bitişik) noktalar o görünümden renk almaz; yan / arka / üst görünümlerin renkleri kanal başına ön görünüme
+   **pozlama eşitlenir** (farklı ışıkta / tonda çizilmiş setler modeli boyamaz; gerçekten farklı renkli görünümler olduğu gibi
+   kalır); her noktada görünümler bakış açısı ve önceliğe göre (ön 1, arka 0.9, yan / üst / alt 0.8, "Yalnız renk" yarısı)
+   **oy verir**, iyi desteklenen görünümlerle çelişen örnek atılır; görünüm alanlarının kenarı iki köşe halkasında yumuşakça
+   söner. Ön görünümde ince olan parçalarda (kol, el, bacak, boyun, baş) yan / üst görünüm rengi yalnızca parçanın yuvarlak
+   kesiti içinde ve ön / arka renge kabaca uyuyorsa kullanılır.
+   Füzyon ayrı bir Web Worker'da (`src/workers/geometry.worker.ts`) çalışır; derinlik modeli çıkarımı ML worker'ına gider,
+   yalnızca son geometri ana iş parçacığına aktarılır. Worker başlatılamazsa oturum boyunca ana iş parçacığına (dilimli, yol
+   veren) geri düşülür; worker iş ortasında çökerse iki dilde hata gösterilir ve sonraki çalıştırma yeni bir worker alır.
+   Derinlik modeli indirilemezse raporda tek satır çıkar: "Derinlik modeli indirilemedi (bağlantı yok); model yalnız
+   siluetlerden oluşturuldu…"; indirme yanıt vermeyi keserse ~30 s sonra "yanıt vermiyor" nedeniyle yine siluetlere düşülür.
    Parametreler: voksel çözünürlüğü (64–256), kabuk modu + gövde toleransı, **görünüm hizalama** (Otomatik = siluet profilleri /
    Yalnız çerçeve = eski bbox davranışı), **ince parça koruması (%)** (0–15, varsayılan 6; ön görselin uzun kenarının bu yüzdesinden
    ince parçalar korunur, 0 = kapalı), derinlik iyileştirme / modeli / gücü, yumuşatma, renk keskinliği, üçgen sınırı.
@@ -216,7 +241,7 @@ kayma farkı, yan görünümdeki kol diskini ön görünümün kol satırlarınd
   paylaştığı eksenlerde eşlenir — arka: satırlar + aynalanmış sütunlar; sol / sağ: satırlar; üst / alt: sütunlar. Ölçek
   (ln k ∈ ±0.37) ve kayma (±%30) aranır, kaba ızgara → yerel tepeler → budanmış ince arama (en kötü %20 bölme atılır, kolları
   farklı yükseklikte olan bir arka görünüm kaymayı sürüklemez). Arka görünümde tek bir içerik ölçeği kullanılır (izotropi).
-  Eşleşme zayıfsa ya da siluet düzse (küre, kutu) çerçeve olduğu gibi kalır ("Önle eşleştirilemedi" / "Hizalanacak ayrıntı yok").
+  Eşleşme zayıfsa ya da siluet düzse (küre, kutu) çerçeve olduğu gibi kalır ("Ön görünümle eşleştirilemedi" / "Hizalanacak ayrıntı yok").
 - **Kenarda kesik görünümler:** siluet görsel kenarına değiyorsa (kenar satırında bbox kenarının ≥ %2'si kadar ön plan) o kenar
   "bilinmiyor" sayılır: gövde orada oymaz, eksik kısım diğer görünümlerden tamamlanır. Ölçek profil eşleşmesinden, o da yoksa
   arka için ön görünümün en-boy oranından, yan görünüm için tepe–boyun mesafesinden bulunur; hiçbiri yoksa "ölçeği bulunamadı;
@@ -228,6 +253,20 @@ kayma farkı, yan görünümdeki kol diskini ön görünümün kol satırlarınd
   çağırır; oluşturmadan sonraki **birleştirme raporu** (3D adımı: görünüm başına puan, seviye, güven, tutarlılık, uyarılar) esas
   sonuçtur. Derinlik yolunda ek olarak görünüm başına *tutarlılık payı* ölçülür: bir görünümün oyacağı hacmin korumanın tuttuğu
   payı %25'i aşarsa "ön görünümle tam örtüşmüyor; ince parçalar korundu" uyarısı verilir.
+- **Yanlış / şüpheli görünüm denetimleri** (puanı sınırlar, notu iki dilde açıklar, raporda uyarı + öneri çıkar):
+  - *Yanlış yuva:* ön / arka görseli yan ya da üst yuvada (figür görünümlüyse: boyun, bacak / kol arası boşluk) → en çok 30
+    (zayıf) ve elle konmadıysa yalnız renk; lamba ya da kare masa gibi yanı önüne benzeyen nesneler işaretlenmez.
+  - *Aynı görsel:* ön görsel başka bir yuvaya tekrar yüklenmiş ya da bir görsel iki yuvada → "ön görselle aynı görsel" (zayıf);
+    silindir / küre gibi her yönden aynı görünen nesneler işaretlenmez.
+  - *Uymayan derinlik:* bir yan / üst görünüm ön görselin 3 katından derin bir hacim ya da diğer derinlik görünümleriyle çelişen
+    bir derinlik veriyorsa zayıf puan ve yalnız renk.
+  - *Ayrıntısız:* ön görsel bir figür / ayrıntılıyken düz bir leke ya da dikdörtgen → zayıf.
+  - *Ters yön:* yan görünümde ayak uçları ve burun yanlış yöne bakıyorsa "ters yöne bakıyor olabilir — Yatay aynala'yı deneyin"
+    (en çok 70, orta); Yatay aynala açılınca kalkar.
+  - *Kopya arka:* arka görünüm ön görselin (aynalı ya da değil) kopyasıysa "ön görselle aynı görünüyor" (en çok 79).
+  - Başka nedeni olmayan **zayıf** her görünüm raporda puanı ve çözümüyle adlandırılır (Hizala panelinde düzeltin ya da
+    güveni "Yalnız renk" / "Kapalı" yapın). Elle hizalama sırasında da bu sınırlar rozette korunur. İki görünümü karşılaştıran
+    denetimler (aynı görsel iki yuvada, çelişen derinlik) yalnızca oluşturmadan sonraki raporda görünür.
 - **Hizala paneli** (yuvadaki hizalama düğmesi): üst üste bindirme önizlemesi (gri: önden beklenen — arka için ön siluetin aynası,
   yanlar için uzunluk çizgileri ve kesikli işaret satırları; renkli: bu görünüm; kırmızı tarama: kesik kenar), **Dikey / Yatay kayma**
   (±%20; yan görünümlerde yatay kayma yoktur, üst / alt görünümlerde dikey kayma yoktur) ve **Ölçek** (%70–140) kaydırıcı + sayı
@@ -254,9 +293,17 @@ yeniden aranır; "Yüksek çözünürlüklü kırpma" yüz/el bölgelerinde deri
 Algılama ana iş parçacığında, derinlik çıkarımıyla paralel çalışır; modeller inemezse (ör. ağ engeli) "Algılama kullanılamıyor"
 gösterilir ve düz derinlikle devam edilir; yavaş (≥5 s, ör. indirme takılması) bir model yükleme hatası 5 dakika hatırlanır, bu
 sürede sonraki çalıştırmalar beklemeden düz derinliğe geçer (hızlı ağ hataları her seferinde yeniden denenir). Kırpma geçişi
-yalnızca küresel geçişten daha ince çözünürlük verecekse yapılır. Bilinen sınır: varsayılan mesh çözünürlüğü / yumuşatmada
-parmaklar ve kulaklar yumuşayabilir; ayrıntı için "Canlı mesh" çözünürlüğünü artırıp yumuşatmayı azaltın. Sonuç 2. ve 4. adımda (algılanan yüz/el/vücut sayısı) görünür; 2. adımda algılama
+yalnızca küresel geçişten daha ince çözünürlük verecekse yapılır. Sonuç 2. ve 4. adımda (algılanan yüz/el/vücut sayısı) görünür; 2. adımda algılama
 yalnızca hazırlığı çalıştırabilecek bir sağlayıcı varken kendiliğinden başlar (gereksiz ~20 MB indirmeyi önler).
+
+- **Parmak ve kulak ayrıntısı:** sürücü yüz (kulak payıyla) ve el bölgelerini derinlikle birlikte işaretler; mesh kurucu bu
+  bölgelerde derinliği yumuşatılmış ızgaradan değil tam çözünürlüklü haritadan alır ve üçgenleri yalnızca orada ~1.25 piksele
+  kadar böler (en çok 3 düzey, en fazla 250 bin ek üçgen; bölge dışına 2 hücrede geçiş, çatlak yok, kapalı mesh kapalı kalır).
+  Varsayılan ayarlarda parmak sırtlarının / kulak kabartmasının ~%93–95'i korunur (önce %3–6); mesh ~68k yerine ~122k üçgen.
+- **Algılama kullanılamazsa** (model inmedi, zaman aşımı, WebGL hatası) 4. adımdaki **İnsan detayı** kartı nedeni sade dille
+  gösterir ("3B üretim yine çalışır, ancak yüz ve el kabartması eklenmez") ve **Yeniden dene** düğmesi sunar (hatırlanan
+  indirme hatasını unutup hemen yeniden indirir); yalnızca bir algılayıcı başarısızsa ("El algılama kullanılamadı; bulunanlarla
+  devam edilir") uyarı gösterilir. Üretim sırasında ilerleme satırı da kabartmasız devam edildiğini söyler.
 
 ## Heykel ve derinlik editörü (5. adım)
 
@@ -276,10 +323,18 @@ modelin üzerinde sürükleyin; boş alanda sürüklemek görünümü döndürü
 Dikişler bozulmaz (aynı konumdaki köşeler birlikte hareket eder), açık kenarlar isteğe bağlı sabitlenir. Heykelli bir derinlik
 modelinde mesh seçeneklerini değiştirmek yüzeyi yeniden örer ve düzenlemeleri siler — bu yüzden canlı yeniden örme duraklatılır.
 
+Kaba mesh'ler (ör. ekstrüzyon, düşük poligonlu modeller) heykel başlarken **otomatik alt bölünür**: en uzun kenar varsayılan
+fırça yarıçapının yarısına göre 1.5 kattan uzunsa kenarlar bölünür (konuma göre, dikişlerde çatlak yok, kapalı mesh kapalı kalır,
+en çok 300 bin üçgen; morph hedefli geometri atlanır). Panel "Mesh heykel için sıklaştırıldı: X → Y üçgen" der; bu düzenleme
+sayılmaz, Geri al / Sıfırla alt bölünmüş, düzenlenmemiş yüzeye döner. Hiçbir köşeye değmeyen bir darbeden sonra ve tipik kenar
+fırça yarıçapından uzunsa baştan uyarı gösterilir.
+
 **Derinlik haritası editörü** (derinlik sonuçları için): Yükselt / Alçalt / Yumuşat / Düzleştir / Geri yükle fırçaları,
 yarıçap, güç, düşüş eğrisi, "yalnızca özne içinde", gri / renkli görünüm, görsel kaplama, önce/sonra, yakınlaştırma
 (tekerlek), kaydırma (Boşluk + sürükle). En yakın noktalar da yükseltilebilir: uygulamada harita yeniden `[0,1]`'e ölçeklenir.
-**Uygula** yeni derinlikten modeli yeniden kurar (canlı mesh ayarları çalışmaya devam eder).
+**Uygula** yeni derinlikten modeli yeniden kurar (canlı mesh ayarları çalışmaya devam eder). Düzenleme varken Esc / × / İptal
+önce sorar ("N düzenleme silinsin mi?" — **Düzenlemeye devam** odaklı, **Vazgeç ve kapat**); soru açıkken Esc düzenlemeye döner,
+yani iki kez Esc'ye basmak çalışmayı kaybettirmez.
 
 ## Rig ve animasyon (6. adım)
 
@@ -287,12 +342,24 @@ yarıçap, güç, düşüş eğrisi, "yalnızca özne içinde", gri / renkli gö
   el noktaları algılanırsa parmaklar). Eklemler önce MediaPipe vücut pozundan, yoksa kolları aşağıda / T-poz siluetinden, o da
   olmazsa oranlardan yerleştirilir. Deri ağırlıkları mesafe + iç görünürlük testiyle, köşe başına 4 kemik.
 - **Eklem düzenleyici:** eklemleri görünümde sürükleyin ya da X/Y/Z ile dürtün (ayna seçeneğiyle); her değişiklik ağırlıkları yeniler.
+  **Geri al / Yinele / Otomatik konuma sıfırla** düğmeleri ve Ctrl/⌘+Z, Ctrl+Shift+Z / Ctrl+Y (her sürükleme ya da dürtme dizisi
+  bir adım; içe aktarılan klipler korunur). Sürükleme 3 px'ten sonra başlar (kayan tıklama yeniden ağırlıklandırmaz); gövde dışına
+  bırakılan eklem (ve ayna ikizi) dinlenme pozunun ön silueti içine çekilir (parmaklar hariç).
+- **Algılama durumu:** MediaPipe modeli yüklenemezse durum satırının altında nedeni ve **Tekrar dene** gösterilir (kişi bulunursa
+  eklemler tek, geri alınabilir bir adımda yeniden yerleşir); "(insan algılanmadı)" yalnızca algılama gerçekten çalışıp kimseyi
+  bulamadığında yazılır. İlerleme vermeyen bir model indirmesi 10 s sonra bırakılır. Şekil insana benzemiyorsa (baş–boyun, bacak
+  arası boşluk, derinlik puanı < 0.5) "siluetten (emin değil)" ve "… insan figürüne benzemiyor; animasyonlar modeli yırtabilir"
+  uyarısı çıkar.
 - **45 hazır animasyon** (bekleme, yürüyüş/koşu, jestler, duygular, dans, aksiyon, pozlar): oynat / duraklat / durdur (T-poza döner),
   zaman çubuğu, hız, döngü, geçiş (cross-fade), arama ve kategori filtresi. Klipler kanonik T-pozda yazılır ve dinlenme yönlerine
-  göre aktarılır; A-pozlu iskeletleri de doğru sürer.
+  göre aktarılır; A-pozlu iskeletleri de doğru sürer. Zemin geçişi deri ağırlıklarıyla birlikte saklanan ~1 500 yüzey
+  noktasını her karede pozlar ve en alçak noktayı zeminde tutar: tabanlar, ayak uçları, yatarken sırt ve baş zemine girmez
+  (bağlı mesh yoksa eklemler + yaklaşık vücut kalınlığı kullanılır).
 - **İçe aktarma:** `.bvh`, `.fbx` (Mixamo dahil), `.glb`/`.gltf`. Kemik adları Mixamo, klasik/CMU/SecondLife BVH, Unity, Unreal ve
   Rigify düzenlerinden eşlenir; kaynağın yukarı/ileri eksenleri iskeletten bulunur; kalça hareketi bacak boyuna göre ölçeklenir,
-  döngüler yerinde kalır.
+  döngüler yerinde kalır. Ayak ucu eklemi olmayan dosyalarda zemin iki tarafta da ayak bileğinden ölçülür (karakter zemine
+  gömülmez). Bozuk dosyada ham JavaScript hatası yerine iki dilde "dosya bozuk ya da geçerli bir BVH / FBX / GLB animasyonu değil"
+  gösterilir.
 - **Dışa aktarma:** GLB deriyi (JOINTS_0/WEIGHTS_0) ve **seçili tüm animasyonları** taşır (dosya adı `-rigged`); OBJ / STL / PLY
   o anda gösterilen pozu verir. Kemikli GLB modellerin kendi animasyonları da oynatılabilir ve GLB'ye geri yazılır.
 - En iyi sonuç tam boy ve T-pozdaki modellerle alınır: 2. adımdaki **T-poz** + 3. adımdaki görünümler + çok görünümlü füzyon.
@@ -347,6 +414,8 @@ API sunucusu ve Vite proxy'si (`PORT`, `CROSS_ORIGIN_ISOLATION`) yalnızca `.env
 | `CROSS_ORIGIN_ISOLATION` | kapalı | `1`: COOP + `COEP: credentialless` → ONNX Runtime çok iş parçacıklı WASM. Vite dev/preview ve üretim sunucusu uygular |
 | `BASE_PATH` | `/` | Derleme alt yolu (GitHub Pages proje sitesi: `/<repo>/`) |
 | `VITE_MODEL_HOST` | `https://huggingface.co/` | Derinlik modeli dosyaları için ayna (derleme zamanı) |
+| `VITE_MODEL_STALL_MS` | `30000` | Derinlik modeli indirmesi bu kadar ms hiç veri göndermezse "yanıt vermiyor" hatasıyla biter (asılı kalmaz); takılan model 5 dk hatırlanır. `0` = kapalı |
+| `VITE_STATIC_DEMO` | boş | `1`: sunucusuz statik derleme (GitHub Pages); `/api/ai/providers` ve `/api/tripo/status` yoklanmaz (konsolda 404 yok) |
 | `VITE_ORT_WASM_PREFIX` | derlemedeki kopya (`/assets`) | ONNX Runtime wasm dosyalarını başka bir dizinden vermek için (ör. `/ort/`) |
 | `VITE_MEDIAPIPE_MODEL_BASE` | `https://storage.googleapis.com/mediapipe-models/` | MediaPipe `.task` modelleri; göreli değer (ör. `mediapipe/`) alt yol altında da çalışır |
 | `VITE_MEDIAPIPE_WASM_BASE` | derlemedeki kopya (`/assets`) | MediaPipe wasm çalışma zamanını başka bir dizinden vermek için |
@@ -376,9 +445,11 @@ olarak ilk kullanımda yüklenir. ORT wasm'ı başka bir dizinden vermek için
 `.github/workflows/deploy-pages.yml` `BASE_PATH=/<repo>/` ile derleyip yayınlar; sunucu yoktur. Tarayıcıda çalışan her şey
 çalışır: tüm ML / sezgisel sürücüler, insan detayı, çok görünümlü füzyon, heykel, derinlik editörü, rig ve animasyon,
 dışa aktarma ve **tarayıcıdan doğrudan çağrılabilen** sağlayıcılar (OpenAI, Gemini, fal.ai; CORS izin veriyorsa OpenAI uyumlu /
-özel HTTP) kullanıcının kendi anahtarıyla. `/api/ai/providers` yoklaması 404 alır → "sunucu yok" kabul edilir; sunucu gerektiren
-kayıtlar (Stability, Replicate, Tripo, yönetilen anahtarlar) ve Tripo sürücüleri iki dilde "sunucu gerekir / ulaşılamıyor"
-açıklamasıyla devre dışı kalır.
+özel HTTP) kullanıcının kendi anahtarıyla. İş akışı `VITE_STATIC_DEMO=1` ile derler: sunucu yoklamaları hiç yapılmaz ("sunucu yok"
+kabul edilir; bayraksız derlemede yoklama 404 alır ve sonuç aynıdır). Sunucu gerektiren kayıtlar (Stability, Replicate, Tripo,
+yönetilen anahtarlar) "sunucu vekili gerekir" uyarısıyla devre dışı kalır; Tripo3D sürücüleri açıklamalarında "çevrimiçi demoda
+çalışmaz" der ve seçilince Tripo3D için fal.ai anahtarıyla **AI sağlayıcı ile 3D** sürücüsünü önerir. Alt yol (`/3dmarker/`)
+altında ML ve geometri worker'ları da `/<repo>/assets/` altından yüklenir.
 
 ### Testler
 
@@ -404,10 +475,19 @@ görünüm için farklı bir karakter silueti çizer), Tripo API'si sahte yanıt
   stil + T-poz + tam gövde istemleri, görünüm üret / yükle / temizle, köşe renkli kapalı füzyon, MediaPipe erişilemezken insan
   detayı, heykel darbeleri + geri al, derinlik editörü, T-poz mankeninde otomatik rig + 3 animasyonun mesh'i deforme etmesi +
   BVH içe aktarma + animasyonlu GLB, 375 px'de tüm adımlar iki dilde.
+- `shell.spec.ts` — düz fonlu opak görselin otomatik maskesi, örneklerin sürücü seçmesi, model indirme hatasında çevrimdışı
+  sürücü düğmesi, 1440 px'de kesilmeyen adım sekmeleri, kamera hazır açıları, 375 px'de sekme kaydırma ipucu / adım altlığı /
+  oluşturma sonrası modele kaydırma / görüntüleyicide `touch-action: pan-y`.
+- `sculpt.spec.ts` — ekstrüde yıldızda alt bölme notu + dört fırçanın etkisi; derinlik editöründe Esc / İptal / × onayı.
+- `human-detail.spec.ts` — MediaPipe indirmesi takılınca 4. adım kartında Türkçe / İngilizce neden, "Yeniden dene"nin yeniden indirmesi.
+- `ml-stall.spec.ts` — Hugging Face hiç yanıt vermezken füzyonun siluetlere düşmesi (ikinci çalıştırma beklemeden) ve Depth
+  Anything'in "yanıt vermiyor" hatası.
+- `offload.spec.ts` — geometri worker'ı: füzyon ve otomatik rig worker'da, füzyon ortasında İptal, kapalı mesh; uzun görev
+  süreleri günlüğe yazılır (makineye bağlı olduğu için doğrulanmaz).
 - `fusion-robust.spec.ts` — elle çizilmiş görünümler (5. örnek): tutarlılık rozetleri ve kesik kenar bayrağı, füzyonun kollarını
   ve gövde oranlarını tutarlı örnekle karşılaştırma (`fusion-robust-arms.png`), Hizala paneli (kaydırıcı → yeniden puanlama, Otomatik
   hizala / Sıfırla, Esc ile odak), güven modları (yalnız renk → rapor çipi; hepsi kapalı → Oluştur engeli), İstemi kopyala (pano +
-  yedek metin kutusu), birleştirme raporu, 375 px'de yatay taşma yok.
+  yedek metin kutusu), birleştirme raporu, T-poz örneklerinde ellerde yan görünüm rengi (mavi) yok, 375 / 414 px'de yatay taşma yok.
 
 Saf mantık tarafında `src/core/fusion/*.test.ts` hizalamayı (ölçek / kayma / kesik senaryoları, sanatçı gürültüsü, ayna, düz siluet),
 korumayı, derinlik kalibrasyonunu ve `reconstruct`'ı prosedürel T-poz fikstürleriyle (`testing.ts`: analitik doğruluk hacmi, kol /
@@ -477,7 +557,8 @@ src/
   sculpt/          heykel oturumu, fırçalar, BVH, geçmiş; derinlik fırçaları ve derinlik çizimi
   rig/             insansı kemikler, otomatik eklemler, iskelet, deri ağırlıkları, animasyon kütüphanesi (animations/),
                    içe aktarma + yeniden hedefleme, oynatıcı, eklem düzenleyici (engine.ts ile tembel yüklenir)
-  workers/         ml.worker.ts (transformers.js boru hatları, WebGPU/WASM seçimi, önbellek, kuyruk)
+  workers/         ml.worker.ts (transformers.js boru hatları, WebGPU/WASM seçimi, önbellek, kuyruk, indirme takılma süresi),
+                   geometry.worker.ts (füzyon + deri ağırlıkları; geometryClient: iptal, çökme, ana iş parçacığına geri düşüş)
   app/             DOM'suz uygulama mantığı: pipeline, store (reducer), steps, viewer (three.js), i18n, örnekler
   ui/              React bileşenleri; ai/ (sağlayıcı iletişim kutusu, stil seçici, hazırlık, görünümler), sculpt/, rig/
 server/            Hono API: Tripo vekili (+ çok görünüm), ai/ (sağlayıcı listesi, AI vekili, çıktı indirme), relay, hız limiti
@@ -490,20 +571,21 @@ tests/e2e/         Playwright uçtan uca testleri (+ png.ts: sahte AI çıktıla
   kapalı bir mesh verir ama arka yüz gerçekte yeniden oluşturulmaz. Tam 3B için görünümleri ekleyip **çok görünümlü füzyon**,
   Tripo3D ya da bir AI image-to-3D modeli kullanın.
 - **Füzyon:** görünümler ortografik kabul edilir (perspektifi hizalama ve tolerans emer); hiçbir görünümün derinliğinin
-  görmediği içbükey oyuklar kurtarılamaz; yalnızca siluetle (derinlik modeli inemezse) T-pozdaki kollar gibi ince parçalar yan
-  görünümlerde gövdeyle örtüştüğü için derinlemesine kalınlaşabilir ve (fotometrik tutarlılık adımı olmadığından) bu hayalet
-  hacme yan görünüm renkleri taşabilir. Derinlik ölçeği yan / üst / alt görünüm varsa siluet gövdesine göre kalibre edilir;
-  profil bilgisi vermeyen bir görünüm oymaz. İş ana iş parçacığında dilimler hâlinde yapılır (~30 ms'de bir yol verir, en uzun
-  duraklama ~70 ms; İptal aşama ortasında etkili olur); ayrı bir Worker'a taşınmadı. Hizalama 144 vokselde ~0.1 s ekler
-  (4 × 1024² görünüm için 60–80 ms).
+  görmediği içbükey oyuklar kurtarılamaz; yalnızca siluetle (derinlik modeli inemezse) gövdenin önündeki ince parçalar yuvarlak
+  kesite kırpılır, gerçekte yassı olan bir parça (ör. geniş kanat) bu yüzden incelebilir. Renk: aynı yüzeyi eşit iyi gören iki
+  görünüm çelişirse dikişte karışım kalır; pozlama eşitlemesi 255'te kırpılmış (aşırı pozlanmış) kanalları kurtaramaz; yalnızca
+  yan görünümün gördüğü küçük bir kol ucunda renk komşulardan yayılabilir. Derinlik ölçeği yan / üst / alt görünüm varsa siluet
+  gövdesine göre kalibre edilir; profil bilgisi vermeyen bir görünüm oymaz. Füzyon Worker'da çalışır; ana iş parçacığında kalanlar:
+  oluşturmadan önceki görsel hazırlığı ve Hizala önizlemesi (~0.1–0.18 s) ile sonda geometrinin görüntüleyiciye aktarılması ve ilk
+  çizim (gölgelendirici derleme; SwiftShader'da 0.1–0.3 s). Renk adımı altı 1024² görünümde ~0.2 s ekler (tüm füzyon ~1.4 s).
 - **Hizalama ve tutarlılık kontrolü:** hizalama, paylaşılan eksenlerdeki 1B siluet profilleriyle çalışır: ölçek, kayma ve kesik
   çerçeveyi düzeltir, **içerik farkını düzeltmez** — A-poz ile T-poz farkı, farklı kıyafet ya da yan görünümde kolun başka
   yükseklikte çizilmesi (yan siluet kol yüksekliğini doğrulayamaz; rozet bunu "Yan görünüm kol yüksekliğini doğrulayamaz" notuyla
   söyler). Böyle durumlarda ince parça koruması kolları tutar, ama yanlış yerde bir kol diski gövdeyi girintileyebilir; çözüm aynı
   poz, "Yalnız renk" ya da elle hizalama. Paylaşılan eksenin iki ucu da kesik ve profil eşleşmesi yoksa görünüm yalnız renk için
-  kullanılır. **Yanlış yuvaya konan içerik** (ör. ön görselin yan yuvaya yüklenmesi) siluet yolunda yakalanmaz ve iyi puan alabilir
-  (derinlik yolunda tutarlılık uyarısı çıkar); düz / ayrıntısız görünümler (küre, tek renk leke) "Hizalanacak ayrıntı yok" notuna
-  rağmen yüksek puan alabilir — puan yalnızca görünümün kenarlarının ön görünümle açıklanabilirliğini ölçer. Ayna algısı (arka
+  kullanılır. Yanlış yuva / kopya / ayrıntısız denetimleri sezgiseldir: sol–sağ ya da üst–alt yuvaların yer değiştirmesi siluetten
+  ayırt edilemez (sol–sağ için yalnızca "ters yön" denetimi vardır); yanlış yuva denetimi yan yuvalarda ön görsel figür gibi
+  görünüyorsa çalışır; iki görünümü karşılaştıran denetimler ön kontrol rozetinde değil yalnızca raporda görünür. Ayna algısı (arka
   görünüm ters yüklenmiş) yalnızca ön siluet belirgin ölçüde asimetrikse çalışır. Kesik kenar tanıma kenara değme sezgisine
   dayanır (kenar satırında ≥ 2 px ve bbox kenarının ≥ %2'si). Ön kontrol rozeti 1. adımdaki önizleme maskesini kullanır; esas
   değerler oluşturmadan sonraki birleştirme raporundadır. Elle hizalama sınırları: kayma ±%20 (çekirdek ±%25), ölçek %70–140
@@ -513,17 +595,26 @@ tests/e2e/         Playwright uçtan uca testleri (+ png.ts: sahte AI çıktıla
   hizalanır ama anatomi/kıyafet tutarsızlıkları mesh'e yansır. Görünümleri elle düzeltmek (yeniden üret / yükle) mümkündür.
 - **İnsan detayı:** İlk kullanımda ~20 MB MediaPipe modeli indirilir (görselde insan olmasa da; parametreden kapatılabilir).
   Çok küçük, bulanık ya da dönük yüzlerde yüz ağı hatalı olabilir; ten rengine yakın arka planlarda kulak kabartması taşabilir.
-  Algılama çağrıları ana iş parçacığını kısa süre (CPU'da ~100–300 ms) bloklar.
-- **Heykel:** oturum kurulumu (kaynak + BVH) büyük mesh'lerde ~0.8 s ana iş parçacığını bloklar. Dokunmatik ekranda ikinci parmak
+  Algılama çağrıları ana iş parçacığını kısa süre (CPU'da ~100–300 ms) bloklar. Yüz / el bölgesi inceltmesi mesh kurulumunu
+  ~0.3–0.45 s'ye çıkarır. Derinlik editöründe (5. adım) uygulanan bir düzenleme bölgeleri taşımaz: o yeniden kurulumda yüz ve
+  eller yine yumuşatılır. 2. adımdaki algılama çipinde "Yeniden dene" yoktur (yalnızca "İnsan olarak ayarla").
+- **Heykel:** oturum kurulumu (kaynak + BVH) büyük mesh'lerde ~0.8 s ana iş parçacığını bloklar; kaba mesh'in alt bölünmesi
+  buna ~0.1 s ekler. Dokunmatik ekranda ikinci parmak
   ilk dokunuştan hemen sonra (300 ms / 12 px içinde) gelirse darbe geri alınır ve iki parmak görünüme (yakınlaştır / döndür)
   verilir; daha sonra gelirse darbe korunur. Düzenle adımından çıkıp dönünce geri al geçmişi korunur. Derinlik modelinde mesh
   seçeneklerini değiştirmek heykel düzenlemelerini siler.
 - **Rig:** vücut noktaları olmadan siluet kuralları T-pozu ve aşağı sarkan / A-pozlu kolları tanır (diğer pozlar kolları aşağı
   sarkan oransal iskelet alır; eklem düzenleyiciyle düzeltilir). Parmak kemikleri yalnızca el noktaları algılanırsa oluşur.
-  Ağırlıklandırma ana iş parçacığında (zaman dilimli; 180k köşede `prepareSkinning` ~230 ms bloklar). Yerdeki kliplerde
-  ayaklar zemine oturtulur (uçma / yüzme hariç); tek seferlik klipler (ör. düşme) "Döngü" açıkken de bir kez oynar.
+  Deri ağırlıkları geometri worker'ında hesaplanır (mesh bir kez hazırlanır, her eklem düzenlemesi orada yeniden ağırlıklanır);
+  ana iş parçacığında kalanlar: animasyon kütüphanesinin zemin geçişi (~0.3 s tek görev) ve iskeletli mesh'in ilk çizimi.
+  İnsana benzemeyen şekiller için rigden önce onay istenmez, uyarı sonradan gösterilir. Yerdeki kliplerde vücut zemine oturtulur
+  (uçma / yüzme hariç); tek seferlik klipler (ör. düşme) "Döngü" açıkken de bir kez oynar.
 - **ML derinliği göreli:** Depth Anything / MiDaS ölçeksiz derinlik verir; metrik ölçü beklemeyin. Modeller ilk kullanımda
   Hugging Face'ten indirilir (~50–490 MB); engelliyse `VITE_MODEL_HOST` ile ayna kullanın, erişilemezse anlaşılır hata gösterilir.
+  Yanıt vermeyen bir indirme `VITE_MODEL_STALL_MS` (30 s) sonra "Model indirmesi yanıt vermiyor…" hatasıyla biter (WebGPU'da
+  takılma WASM'da ikinci kez beklenmez) ve 5 dakika boyunca aynı model beklemeden hata verir.
+- **Çift yüzlü (double) mod:** kenar yüksekliği siluet kenarına doğru sıfıra indirilir ve ön / arka yüz yuvarlak tek bir dikişte
+  buluşur; "Düz (kurabiye)" şişirme profilinde kenar ızgaradan dik olduğu için yüksek duvar kalır.
 - **WebGPU:** yoksa ya da hata verirse WASM'a düşülür (daha yavaş). `CROSS_ORIGIN_ISOLATION=1` WASM'ı çok iş parçacıklı yapar.
 - **AI arka plan kaldırma (yerel):** MODNet portre için eğitilmiştir ve sert maske üretir (kenar yumuşatma yok).
 - **Özel HTTP sağlayıcı:** yalnızca tek eşzamanlı, tarayıcıdan doğrudan istek (kuyruk/sorgulama yok).
@@ -571,6 +662,6 @@ ayarlardan / ortam değişkenlerinden değiştirilebilir:
    Her biri `{ kind: 'model', glb }` sözleşmesiyle bir sürücü olarak eklenir; ilerleme SSE/WebSocket ile.
 4. **Depolama:** Yüklenen görseller ve üretilen GLB'ler için S3/R2 + imzalı URL'ler, saklama süresi politikası, CDN.
 5. **Galeri ve paylaşım:** Kullanıcının model geçmişi, herkese açık paylaşım sayfaları, `<model-viewer>` gömme kodu, AR (USDZ).
-6. **Kalite:** füzyon ve ağırlıklandırmayı Web Worker'a taşıma, retopoloji/decimation, doku pişirme (köşe renginden UV dokuya),
+6. **Kalite:** animasyon kütüphanesi zemin geçişini de worker'a taşıma, retopoloji/decimation, doku pişirme (köşe renginden UV dokuya),
    metrik derinlik modelleri, yüz/el detayının çok görünümlü füzyona da uygulanması.
 7. **Operasyon:** Gözlemlenebilirlik (OpenTelemetry), hata izleme (Sentry), Docker imajı, CI'da `npm run check`.

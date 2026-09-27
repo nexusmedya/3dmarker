@@ -8,7 +8,7 @@ import { StrictMode, act, createElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_VIEW_ALIGN, type ViewAlign } from '../../core/types';
 import type { ViewAlignment } from '../../core/fusion/types';
-import { SHARED_AXES, alignedBox } from '../../core/fusion/align';
+import { ALIGN_TEXT, SHARED_AXES, alignedBox } from '../../core/fusion/align';
 import { ViewsPanel, bboxOfFit, liveAlignment } from './ViewsPanel';
 import type { ViewSlotInfo } from './types';
 import { byTestId, chooseFile, cleanup, click, dropFiles, image, keyDown, mount, queryTestId, typeInto } from './testing';
@@ -238,6 +238,9 @@ describe('ViewsPanel consistency badges', () => {
     expect(liveAlignment(c, { ...DEFAULT_VIEW_ALIGN, mode: 'manual', dy: 0.03, scale: 0.95 })).toEqual({ score: 90, level: 'good' });
     // A check computed under a manual request re-scores against its suggestion once the mode is auto again.
     expect(liveAlignment({ ...c, status: 'manual', score: 10, level: 'poor' }, DEFAULT_VIEW_ALIGN).score).toBe(90);
+    // A slot check (the front uploaded as the left view) holds whatever the placement.
+    const wrong = { ...check('left'), score: 30, level: 'poor' as const, notes: [{ code: 'wrongSlot' as const, text: ALIGN_TEXT.wrongSlot }] };
+    expect(liveAlignment(wrong, { ...DEFAULT_VIEW_ALIGN, mode: 'manual', dy: 0.03, scale: 0.95 })).toEqual({ score: 30, level: 'poor' });
     // The inverse of alignedBox recovers the silhouette bbox.
     const bbox = { x0: 10, y0: 20, x1: 110, y1: 220 };
     for (const id of ['back', 'left', 'top'] as const) {
@@ -370,7 +373,7 @@ describe('ViewsPanel align panel', () => {
     mount(createElement(ViewsPanel, p), 'tr');
     click(byTestId('view-align-back'));
     const panel = byTestId('view-align-panel');
-    expect(panel.textContent).toContain('arka görünümünü hizala');
+    expect(panel.textContent).toContain('Arka görünümü hizala');
     expect(panel.textContent).toContain('Dikey kayma');
     expect(panel.textContent).toContain('Yalnız renk');
     expect(byTestId('align-status').textContent).toBe('88 · iyi · Otomatik hizalandı: %3 aşağı');

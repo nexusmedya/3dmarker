@@ -7,6 +7,7 @@ import {
   createProviderConfig,
   currentAiSettings,
   DEFAULT_AI_SETTINGS,
+  apiServerDisabled,
   fetchServerInfo,
   fetchServerProviders,
   LOCAL_PROVIDER_ID,
@@ -21,7 +22,10 @@ import {
 } from './settings';
 import { fakeNet, json } from './testing';
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
+});
 
 class MemStore implements KeyValueStore {
   map = new Map<string, string>();
@@ -236,6 +240,17 @@ describe('server providers', () => {
     expect(await fetchServerProviders()).toBeNull();
     vi.stubGlobal('fetch', fakeNet().on(null, /./, json({ providers: [] })).fetch);
     expect(await fetchServerProviders()).toEqual([]);
+  });
+
+  it('does not probe at all in the static build (no console 404 on Pages)', async () => {
+    const fetch = vi.fn(async () => json({ providers: [] }));
+    vi.stubGlobal('fetch', fetch);
+    vi.stubEnv('VITE_STATIC_DEMO', '1');
+    expect(await fetchServerInfo()).toBeNull();
+    expect(await fetchServerProviders()).toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(apiServerDisabled({ VITE_STATIC_DEMO: 'true' })).toBe(true);
+    expect(apiServerDisabled({})).toBe(false);
   });
 });
 

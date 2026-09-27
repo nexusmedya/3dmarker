@@ -21,7 +21,7 @@ function view(id: ViewReport['id'], over: Partial<ViewReport> = {}): ViewReport 
     suggested: c,
     cut: { top: false, bottom: false, left: false, right: false },
     consistency: null,
-    notes: [{ code: 'aligned', text: { tr: 'Önle hizalı', en: 'Aligned with the front' } }],
+    notes: [{ code: 'aligned', text: { tr: 'Ön görünümle hizalı', en: 'Aligned with the front' } }],
     ...over,
   };
 }
@@ -63,5 +63,15 @@ describe('FusionReportNote', () => {
     expect(root.textContent).toContain('Birleştirme raporu');
     expect(root.textContent).toContain('uyarı yok');
     expect(byTestId('fusion-view-left').textContent).toMatch(/Sol 40 · yalnız renk/);
+  });
+
+  it('shows views switched off before the run as muted chips', () => {
+    mount(createElement(FusionReportNote, { report, offViews: ['top', 'left'] }), 'tr');
+    const top = byTestId('fusion-view-top');
+    expect(top.dataset.trust).toBe('off');
+    expect(top.textContent).toBe('Üst · kapalı');
+    expect(top.dataset.score).toBeUndefined();
+    // A view the report already lists is not duplicated.
+    expect(document.querySelectorAll('[data-testid="fusion-view-left"]')).toHaveLength(1);
   });
 });

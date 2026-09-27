@@ -32,7 +32,15 @@ export interface MlEnvConfig {
   wasmPrefix?: string;
   /** Cache downloaded weights in the Cache API (default true). */
   useBrowserCache?: boolean;
+  /**
+   * A model/runtime download that receives no bytes (or no response headers)
+   * for this long fails with ModelStalledError (default DEFAULT_STALL_TIMEOUT_MS; 0 = never).
+   */
+  stallTimeoutMs?: number;
 }
+
+/** Same default as the MediaPipe loader (src/core/human/config.ts). */
+export const DEFAULT_STALL_TIMEOUT_MS = 30_000;
 
 interface JobBase {
   id: number;
@@ -114,6 +122,18 @@ export type MlResponse =
  * the job on WASM in a fresh worker.
  */
 export const WEBGPU_FAILED_ERROR = 'WebGpuFailedError';
+
+/**
+ * Error name for a model download that stopped responding (a blackholed host,
+ * a stalled proxy or CDN edge): fetch has no timeout of its own.
+ */
+export const MODEL_STALLED_ERROR = 'ModelStalledError';
+
+export function modelStalledError(url: string, ms: number): Error {
+  const err = new Error(`No data from ${url} for ${Math.round(ms / 1000)} s`);
+  err.name = MODEL_STALLED_ERROR;
+  return err;
+}
 
 export function serializeError(e: unknown): SerializedError {
   if (e instanceof Error) return { name: e.name, message: e.message, stack: e.stack };

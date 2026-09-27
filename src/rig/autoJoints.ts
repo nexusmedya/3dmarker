@@ -48,6 +48,22 @@ export interface AutoJointResult {
   /** Heuristic layout the pose was completed from. */
   heuristic: JointLayout;
   silhouette: Silhouette;
+  /**
+   * 0..1: how much the shape looks like a human figure (head over a neck, a
+   * crotch gap, some depth). Below 0.5 without a detected pose the skeleton
+   * is a guess on a non-human shape (logo, mascot blob) and clips may tear it.
+   */
+  plausibility: number;
+  /** Why the plausibility was lowered. */
+  reasons: PlausibilityIssue[];
+}
+
+export type PlausibilityIssue = 'no-head' | 'no-crotch' | 'flat' | 'no-figure';
+
+/** Structure found by the T-pose reading (plausibility inputs). */
+interface TposeFlags {
+  head: boolean;
+  crotch: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +164,38 @@ export function jointZ(s: Silhouette, x: number, y: number, behind: number, radi
   if (best < 0) return s.box.isEmpty() ? 0 : (s.box.min.z + s.box.max.z) / 2;
   const lo = s.zMin[best], hi = s.zMax[best];
   return hi - lo > behind * 0.5 ? (lo + hi) / 2 : hi - behind;
+}
+
+/**
+ * Keep a (dragged) joint inside the body: outside the front silhouette it
+ * snaps to the nearest occupied cell's centre, and its depth is kept between
+ * that cell's front and back hits (their middle when it left them; behind a
+ * single surface is allowed). Returns `p` itself when it is already inside.
+ */
+export function clampToSilhouette(s: Silhouette, p: Vec3): Vec3 {
+  let i = colOf(s, p.x), j = rowOf(s, p.y);
+  let x = p.x, y = p.y;
+  const inGrid = p.x >= s.x0 && p.x < s.x0 + s.nx * s.cell && p.y >= s.y0 && p.y < s.y0 + s.ny * s.cell;
+  if (!inGrid || !s.occ[j * s.nx + i]) {
+    let best = -1, bestD = Infinity;
+    for (let jj = 0; jj < s.ny; jj++) {
+      const dy = cellY(s, jj) - p.y;
+      if (dy * dy >= bestD) continue;
+      for (let ii = 0; ii < s.nx; ii++) {
+        if (!s.occ[jj * s.nx + ii]) continue;
+        const dx = cellX(s, ii) - p.x, d = dx * dx + dy * dy;
+        if (d < bestD) (bestD = d), (best = jj * s.nx + ii);
+      }
+    }
+    if (best < 0) return p;
+    (i = best % s.nx), (j = Math.floor(best / s.nx));
+    (x = cellX(s, i)), (y = cellY(s, j));
+  }
+  const k = j * s.nx + i, lo = s.zMin[k], hi = s.zMax[k];
+  let z = p.z;
+  if (hi - lo < 2 * s.cell) z = Math.min(z, hi); // a relief: anywhere behind its surface
+  else if (z < lo || z > hi) z = (lo + hi) / 2;
+  return x === p.x && y === p.y && z === p.z ? p : { x, y, z };
 }
 
 interface Run {
@@ -281,7 +329,7 @@ function spineFrom(out: Record<string, XY>): void {
 }
 
 /** T-pose reading of the silhouette, or null when it does not look like one. */
-function tposeLayout(s: Silhouette, f: Frame2D): Record<CoreBone, XY> | null {
+function tposeLayout(s: Silhouette, f: Frame2D, flags: TposeFlags = { head: false, crotch: false }): Record<CoreBone, XY> | null {
   const { H } = f;
   const widths = new Float32Array(s.ny);
   let maxW = 0, maxJ = -1;
@@ -369,6 +417,9 @@ function tposeLayout(s: Silhouette, f: Frame2D): Record<CoreBone, XY> | null {
       if (!r || runWidth(s, r) > neckW * 1.35 + s.cell) break;
       j++;
     }
+    // A head: the neck narrower than the torso, widening again above it (a star's point only narrows).
+    const above = j + 1 < jTop ? runNear(s, j + 1, cx) : null;
+    flags.head = neckW < 1.2 * torsoHalf && !!above && runWidth(s, above) > neckW * 1.35 + s.cell;
     headY = Math.min(Math.max(cellY(s, j), neckBase + 0.03 * H), f.top - 0.08 * H);
   }
   out.Neck = { x: cx, y: neckBase };
@@ -384,6 +435,7 @@ function tposeLayout(s: Silhouette, f: Frame2D): Record<CoreBone, XY> | null {
     const rightOf = runs.some((r) => runCenter(s, r) > cx && cellX(s, r.i0) - cx < 0.2 * H);
     if (leftOf && rightOf) {
       crotchY = cellY(s, j) + s.cell / 2;
+      flags.crotch = true;
       break;
     }
   }
@@ -659,7 +711,8 @@ export function autoPlaceJointsDetailed(root: Object3D, opts: AutoJointOptions =
   const s = buildSilhouette(data, opts.resolution ?? 192);
   const f = occupiedFrame(s) ?? { cx: 0, bottom: -1, top: 1, H: 2, halfW: 1 };
   const down = armsDownLayout(s, f);
-  const t = down ? null : tposeLayout(s, f);
+  const flags: TposeFlags = { head: false, crotch: false };
+  const t = down ? null : tposeLayout(s, f, flags);
   const heurXY = t ?? down ?? proportionalLayout(f);
   const heuristic = toLayout(s, heurXY, f.H);
   fixToes(s, heuristic, f);
@@ -684,7 +737,20 @@ export function autoPlaceJointsDetailed(root: Object3D, opts: AutoJointOptions =
       method = 'pose';
     }
   }
-  return { layout, method, heuristic, silhouette: s };
+  const reasons: PlausibilityIssue[] = [];
+  let plausibility = 1;
+  if (method === 'pose') {
+    // A detected person.
+  } else if (method === 'proportional') {
+    reasons.push('no-figure');
+    plausibility = 0.3;
+  } else if (method === 'silhouette') {
+    if (!flags.head) (reasons.push('no-head'), (plausibility -= 0.4));
+    if (!flags.crotch) (reasons.push('no-crotch'), (plausibility -= 0.25));
+  }
+  // Flat extrusions (logos) rarely are figures; reliefs of people keep a head and legs.
+  if (method !== 'pose' && data.box.max.z - data.box.min.z < 0.07 * f.H) (reasons.push('flat'), (plausibility -= 0.2));
+  return { layout, method, heuristic, silhouette: s, plausibility: Math.max(0, plausibility), reasons };
 }
 
 export function autoPlaceJoints(root: Object3D, opts: AutoJointOptions = {}): JointLayout {

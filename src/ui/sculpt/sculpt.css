@@ -239,9 +239,23 @@
   border-top: 1px solid var(--border);
 }
 
+/* "Discard N edits?" (Esc / X / Cancel with edits). */
+.dme-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.dme-confirm-text { font-weight: 600; color: var(--warn); }
+.dme-discard { color: var(--danger); }
+
 @media (max-width: 760px) {
   .dme-backdrop { padding: 0; }
   .dme { width: 100%; height: 100%; border-radius: 0; }
   .dme-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 42%) minmax(0, 1fr); }
   .dme-side { border-right: 0; border-bottom: 1px solid var(--border); }
 }
+
+/* Brush reached no vertex / mesh too coarse for the brush. */
+.sculpt-warn, .sculpt-warn svg { color: var(--warn); }

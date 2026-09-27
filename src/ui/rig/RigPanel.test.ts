@@ -7,7 +7,7 @@
 import { act, createElement } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { AnimationClip, NumberKeyframeTrack, PerspectiveCamera } from 'three';
+import { AnimationClip, BoxGeometry, NumberKeyframeTrack, PerspectiveCamera, Vector3 } from 'three';
 import type { Mesh, Object3D } from 'three';
 
 const analyzeHuman = vi.hoisted(() => vi.fn());
@@ -18,15 +18,17 @@ import type { ViewerCore } from '../../app/viewer';
 import { asciiFbx, mixamoBones } from '../../rig/fbxFixture';
 import { makeMannequin } from '../../rig/testing';
 import { LangProvider } from '../i18n';
-import { RigPanel } from './RigPanel';
+import { detectForRig, RigPanel } from './RigPanel';
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 function fakeCore() {
   const listeners = new Set<(dt: number) => boolean | void>();
   let object: Object3D | null = null;
+  const canvas = document.createElement('canvas');
+  canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 400, height: 400, right: 400, bottom: 400, x: 0, y: 0, toJSON: () => ({}) });
   const core = {
-    canvas: document.createElement('canvas'),
+    canvas,
     camera: new PerspectiveCamera(),
     setObject: (o: Object3D | null) => (object = o),
     getObject: () => object,
@@ -48,6 +50,19 @@ function fakeCore() {
     },
   };
   return core;
+}
+
+function mount(model: BuiltModel, core: ReturnType<typeof fakeCore>, lang: 'en' | 'tr' = 'en') {
+  const coreRef = { current: core as unknown as ViewerCore };
+  core.setObject(model.object);
+  host = document.createElement('div');
+  document.body.append(host);
+  root = createRoot(host);
+  return act(async () =>
+    root!.render(
+      createElement(LangProvider, { value: lang }, createElement(RigPanel, { coreRef, model, frontImage: image, frontMask: null, enabled: true, onModelChanged: vi.fn(), onActiveChange: vi.fn() })),
+    ),
+  );
 }
 
 const newModel = (): BuiltModel => buildGeometryModel(makeMannequin(1).mesh.geometry, null);
@@ -222,5 +237,134 @@ describe('RigPanel', () => {
     );
     expect(host.textContent).toContain('Önce bir 3B model oluşturun');
     expect(q('rig-auto')).toBe(null);
+  });
+
+  it('a detector that cannot load is reported as such (not "no person detected"), with a retry', async () => {
+    const failed = {
+      width: 8, height: 8, faces: [], hands: [], poses: [], isHuman: false,
+      unavailableReason: 'Could not load the human detection (body) model: Failed to fetch',
+      unavailableText: { tr: 'İnsan algılama (vücut) modeli yüklenemedi: Failed to fetch', en: 'Could not load the human detection (body) model: Failed to fetch' },
+      failed: { pose: 'Failed to fetch', hands: 'Failed to fetch' },
+    };
+    analyzeHuman.mockResolvedValue(failed);
+    const core = fakeCore();
+    // A box: no T-pose, so the proportional fallback (the wording the bug was in).
+    await mount(buildGeometryModel(new BoxGeometry(0.6, 2, 0.4), null), core, 'tr');
+    await click('rig-auto');
+    await waitFor(() => !!q('rig-status'));
+    expect(q('rig-status')!.dataset.method).toBe('proportional');
+    expect(q('rig-status')!.textContent).not.toContain('insan algılanmadı');
+    const warn = q('rig-detect-warning');
+    expect(warn).toBeTruthy();
+    expect(warn!.textContent).toContain('İnsan algılama modeli yüklenemedi');
+    expect(warn!.textContent).toContain('Failed to fetch');
+    expect(q('rig-shape-warning')).toBeTruthy(); // a box is no human figure
+
+    await click('rig-detect-retry');
+    await waitFor(() => analyzeHuman.mock.calls.length === 2 && !(q('rig-detect-retry') as HTMLButtonElement).disabled);
+    expect(q('rig-detect-warning')).toBeTruthy();
+
+    // Detection that ran and found nobody keeps the "no person detected" wording.
+    analyzeHuman.mockResolvedValue({ width: 8, height: 8, faces: [], hands: [], poses: [], isHuman: false });
+    await click('rig-remove');
+    await click('rig-auto');
+    await waitFor(() => !!q('rig-status'));
+    expect(q('rig-status')!.textContent).toContain('insan algılanmadı');
+    expect(q('rig-detect-warning')).toBe(null);
+  }, 30_000);
+
+  it('joint edits can be undone, redone and reset to the automatic layout, keeping imported clips', async () => {
+    analyzeHuman.mockResolvedValue({ width: 8, height: 8, faces: [], hands: [], poses: [], isHuman: false });
+    const core = fakeCore();
+    core.camera.position.set(0, 0, 4);
+    core.camera.updateMatrixWorld(true);
+    const model = newModel();
+    await mount(model, core);
+    await click('rig-auto');
+    await waitFor(() => !!q('rig-status'));
+    const file = new File([asciiFbx(mixamoBones(), { LeftArm: [[0, 0, 0, 0], [1, 0, 0, -90]] })], 'Wave Hello.fbx');
+    const input = q('anim-import') as HTMLInputElement;
+    Object.defineProperty(input, 'files', { value: [file], configurable: true });
+    await act(async () => input.dispatchEvent(new Event('change', { bubbles: true })));
+    await waitFor(() => !!q('anim-import-wave-hello'));
+
+    await click('rig-edit-joints');
+    const elbow = () => {
+      model.object.updateMatrixWorld(true);
+      return model.object.getObjectByName('LeftForeArm')!.getWorldPosition(new Vector3());
+    };
+    const start = elbow();
+    // Select the elbow by clicking its marker.
+    const p = start.clone().project(core.camera);
+    const [x, y] = [((p.x + 1) / 2) * 400, ((1 - p.y) / 2) * 400];
+    for (const type of ['pointerdown', 'pointerup']) {
+      const ev = new MouseEvent(type, { clientX: x, clientY: y, button: 0, bubbles: true });
+      Object.defineProperty(ev, 'pointerId', { value: 1 });
+      await act(async () => core.canvas.dispatchEvent(ev));
+    }
+    expect(q('rig-nudge-y-plus')).toBeTruthy();
+    expect((q('rig-undo') as HTMLButtonElement).disabled).toBe(true);
+    const idle = () => !q('rig-reweight') && !(q('rig-undo') as HTMLButtonElement).disabled;
+    await click('rig-nudge-y-plus');
+    await click('rig-nudge-y-plus');
+    await waitFor(idle);
+    const moved = elbow();
+    expect(moved.y).toBeGreaterThan(start.y + 1e-3);
+
+    await click('rig-undo');
+    await waitFor(() => !q('rig-reweight') && !(q('rig-redo') as HTMLButtonElement).disabled);
+    expect(elbow().distanceTo(start)).toBeLessThan(1e-6);
+    expect((q('rig-undo') as HTMLButtonElement).disabled).toBe(true);
+
+    // Ctrl+Shift+Z redoes.
+    await act(async () => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Z', ctrlKey: true, shiftKey: true })));
+    await waitFor(idle);
+    expect(elbow().distanceTo(moved)).toBeLessThan(1e-6);
+
+    await click('rig-reset-joints');
+    await waitFor(() => !q('rig-reweight'));
+    expect(elbow().distanceTo(start)).toBeLessThan(1e-6);
+    expect(q('anim-import-wave-hello')).toBeTruthy(); // imported clips survive (retargeted)
+  }, 60_000);
+});
+
+describe('detectForRig', () => {
+  afterEach(() => vi.useRealTimers());
+  const hang = (_img: unknown, o: { signal: AbortSignal }) =>
+    new Promise((_r, reject) => o.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError'))));
+
+  it('gives up on a stalled detector after the budget and reports it unavailable', async () => {
+    vi.useFakeTimers();
+    analyzeHuman.mockImplementation(hang);
+    const res = detectForRig(image, new AbortController().signal, undefined, 10_000);
+    await vi.advanceTimersByTimeAsync(9_000);
+    let settled = false;
+    void res.then(() => (settled = true));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_500);
+    const r = await res;
+    expect(r.detection).toBe('unavailable');
+    expect(r.pose).toBe(null);
+    expect(r.detail?.en).toContain('stopped responding');
+  });
+
+  it('progress (a slow but live download) re-arms the budget; cancelling the rig still aborts', async () => {
+    vi.useFakeTimers();
+    let progress: ((p: unknown) => void) | undefined;
+    analyzeHuman.mockImplementation((img: unknown, o: { signal: AbortSignal; onProgress?: (p: unknown) => void }) => {
+      progress = o.onProgress;
+      return hang(img, o);
+    });
+    const ac = new AbortController();
+    const res = detectForRig(image, ac.signal, undefined, 10_000);
+    const outcome = res.then(() => 'resolved', (e: unknown) => (e as Error).name);
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(8_000);
+      progress?.({ label: { tr: '', en: '' }, ratio: i / 3 });
+    }
+    ac.abort();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await outcome).toBe('AbortError');
   });
 });

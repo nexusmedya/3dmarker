@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { ViewId } from '../types';
 import { estimateObjectBox, prepareView } from './frame';
 import { registerViews } from './align';
-import { buildGuard, GUARD_FILL, GuardField, localThickness } from './guard';
+import { buildGuard, GUARD_FILL, GuardField, localThickness, thinPartGate } from './guard';
 import { buildHullPlanesSteps, createGrid } from './volume';
 import { drain } from './steps';
 import { renderCharacterViews, renderViews, sphere } from './testing';
@@ -33,6 +33,62 @@ describe('localThickness', () => {
     const tb = localThickness(bar, w, h);
     for (let y = 20; y < 26; y++) for (let x = 10; x < 54; x++) expect(Math.abs(tb[y * w + x] - 6)).toBeLessThanOrEqual(1);
     expect(tb[0]).toBe(0);
+  });
+});
+
+describe('thin parts for the colouring', () => {
+  it('thinPartGate keeps a limb, drops the corner slivers of a thick silhouette', () => {
+    const w = 64, h = 64;
+    const gateOf = (bin: Uint8Array, thin: number) => {
+      const tau = localThickness(bin, w, h);
+      const gate = new Float32Array(w * h);
+      for (let i = 0; i < w * h; i++) if (bin[i] && tau[i] < thin) gate[i] = 1;
+      return thinPartGate(gate, tau, w, h);
+    };
+    const count = (g: Float32Array) => g.reduce((s, v) => s + (v > 0 ? 1 : 0), 0);
+    // A 40 × 30 block: only its corners are thinner than 12 px, and they are no part.
+    const block = new Uint8Array(w * h);
+    for (let y = 10; y < 40; y++) for (let x = 10; x < 50; x++) block[y * w + x] = 1;
+    expect(count(gateOf(block, 12))).toBe(0);
+    // The block with a 6 px arm: the arm is kept whole.
+    for (let y = 20; y < 26; y++) for (let x = 50; x < 62; x++) block[y * w + x] = 1;
+    expect(count(gateOf(block, 12))).toBeGreaterThanOrEqual(10 * 6); // (the root is covered by the block's discs)
+  });
+
+  it('colorSupport fades a view out beyond the round cross-section only where another part hides the thin one', () => {
+    const grid = createGrid([10, 10, 20], 20, 1);
+    const [nx, ny] = grid.dims;
+    const center = new Float32Array(nx * ny), half = new Float32Array(nx * ny), gate = new Float32Array(nx * ny), radius = new Float32Array(nx * ny);
+    const c = 5 + nx * 6;
+    center[c] = 10;
+    half[c] = 1.8;
+    gate[c] = 1;
+    radius[c] = 2;
+    const rowHidden = new Uint8Array(ny), colHidden = new Uint8Array(nx);
+    rowHidden[6] = 1;
+    const parts = { gate, radius, span: new Float32Array(nx * ny).fill(8), rowHidden, colHidden, hasZY: true, hasXZ: false };
+    const g = new GuardField(grid, center, half, new Float32Array(grid.dims[2]).fill(1), 1, parts);
+    const at = (i: number, j: number, k: number) => [grid.origin[0] + i * grid.spacing, grid.origin[1] + j * grid.spacing, grid.origin[2] + k * grid.spacing];
+    expect(g.colorSupport(at(5, 6, 10), 0)).toBe(1);
+    expect(g.colorSupport(at(5, 6, 12), 0)).toBe(1);
+    expect(g.colorSupport(at(5, 6, 13), 0)).toBeGreaterThan(0);
+    expect(g.colorSupport(at(5, 6, 13), 0)).toBeLessThan(1);
+    expect(g.colorSupport(at(5, 6, 14), 0)).toBe(0);
+    expect(g.colorSupport(at(7, 6, 16), 0)).toBe(0); // a rim vertex two columns off
+    expect(g.colorSupport(at(9, 6, 16), 0)).toBe(1);
+    expect(g.colorSupport(at(5, 6, 16), 1)).toBe(1); // nothing hides the part from the top
+    expect(g.gateAt(at(7, 7, 0))).toBe(1);
+    expect(g.gateAt(at(8, 6, 0))).toBe(0);
+    // Without thin-part info (a guard built by hand): no restriction.
+    expect(new GuardField(grid, center, half, new Float32Array(grid.dims[2]), 1).colorSupport(at(5, 6, 18), 0)).toBe(1);
+    // capHidden: the hidden column is cut to 1.25 × radius (+ half a voxel) around its centre.
+    const field = new Float32Array(nx * ny * grid.dims[2]).fill(1);
+    expect(g.capHidden(field)).toBeGreaterThan(0);
+    const v = (k: number) => field[c + nx * ny * k];
+    expect(v(10)).toBe(1);
+    expect(v(12)).toBe(1); // 2.5 − 2 + 0.5
+    expect(v(13)).toBe(0);
+    expect(field[c + 1 + nx * ny * 14]).toBe(1); // not a part
   });
 });
 

@@ -416,6 +416,24 @@ describe('tripoDriver.isAvailable', () => {
     stubServer({ status: new Response('<html>', { status: 502 }) });
     const a = await tripoDriver.isAvailable!();
     expect(a).toEqual({ ok: false, reason: expect.objectContaining({ en: expect.stringMatching(/API server/) }) });
+    // Static demo: say it is a demo limitation and point to the fal.ai route instead of sounding like a network blip.
+    expect(a.reason?.en).toMatch(/online demo runs without one/);
+    expect(a.reason?.en).toMatch(/AI provider.*fal\.ai/);
+    expect(a.reason?.tr).toMatch(/çevrimiçi demo sunucusuz/);
+    expect(a.reason?.tr).toMatch(/Yapay zekâ sağlayıcısı.*fal\.ai/);
+  });
+
+  it('does not probe the status route at all in the static build', async () => {
+    const { calls } = stubServer();
+    vi.stubEnv('VITE_STATIC_DEMO', '1');
+    try {
+      const a = await tripoDriver.isAvailable!();
+      expect(a.ok).toBe(false);
+      expect(a.reason?.en).toMatch(/online demo runs without one/);
+      expect(calls).toEqual([]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
 

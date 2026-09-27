@@ -341,10 +341,21 @@ export interface AiServerInfo {
 }
 
 /**
+ * True for the static build (VITE_STATIC_DEMO=1, e.g. GitHub Pages): there is
+ * no API server, so probing it would only log a 404 in every visitor's console.
+ */
+export function apiServerDisabled(env: Record<string, unknown> = import.meta.env ?? {}): boolean {
+  const v = String(env.VITE_STATIC_DEMO ?? '').trim().toLowerCase();
+  return v === '1' || v === 'true';
+}
+
+/**
  * GET /api/ai/providers → the server's AI info, or null when there is no
  * server (static hosting: network error, 404 page, HTML fallback).
  */
 export async function fetchServerInfo(signal?: AbortSignal): Promise<AiServerInfo | null> {
+  // Browsers log failed responses whatever JS does with them: don't send it at all.
+  if (apiServerDisabled()) return null;
   try {
     const timeout = typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(8000) : undefined;
     const sig = signal && timeout && typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, timeout]) : signal ?? timeout;

@@ -14,14 +14,16 @@ import { generateBlock, hasUnsavedModelEdits, meshModeLabel, presentViews } from
 import { getDriver } from '../drivers';
 import { VIEW_LABELS } from '../ai/views';
 import { providerUsable, supports } from '../ai/settings';
-import type { Studio } from './useStudio';
+import { OFFLINE_DRIVER_ID, type Studio } from './useStudio';
 import { useI18n } from './i18n';
 import { UploadCard } from './UploadCard';
 import { DriverPicker } from './DriverPicker';
 import { ParamForm } from './ParamForm';
 import { GeneratePanel } from './GeneratePanel';
 import { StepFooter, StepHeading, StepNav, StepPanel } from './StepNav';
-import { DepthEditCard, HumanDetailNote, OriginalNote } from './StepCards';
+import { DepthEditCard, OriginalNote, RevertedNote } from './StepCards';
+import { HumanDetailNote } from './HumanDetailNote';
+import { forgetHumanLoadFailures } from '../core/human/analyze';
 import { IconCube, IconInfo, IconLayers, IconSparkles, IconUndo } from './icons';
 import { AiPrepPanel } from './ai/AiPrepPanel';
 import { ViewsPanel } from './ai/ViewsPanel';
@@ -130,6 +132,7 @@ export function ControlPanel({ studio }: Props) {
 
   // ---- Extra views the selected driver would ignore ----
   const fusion = getDriver(FUSION_ID);
+  const offlineDriver = getDriver(OFFLINE_DRIVER_ID);
   const unusedViews = viewCount > 0 && !driver.views && !!fusion;
   const useFusion = () => actions.selectDriver(FUSION_ID);
   const unusedViewsNote = (testId: string) => (
@@ -198,7 +201,16 @@ export function ControlPanel({ studio }: Props) {
     );
   }
 
-  const revertNote = state.original ? <OriginalNote onRevert={actions.revertOriginal} disabled={busy || !!aiBusy} /> : null;
+  const aiViewCount = Object.values(state.views).filter((v) => v?.origin === 'ai').length;
+  const revertNote = state.original ? (
+    <OriginalNote onRevert={actions.revertOriginal} disabled={busy || !!aiBusy} aiViewCount={aiViewCount} />
+  ) : state.revertedAi && state.revertedAi.original === state.source ? (
+    <RevertedNote
+      onRestore={actions.restorePrepared}
+      disabled={busy || !!aiBusy}
+      aiViewCount={Object.keys(state.revertedAi.aiViews).length}
+    />
+  ) : null;
   const mounted = (id: StepId) => id === step || visited.has(id);
 
   return (
@@ -266,7 +278,7 @@ export function ControlPanel({ studio }: Props) {
             onRun={() => void actions.runPrep()}
             onCancel={actions.cancelAi}
             prepared={state.prepared}
-            aiViewCount={Object.values(state.views).filter((v) => v?.origin === 'ai').length}
+            aiViewCount={aiViewCount}
             original={state.source?.image ?? null}
             onAccept={actions.acceptPrepared}
             onDiscard={actions.discardPrepared}
@@ -316,7 +328,16 @@ export function ControlPanel({ studio }: Props) {
           {unusedViews && unusedViewsNote('views-unused')}
 
           {driver.badges.includes('human-detail') && (
-            <HumanDetailNote human={human} enabled={params.humanDetail !== false} onDetect={actions.detectHuman} disabled={!state.source || busy} />
+            <HumanDetailNote
+              human={human}
+              enabled={params.humanDetail !== false}
+              onDetect={actions.detectHuman}
+              onRetry={() => {
+                forgetHumanLoadFailures(); // an explicit retry downloads again at once
+                actions.detectHuman();
+              }}
+              disabled={!state.source || busy}
+            />
           )}
 
           {driver.params.length > 0 && (
@@ -351,7 +372,7 @@ export function ControlPanel({ studio }: Props) {
               note={meshNote}
             />
           )}
-          {state.result?.fusion && <FusionReportNote report={state.result.fusion} />}
+          {state.result?.fusion && <FusionReportNote report={state.result.fusion} offViews={state.result.fusionOff} />}
           <StepFooter id="3d" onStep={actions.setStep} />
         </StepPanel>
 
@@ -432,6 +453,11 @@ export function ControlPanel({ studio }: Props) {
         confirming={state.regenConfirm}
         onConfirm={actions.confirmRegenerate}
         onCancelConfirm={actions.cancelRegenerate}
+        errorAction={
+          state.status === 'error' && state.errorOffline && offlineDriver
+            ? { label: t('tryOfflineDriver', { driver: tx(offlineDriver.name) }), onClick: actions.generateOffline }
+            : null
+        }
         summary={
           step !== '3d' ? (
             <>

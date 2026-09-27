@@ -163,6 +163,8 @@ describe('tripoMultiviewDriver', () => {
     const a = await tripoMultiviewDriver.isAvailable!();
     expect(a.ok).toBe(false);
     expect(a.reason?.en).toMatch(/API server/);
+    expect(a.reason?.en).toMatch(/online demo runs without one.*fal\.ai/);
+    expect(tripoMultiviewDriver.description.en).toMatch(/not available on the online demo/);
   });
 });
 

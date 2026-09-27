@@ -151,7 +151,8 @@ export type AlignStatus = 'bbox' | 'aligned' | 'plain' | 'weak' | 'stretched' | 
 export type AlignLevel = 'good' | 'fair' | 'poor';
 export type AlignNoteCode =
   | 'aligned' | 'autoAligned' | 'cropped' | 'stretched' | 'weak' | 'plain' | 'aspect'
-  | 'sideBlind' | 'noMask' | 'mirrored' | 'colorOnly' | 'off' | 'inconsistent';
+  | 'sideBlind' | 'noMask' | 'mirrored' | 'colorOnly' | 'off' | 'inconsistent'
+  | 'wrongSlot' | 'facing' | 'duplicate' | 'poor' | 'sameImage' | 'extent' | 'featureless';
 export interface AlignNote { code: AlignNoteCode; text: I18nText; }
 export interface CutFlags { top: boolean; bottom: boolean; left: boolean; right: boolean; }
 /** Correction of the bbox fit (units as ViewAlign). */

@@ -1,4 +1,5 @@
 /** Compact SaaS landing below the studio: hero + capabilities, the six steps, driver table (from DRIVERS), pricing, FAQ. */
+import { memo } from 'react';
 import { DRIVERS } from '../drivers';
 import { CATEGORY_SHORT, bestFor, groupDrivers, outputKind } from '../app/driverMeta';
 import { FAQ, HERO, HIGHLIGHTS, PLANS, SECTION_TITLES, STEPS } from '../app/content';
@@ -13,7 +14,8 @@ interface Props {
   onTryDriver: (id: string) => void;
 }
 
-export function Landing({ onTryDriver }: Props) {
+/** Memoised: the page below the studio has no live state (only the language, through context). */
+export const Landing = memo(function Landing({ onTryDriver }: Props) {
   const { t, tx } = useI18n();
   const drivers = groupDrivers(DRIVERS).flatMap((g) => g.drivers);
   return (
@@ -172,4 +174,4 @@ export function Landing({ onTryDriver }: Props) {
       </footer>
     </div>
   );
-}
+});

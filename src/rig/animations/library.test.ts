@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { AnimationMixer, Vector3 } from 'three';
-import type { AnimationClip } from 'three';
+import type { AnimationClip, SkinnedMesh } from 'three';
+import { buildGeometryModel } from '../../app/pipeline';
+import { rigModel } from '../rig';
 import { autoPlaceJoints } from '../autoJoints';
 import { isHumanoidBone } from '../bones';
 import { buildSkeleton, describeRig, type RigSkeleton } from '../skeleton';
@@ -233,4 +235,60 @@ describe('DSL helpers', () => {
     expect(spin(0.125)).toBeCloseTo(45, 0);
     expect(spin(0.01)).toBeGreaterThan(0);
   });
+});
+
+describe('grounding on the bound surface (skinned mannequin)', () => {
+  it('no grounded clip pushes the skinned surface through the floor, each touches it, and fall-die ends lying on its back', async () => {
+    const model = buildGeometryModel(makeMannequin(1).mesh.geometry, null);
+    const handle = await rigModel(null, model);
+    expect(handle.descriptor.contact?.positions.length).toBeGreaterThan(0);
+    const lib = buildLibrary(handle.descriptor);
+    const mesh = handle.meshes[0] as SkinnedMesh;
+    const count = mesh.geometry.getAttribute('position').count;
+    const p = new Vector3();
+    const lowestNow = (filter?: (i: number) => boolean) => {
+      model.object.updateMatrixWorld(true);
+      let min = Infinity;
+      for (let i = 0; i < count; i++) if (!filter || filter(i)) min = Math.min(min, mesh.getVertexPosition(i, p).applyMatrix4(mesh.matrixWorld).y);
+      return min;
+    };
+    handle.restPose();
+    const ground = lowestNow();
+    const H = handle.layout.HeadTop_End!.y - ground;
+    const failures: string[] = [];
+    for (const def of CLIP_DEFS) {
+      if (def.grounded === false) continue;
+      const clip = lib.find((c) => c.info.id === def.id)!.clip;
+      const mixer = new AnimationMixer(model.object);
+      mixer.clipAction(clip).play();
+      let lowest = Infinity;
+      for (let k = 0; k <= 24; k++) {
+        mixer.setTime((k / 24) * clip.duration * 0.9999);
+        lowest = Math.min(lowest, lowestNow() - ground);
+      }
+      mixer.stopAllAction();
+      mixer.uncacheRoot(model.object);
+      if (lowest / H < -0.005) failures.push(`${def.id} sinks ${(lowest / H).toFixed(4)}`);
+      if (lowest / H > 0.01) failures.push(`${def.id} floats ${(lowest / H).toFixed(4)}`);
+    }
+    expect(failures).toEqual([]);
+
+    // The end of fall-die: lying, the back / head (not the heels) carry the body.
+    handle.restPose();
+    const die = lib.find((c) => c.info.id === 'fall-die')!.clip;
+    const mixer = new AnimationMixer(model.object);
+    mixer.clipAction(die).play();
+    mixer.setTime(die.duration * 0.9999);
+    const names = handle.descriptor.bones;
+    const si = mesh.geometry.getAttribute('skinIndex'), sw = mesh.geometry.getAttribute('skinWeight');
+    const torso = new Set(['Spine', 'Spine1', 'Spine2', 'Neck', 'Head'].map((b) => names.indexOf(b as HumanoidBone)));
+    const upper = (i: number) => {
+      let best = 0;
+      for (let s = 1; s < 4; s++) if (sw.getComponent(i, s) > sw.getComponent(i, best)) best = s;
+      return torso.has(si.getComponent(i, best));
+    };
+    const back = lowestNow(upper) - ground;
+    expect(back / H).toBeGreaterThan(-0.005);
+    expect(back / H).toBeLessThan(0.03);
+  }, 60_000);
 });

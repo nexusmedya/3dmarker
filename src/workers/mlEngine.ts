@@ -3,7 +3,7 @@
  * selection with fallbacks, and a serial job queue. transformers.js is
  * injected (see ml.worker.ts) so this logic is unit-testable in Node.
  */
-import { WEBGPU_FAILED_ERROR, type MlDevice, type MlDevicePref, type MlPrecision, type MlProgress, type MlTask } from './mlProtocol';
+import { MODEL_STALLED_ERROR, WEBGPU_FAILED_ERROR, type MlDevice, type MlDevicePref, type MlPrecision, type MlProgress, type MlTask } from './mlProtocol';
 import { DownloadProgressTracker, type LoadProgressEvent } from '../drivers/ml/postprocess';
 
 export interface GpuInfo {
@@ -138,7 +138,8 @@ export class MlEngine<P> {
         if (webgpuFailed) this.webgpuBroken.add(spec.model);
         return { result, device, dtype };
       } catch (e) {
-        if (device === 'wasm') throw e;
+        // A stalled download is the network's fault, and WASM would wait just as long.
+        if (device === 'wasm' || (e instanceof Error && e.name === MODEL_STALLED_ERROR)) throw e;
         await this.drop(`${spec.task}|${spec.model}|webgpu|`);
         const beforeOrt = isMissingWeightsError(e) || isUnsupportedDtypeError(e);
         console.warn(`[ml] WebGPU failed for ${spec.model}, retrying on WASM${beforeOrt ? '' : ' in a fresh worker'}:`, e);
@@ -171,7 +172,8 @@ export class MlEngine<P> {
         return { pipe: hit, dtype };
       }
       await this.evict(this.maxCached() - 1);
-      emit({ stage: 'load', device });
+      // 'download' at once: transformers.js reports nothing while config.json is pending.
+      emit({ stage: 'download', device });
       const tracker = new DownloadProgressTracker();
       try {
         const pipe = await this.deps.load({

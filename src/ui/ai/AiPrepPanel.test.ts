@@ -1,14 +1,17 @@
 // @vitest-environment jsdom
 /** AiPrepPanel: empty states, disabled states (source / provider / options / humanoid-only toggles), detection chip, run / cancel, result accept / discard. */
 import { createElement } from 'react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { DEFAULT_PREP_OPTIONS, type PrepOptions } from '../../ai/types';
 import { createProviderConfig } from '../../ai/settings';
 import type { HumanAnalysis } from '../../core/human/types';
 import { AiPrepPanel } from './AiPrepPanel';
 import { byTestId, cleanup, click, image, mount, queryTestId, selectValue, typeInto } from './testing';
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 type Props = Parameters<typeof AiPrepPanel>[0];
 
@@ -185,5 +188,45 @@ describe('AiPrepPanel', () => {
     mount(createElement(AiPrepPanel, props({ prepared, original: image(4, 6), aiViewCount: 3 })));
     expect(byTestId('ai-prep-views-dropped').textContent).toContain('previous image (3) are removed');
     expect(byTestId('ai-prep-result').textContent).not.toContain('the other views are made from this image');
+  });
+
+  it('scrolls a new error / result into view and focuses the error', () => {
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => (cb(0), 1));
+    vi.stubGlobal('cancelAnimationFrame', () => {});
+    const scrolled: string[] = [];
+    // jsdom has no scrollIntoView (the panel calls it optionally).
+    Object.defineProperty(Element.prototype, 'scrollIntoView', {
+      configurable: true,
+      value(this: HTMLElement) {
+        scrolled.push(this.dataset.testid ?? '');
+      },
+    });
+    onTestFinished(() => void delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView);
+    const m = mount(createElement(AiPrepPanel, props()));
+    expect(scrolled).toEqual([]);
+    const error = { tr: 'X reddetti.\nSağlayıcı yanıtı: nope.', en: 'X refused.\nProvider response: nope.' };
+    m.render(createElement(AiPrepPanel, props({ error, status: 'error' })));
+    expect(scrolled).toEqual(['ai-prep-error']);
+    expect(document.activeElement).toBe(byTestId('ai-prep-error'));
+    m.render(createElement(AiPrepPanel, props({ error, status: 'error' }))); // same error: no re-scroll
+    expect(scrolled).toEqual(['ai-prep-error']);
+    m.render(createElement(AiPrepPanel, props({ prepared: { image: image(8, 8), name: 'a.png' }, original: image(4, 6) })));
+    expect(scrolled).toEqual(['ai-prep-error', 'ai-prep-result']);
+  });
+
+  it('tells the user what to do when auto-detect cannot find a person', () => {
+    const unavailable: HumanAnalysis = { ...humanAnalysis, faces: [], hands: [], poses: [], isHuman: false, unavailableText: { tr: 'bağlantı kurulamadı', en: 'could not connect' } };
+    const p = props({ human: unavailable });
+    const m = mount(createElement(AiPrepPanel, p), 'tr');
+    expect(tpose().disabled).toBe(true);
+    expect(document.body.textContent).toContain('Otomatik algılama kullanılamıyor: T-poz için');
+    expect(document.body.textContent).not.toContain('bekleyin');
+    click(byTestId('ai-prep-set-human'));
+    expect(p.onPrep).toHaveBeenLastCalledWith({ subject: 'human' });
+    m.render(createElement(AiPrepPanel, props({ human: { ...unavailable, unavailableText: undefined } })));
+    expect(document.body.textContent).toContain('Otomatik algılama bir kişi bulamadı');
+    expect(queryTestId('ai-prep-set-human')).toBeNull();
+    m.render(createElement(AiPrepPanel, props({ human: unavailable }, { subject: 'object' })));
+    expect(queryTestId('ai-prep-set-human')).toBeNull(); // an explicit subject is the user's choice
   });
 });

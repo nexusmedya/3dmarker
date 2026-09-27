@@ -99,7 +99,9 @@ describe('depth driver run()', () => {
     const labels = inp.progress.map((p) => p.label.en);
     expect(labels[0]).toBe('Preparing image…');
     expect(labels).toContain('Estimating depth (WebGPU)…');
-    expect(labels.at(-1)).toBe('Post-processing…');
+    expect(labels).toContain('Post-processing…');
+    // No MediaPipe in Node: human detection is unavailable, which the last label says.
+    expect(labels.at(-1)).toMatch(/^Human detail unavailable, continuing without face \/ hand relief: /);
   });
 
   it('honours detail, precision and device params', async () => {

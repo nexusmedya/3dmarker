@@ -121,7 +121,59 @@ describe('DepthMapEditor', () => {
     expect((q('[data-testid="depth-undo"]') as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it('Escape and Cancel close without applying', () => {
+  it('asks before Esc / X / Cancel throw edits away; a second Esc keeps editing', () => {
+    const { onApply, onClose } = mount();
+    const stage = q('[data-testid="depth-stage"]')!;
+    stage.getBoundingClientRect = () => ({ left: 0, top: 0, width: 500, height: 400, right: 500, bottom: 400, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect;
+    const fire = (type: string, x: number, y: number) =>
+      stage.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, pointerId: 1, isPrimary: true, button: 0, clientX: x, clientY: y }));
+    act(() => {
+      fire('pointerdown', 20, 20);
+      fire('pointermove', 30, 20);
+      fire('pointerup', 30, 20);
+    });
+    expect(q('[data-testid="depth-edits"]')!.dataset.edits).toBe('1');
+    const esc = () =>
+      act(() => {
+        (document.activeElement ?? q('[data-testid="depth-editor"]'))!.dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
+        );
+      });
+
+    esc();
+    expect(onClose).not.toHaveBeenCalled();
+    const box = q('[data-testid="depth-discard-confirm"]')!;
+    expect(box.getAttribute('role')).toBe('alertdialog');
+    expect(box.textContent).toContain('Discard 1 edits?');
+    expect(document.activeElement).toBe(q('[data-testid="depth-keep"]'));
+    expect(q('[data-testid="depth-apply"]')).toBeNull();
+    // Shortcuts and painting are off while asking.
+    act(() => {
+      q('[data-testid="depth-editor"]')!.dispatchEvent(new KeyboardEvent('keydown', { key: '3', bubbles: true, cancelable: true }));
+      fire('pointerdown', 40, 30);
+      fire('pointerup', 40, 30);
+    });
+    expect(q('[data-testid="depth-brush-smooth"]')!.getAttribute('aria-pressed')).toBe('false');
+    expect(q('[data-testid="depth-edits"]')!.dataset.edits).toBe('1');
+
+    esc(); // keep editing
+    expect(q('[data-testid="depth-discard-confirm"]')).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(q('[data-testid="depth-edits"]')!.dataset.edits).toBe('1');
+    expect(document.activeElement).toBe(q('[data-testid="depth-editor"]'));
+
+    act(() => (q('[data-testid="depth-cancel"]') as HTMLButtonElement).click());
+    act(() => (q('[data-testid="depth-keep"]') as HTMLButtonElement).click());
+    expect(q('[data-testid="depth-discard-confirm"]')).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+
+    act(() => (q('[data-testid="depth-close"]') as HTMLButtonElement).click());
+    act(() => (q('[data-testid="depth-discard"]') as HTMLButtonElement).click());
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onApply).not.toHaveBeenCalled();
+  });
+
+  it('Escape and Cancel close at once (without applying) when nothing was edited', () => {
     const { onApply, onClose } = mount();
     act(() => {
       q('[data-testid="depth-editor"]')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));

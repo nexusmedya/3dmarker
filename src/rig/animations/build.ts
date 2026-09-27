@@ -11,8 +11,11 @@
  * bind by name from the model root, so one clip drives every skinned mesh.
  *
  * Grounded clips (the default; not fly / swim) get a floor pass: per frame,
- * forward kinematics of the rig's own legs (Hips rotation included) gives the
- * Hips height at which the lowest foot / toe joint sits at its rest height;
+ * forward kinematics of the rig (Hips rotation included) gives the Hips
+ * height at which the pose just touches the rest ground: the bound surface
+ * (the descriptor's skinned contact sample: soles, toes, the back when lying)
+ * or, for a bare layout, the foot / toe joints plus the torso, head, knees,
+ * elbows and hands lifted by their approximate thickness;
  * the authored Hips height is raised to at least that (no sinking between
  * keys or through pitched hips), and a clip that never touches the floor
  * (e.g. a run whose authored bounce is too high) is lowered as a whole until
@@ -20,7 +23,7 @@
  */
 import { AnimationClip, Euler, Quaternion, QuaternionKeyframeTrack, Vector3, VectorKeyframeTrack } from 'three';
 import type { KeyframeTrack } from 'three';
-import { END_BONES, parentOf, SIDES } from '../bones';
+import { END_BONES, parentOf } from '../bones';
 import { computeAlignment, makeContinuous, solveFrame } from '../retarget';
 import type { RigDescriptor } from '../skeleton';
 import type { AnimationInfo, HumanoidBone, RigClip } from '../types';
@@ -81,8 +84,9 @@ export function buildClip(def: ClipDef, rig: RigDescriptor, align = canonicalAli
   const euler = new Euler(), q = new Quaternion();
   const rest = rig.layout.Hips!;
   const grounded = def.grounded !== false;
-  /** Per frame: the Hips height that puts the lowest foot joint exactly at its rest height. */
+  /** Per frame: the Hips height at which the pose just touches the rest ground. */
   const floorY = new Float64Array(frames);
+  const ground = grounded ? restGround(rig) : 0;
   for (let f = 0; f < frames; f++) {
     const u = f / (frames - 1);
     times[f] = u * def.duration;
@@ -103,7 +107,7 @@ export function buildClip(def: ClipDef, rig: RigDescriptor, align = canonicalAli
     hipsPos[f * 3] = rest.x + h[0] * rig.hipHeight;
     hipsPos[f * 3 + 1] = rest.y + h[1] * rig.hipHeight;
     hipsPos[f * 3 + 2] = rest.z + h[2] * rig.hipHeight;
-    if (grounded) floorY[f] = floorHipsY(rig, local);
+    if (grounded) floorY[f] = floorHipsY(rig, local, ground);
   }
   if (grounded) {
     let clearance = Infinity;
@@ -128,33 +132,90 @@ export function buildClip(def: ClipDef, rig: RigDescriptor, align = canonicalAli
   return { clip, info };
 }
 
-const FOOT_CHAINS = SIDES.map((s) => [`${s}UpLeg`, `${s}Leg`, `${s}Foot`, `${s}ToeBase`] as const);
+/**
+ * Contact points without a bound surface: joint → how far the body reaches
+ * below it (× hipHeight). Feet / toes stay at their own rest height; the
+ * torso, head, knees, elbows and hands keep their thickness off the floor
+ * (lying, kneeling, crawling).
+ */
+const JOINT_RADII: Partial<Record<HumanoidBone, number>> = {
+  Hips: 0.1, Spine: 0.1, Spine1: 0.1, Spine2: 0.1, Neck: 0.06, Head: 0.1, HeadTop_End: 0.06,
+  LeftLeg: 0.05, RightLeg: 0.05, LeftForeArm: 0.04, RightForeArm: 0.04, LeftHand: 0.03, RightHand: 0.03,
+};
+
+/** Rest ground of a rig: its lowest surface point (the sample), else the lowest foot / toe joint. */
+function restGround(rig: RigDescriptor): number {
+  const c = rig.contact;
+  if (c && c.positions.length) {
+    let min = Infinity;
+    for (let i = 1; i < c.positions.length; i += 3) min = Math.min(min, c.positions[i]);
+    return min;
+  }
+  const L = rig.layout;
+  return Math.min(...(['LeftFoot', 'RightFoot', 'LeftToeBase', 'RightToeBase'] as const).map((b) => L[b]?.y ?? Infinity));
+}
 
 /**
- * Hips Y (rig frame) at which the lowest of the foot / toe joints, posed by
- * the local rotations `local`, is exactly at its rest height.
+ * Hips Y (rig frame) at which the pose given by the local rotations `local`
+ * just touches the rest ground: the skinned contact sample when the rig has
+ * one (linear blend skinning of the sampled vertices), else the contact
+ * joints lifted by their radius.
  */
-function floorHipsY(rig: RigDescriptor, local: Map<HumanoidBone, Quaternion>): number {
+function floorHipsY(rig: RigDescriptor, local: Map<HumanoidBone, Quaternion>, ground: number): number {
   const L = rig.layout;
   const hips = L.Hips!;
-  const hipsQ = local.get('Hips') ?? new Quaternion();
-  let need = -Infinity;
-  const w = new Quaternion(), off = new Vector3(), pos = new Vector3();
-  for (const chain of FOOT_CHAINS) {
-    // Joint positions relative to the Hips joint; the chain hangs off Hips directly.
-    w.copy(hipsQ);
-    pos.set(0, 0, 0);
-    let prev: HumanoidBone = 'Hips';
-    for (const b of chain) {
-      const p = L[b], pp = L[prev];
-      if (!p || !pp || parentOf(b) !== prev) break;
-      pos.add(off.set(p.x - pp.x, p.y - pp.y, p.z - pp.z).applyQuaternion(w));
-      if (b.endsWith('Foot') || b.endsWith('ToeBase')) need = Math.max(need, p.y - pos.y);
-      w.multiply(local.get(b) ?? IDENTITY);
-      prev = b;
+  // Forward kinematics relative to the Hips joint (bones are parents first).
+  const rot = new Map<HumanoidBone, Quaternion>(), pos = new Map<HumanoidBone, Vector3>();
+  for (const b of rig.bones) {
+    const parent = parentOf(b);
+    const p = L[b]!;
+    if (!parent || !rot.has(parent)) {
+      rot.set(b, (local.get(b) ?? IDENTITY).clone());
+      pos.set(b, new Vector3(p.x - hips.x, p.y - hips.y, p.z - hips.z));
+      continue;
+    }
+    const pp = L[parent]!, pq = rot.get(parent)!;
+    pos.set(b, new Vector3(p.x - pp.x, p.y - pp.y, p.z - pp.z).applyQuaternion(pq).add(pos.get(parent)!));
+    rot.set(b, pq.clone().multiply(local.get(b) ?? IDENTITY));
+  }
+  let lowest = Infinity;
+  const c = rig.contact;
+  if (c && c.positions.length) {
+    // Only the y row of each bone's rotation matrix is needed: y' = Σ w (R (v − L) + P).y.
+    const n = rig.bones.length;
+    const ry = new Float64Array(n * 4);
+    rig.bones.forEach((b, i) => {
+      const q = rot.get(b)!, l = L[b]!;
+      const { x, y, z, w } = q;
+      const r0 = 2 * (x * y + w * z), r1 = 1 - 2 * (x * x + z * z), r2 = 2 * (y * z - w * x);
+      ry[i * 4] = r0;
+      ry[i * 4 + 1] = r1;
+      ry[i * 4 + 2] = r2;
+      ry[i * 4 + 3] = pos.get(b)!.y - (r0 * l.x + r1 * l.y + r2 * l.z);
+    });
+    const P = c.positions, I = c.skinIndex, W = c.skinWeight;
+    for (let v = 0, m = P.length / 3; v < m; v++) {
+      const x = P[v * 3], y = P[v * 3 + 1], z = P[v * 3 + 2];
+      let out = 0;
+      for (let s = 0; s < 4; s++) {
+        const w = W[v * 4 + s];
+        if (!w) continue;
+        const k = I[v * 4 + s] * 4;
+        out += w * (ry[k] * x + ry[k + 1] * y + ry[k + 2] * z + ry[k + 3]);
+      }
+      if (out < lowest) lowest = out;
+    }
+  } else {
+    for (const [b, r] of Object.entries(JOINT_RADII) as [HumanoidBone, number][]) {
+      const p = pos.get(b);
+      if (p) lowest = Math.min(lowest, p.y - r * rig.hipHeight);
+    }
+    for (const b of ['LeftFoot', 'RightFoot', 'LeftToeBase', 'RightToeBase'] as const) {
+      const p = pos.get(b);
+      if (p) lowest = Math.min(lowest, p.y - (L[b]!.y - ground));
     }
   }
-  return Number.isFinite(need) ? need : hips.y;
+  return Number.isFinite(lowest) ? ground - lowest : hips.y;
 }
 
 const IDENTITY = new Quaternion();

@@ -289,6 +289,14 @@ export function clearHumanCache(image?: RGBAImage): void {
   loadFailures = new Map();
 }
 
+/**
+ * Forget remembered model load failures (a user-requested retry: the network
+ * may be back). Cached analyses stay; failed ones are never cached.
+ */
+export function forgetHumanLoadFailures(): void {
+  loadFailures = new Map();
+}
+
 function requested(detect: AnalyzeOptions['detect']): HumanDetector[] {
   return ORDER.filter((d) => {
     if (!detect) return true;

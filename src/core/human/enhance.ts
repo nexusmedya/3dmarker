@@ -22,7 +22,7 @@
  * Missing detections leave the depth untouched (the same object is returned).
  */
 import { blurFloat, resizeFloat, resizeMask, resizeRGBA } from '../image/ops';
-import { DEFAULT_MESH_OPTIONS } from '../mesh/options';
+import { DEFAULT_MESH_OPTIONS, type DetailedDepth, type DetailRegion } from '../mesh/options';
 import { throwIfAborted, type DepthMap, type I18nText, type Mask, type RGBAImage } from '../types';
 import { yieldToPaint } from '../yield';
 import { boxFeather, fitAffine } from './align';
@@ -287,6 +287,39 @@ export function fitRange(out: Float32Array, mask: Mask | null): void {
     const v = s === 1 ? out[i] : base + (out[i] - base) * s;
     out[i] = Math.min(1, Math.max(0, v));
   }
+}
+
+/** Region margin per side, as a fraction of the landmark box's longest side: faces (ears sit up to ~0.15 face heights beside the mesh) … */
+const FACE_REGION_MARGIN = 0.2;
+/** … and hands (finger tips are landmark centres; the finger's own radius lies beyond). */
+const HAND_REGION_MARGIN = 0.15;
+
+/**
+ * Face (with ears) and hand areas of `analysis` in a width × height depth
+ * grid, for the mesh builder to keep their fine relief (no smoothing there, a
+ * finer grid). Faces / hands below MIN_DETAIL_SIDE are left out.
+ */
+export function humanDetailRegions(analysis: HumanAnalysis, width: number, height: number): DetailRegion[] {
+  const a = scaleAnalysis(analysis, width, height);
+  const out: DetailRegion[] = [];
+  const add = (kind: 'face' | 'hand', b: Box, margin: number) => {
+    const side = Math.max(b.width, b.height);
+    if (!(side >= MIN_DETAIL_SIDE)) return;
+    const m = margin * side;
+    const x0 = Math.max(0, Math.floor(b.x - m)), y0 = Math.max(0, Math.floor(b.y - m));
+    const x1 = Math.min(width, Math.ceil(b.x + b.width + m)), y1 = Math.min(height, Math.ceil(b.y + b.height + m));
+    if (x1 > x0 && y1 > y0) out.push({ kind, x: x0, y: y0, width: x1 - x0, height: y1 - y0 });
+  };
+  for (const f of a.faces) add('face', f.box, FACE_REGION_MARGIN);
+  for (const h of a.hands) add('hand', h.box, HAND_REGION_MARGIN);
+  return out;
+}
+
+/** `depth` carrying `regions` for the mesh builder (a new object; the data is shared). Unchanged without regions. */
+export function withDetailRegions(depth: DepthMap, regions: DetailRegion[]): DepthMap {
+  if (regions.length === 0) return depth;
+  const out: DepthMap & DetailedDepth = { width: depth.width, height: depth.height, data: depth.data, detail: regions };
+  return out;
 }
 
 export async function enhanceHumanDepth(

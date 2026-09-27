@@ -370,8 +370,12 @@ select {
 
 .stepnav {
   display: grid;
-  /* Content-sized tabs share the row (labels differ a lot in length); they shrink with ellipsis if needed. */
-  grid-template-columns: repeat(6, minmax(0, auto));
+  /*
+   * Content-sized tabs share the row (labels differ a lot in length). Only the
+   * label sizes a column (never below its longest word: it wraps instead of
+   * being cut); the status hint fits into whatever width that leaves.
+   */
+  grid-template-columns: repeat(6, minmax(min-content, auto));
   gap: 3px;
   padding: 8px;
   border-bottom: 1px solid var(--border);
@@ -434,22 +438,23 @@ select {
 
 .stepnav-label {
   max-width: 100%;
-  overflow: hidden;
   font-size: 11.5px;
   font-weight: 600;
   line-height: 1.2;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: normal;
+  text-wrap: balance;
 }
 
 .stepnav-hint {
-  max-width: 100%;
-  overflow: hidden;
+  contain: inline-size;
+  width: 100%;
   font-size: 10px;
   line-height: 1.2;
   color: var(--text-subtle);
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-wrap: balance;
 }
 
 .stepnav-tab.is-done .stepnav-hint { color: var(--ok); }
@@ -490,11 +495,14 @@ select {
 
 .step-footer {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
   padding-top: 2px;
 }
+/* Stays right-aligned when it wraps onto its own row (narrow phones, long labels). */
+.step-footer > .btn:last-child { margin-left: auto; }
 
 .link-btn {
   display: inline;
@@ -531,6 +539,14 @@ select {
 }
 
 .prepared-note > svg { flex: none; color: var(--accent-text); }
+.prepared-note.is-confirm {
+  flex-wrap: wrap;
+  border-color: color-mix(in srgb, var(--warn) 45%, transparent);
+  background: var(--warn-soft);
+}
+.prepared-note.is-confirm > svg { color: var(--warn); }
+.prepared-note.is-confirm > .grow { flex-basis: 12rem; }
+.prepared-note-actions { display: flex; gap: 6px; margin-left: auto; }
 
 .state-chip {
   display: inline-flex;
@@ -1190,6 +1206,11 @@ select {
 .alert > svg { flex: none; margin-top: 1px; }
 .alert-body { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .alert-body p { margin-top: 2px; color: var(--text); opacity: 0.9; }
+.error-extra { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin-top: 6px; }
+.error-detail { font-size: 12px; color: var(--text-muted); }
+.error-detail[open] { flex-basis: 100%; }
+.error-detail summary { cursor: pointer; }
+.error-detail code { display: block; margin-top: 2px; overflow-wrap: anywhere; white-space: pre-wrap; }
 
 .alert-danger {
   color: var(--danger);
@@ -1252,6 +1273,22 @@ select {
 .tool-btn:hover:not(:disabled) { color: var(--text); background: var(--surface-3); }
 .tool-btn.is-on { color: var(--accent-text); background: var(--accent-soft); }
 .tool-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+.viewer-presets-wrap { position: relative; display: inline-flex; }
+.viewer-presets {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--glass);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  white-space: nowrap;
+}
 
 .toolbar-sep {
   width: 1px;
@@ -1435,6 +1472,9 @@ select {
 }
 
 .export-anim svg { color: var(--accent-text); }
+.export-anim.is-empty { visibility: hidden; }
+/* The stats get their own row whether or not a model exists: generating never re-wraps the footer. */
+.stage-footer > .stats { flex: 1 0 100%; }
 
 /* ---------- Landing ---------- */
 
@@ -1747,6 +1787,24 @@ select {
     scroll-snap-align: start;
   }
 
+  /* The row scrolls: fade the edge(s) that hide more tabs. */
+  .stepnav.can-scroll-end {
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
+  }
+  .stepnav.can-scroll-start {
+    -webkit-mask-image: linear-gradient(to right, transparent, #000 28px);
+    mask-image: linear-gradient(to right, transparent, #000 28px);
+  }
+  .stepnav.can-scroll-start.can-scroll-end {
+    -webkit-mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent);
+    mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent);
+  }
+
+  /* One line each in the scroller (tabs size to their content there). */
+  .stepnav-label { white-space: nowrap; }
+  .stepnav-hint { contain: none; width: auto; white-space: nowrap; }
+
   /* Keep Generate reachable while scrolling through the stacked panel. */
   .generate-panel {
     position: sticky;
@@ -1758,14 +1816,48 @@ select {
 
   /* Long errors scroll inside the sticky footer instead of covering the panel. */
   .generate-panel .alert-body p {
-    max-height: 6em;
+    max-height: 4.5em; /* room for the recovery action row below */
     overflow-y: auto;
     overscroll-behavior: contain;
   }
 
+  /* Shorter than the screen: swipes above / below the viewer still scroll the page (landscape too). */
   .stage {
-    height: 72vh;
-    min-height: 440px;
+    height: min(62vh, 560px);
+    height: min(62svh, 560px);
+    min-height: 300px;
+    scroll-margin-top: calc(var(--topbar-h) + 8px);
+  }
+
+  /*
+   * Edit / Rig steps (and sculpt mode): the viewer is pinned to the bottom of
+   * the screen while the controls scroll above it, so a brush or an animation
+   * and its effect are on screen together.
+   */
+  .studio--pin-stage .stage {
+    position: sticky;
+    bottom: 0;
+    z-index: 7;
+    height: 42vh;
+    height: 42svh;
+    min-height: 240px;
+    box-shadow: 0 -8px 24px -12px rgba(0, 0, 0, 0.35);
+  }
+  .studio--pin-stage .stage-footer { padding: 6px 10px; gap: 4px 10px; }
+  .studio--pin-stage .stage-footer > .stats,
+  .studio--pin-stage .export-anim,
+  .studio--pin-stage .stl-size { display: none; }
+  /* The pinned viewer takes the bottom edge: the Generate footer scrolls normally meanwhile. */
+  .studio--pin-stage .generate-panel { position: static; box-shadow: none; }
+
+  /* Keep the sticky Generate footer compact (a phone has little height to spare). */
+  .generate-panel { padding: 8px 12px; gap: 6px; }
+  .generate-panel .kbd-hint { display: none; }
+
+  /* Focus / scrollIntoView must not land a control under the sticky step tabs or the Generate footer. */
+  .panel-scroll :is(button, input, select, textarea, a, summary, [tabindex]) {
+    scroll-margin-top: calc(var(--stepnav-h, 80px) + 8px);
+    scroll-margin-bottom: calc(var(--generate-h, 120px) + 8px);
   }
 
   .highlights,
@@ -1782,8 +1874,7 @@ select {
 
 @media (max-width: 520px) {
   .brand-name { display: none; }
-  .viewer-toolbar { top: 8px; }
-  .tool-btn { width: 30px; height: 30px; }
+  .viewer-toolbar { top: 8px; gap: 0; }
   .viewer-hint { display: none; }
   .depth-thumb canvas { max-width: 88px; max-height: 88px; }
   .container { padding: 0 16px; }
@@ -1791,6 +1882,15 @@ select {
 
 @media (hover: none) and (pointer: coarse) {
   .kbd-hint { display: none; }
+
+  /* Finger-sized targets (~40px; hit areas grow where the layout must not). */
+  .tool-btn { width: 40px; height: 40px; }
+  .btn-sm { min-height: 40px; }
+  .icon-btn { min-width: 40px; min-height: 40px; }
+  .seg-btn { min-height: 36px; padding: 3px 12px; }
+  .link-btn { position: relative; }
+  .link-btn::after { content: ''; position: absolute; inset: -10px -6px; }
+  .switch { min-height: 40px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1802,4 +1902,12 @@ select {
     transition-duration: 0.001ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* Fusion report: a view switched off before the run (not part of the fusion). */
+.fusion-chip.is-off {
+  color: var(--text-muted, inherit);
+  background: transparent;
+  border: 1px dashed currentColor;
+  opacity: 0.75;
 }

@@ -10,7 +10,7 @@
  */
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { Mesh, Object3D } from 'three';
-import type { DepthMap, Driver, Lang, Mask, ParamValue, Progress, RGBAImage, ViewAlign, ViewId } from '../core/types';
+import type { DepthMap, Driver, I18nText, Lang, Mask, ParamValue, Progress, RGBAImage, ViewAlign, ViewId } from '../core/types';
 import { AbortError, DEFAULT_VIEW_ALIGN, defaultParams, throwIfAborted } from '../core/types';
 import type { MeshStats } from '../core/mesh/stats';
 import { depthToRGBA } from '../core/image/ops';
@@ -78,6 +78,10 @@ import { UI, t } from '../app/i18n';
 import { throttleLatest } from '../app/throttle';
 import { disposeObject } from '../app/dispose';
 import { renderSample, type SampleSpec } from '../app/samples';
+import { AiError, type AiErrorCode } from '../ai/transport';
+import { VIEW_LABELS } from '../ai/views';
+import { LocalizedError } from '../core/errors';
+import { isNetworkError } from '../drivers/ml/errors';
 import type { ViewerCore } from '../app/viewer';
 import { useAvailability } from './useAvailability';
 
@@ -85,6 +89,26 @@ import { useAvailability } from './useAvailability';
 export const REMESH_DEBOUNCE_MS = 150;
 /** A view's consistency check is redone this long after its alignment request last changed. */
 export const CHECK_REFRESH_MS = 250;
+/** AI errors that would fail every view of a batch the same way (the batch stops at the first). */
+const BATCH_FATAL = new Set<AiErrorCode>(['network', 'needs-server', 'missing-key', 'key-format', 'auth', 'forbidden', 'billing', 'rate-limit', 'unsupported']);
+
+export function isBatchFatal(e: unknown): boolean {
+  return e instanceof AiError && BATCH_FATAL.has(e.code);
+}
+
+/** "4/5 views generated; Right: content policy" after a batch where some views failed. */
+export function viewsSummaryError(ok: number, n: number, failed: { view: OtherViewId; error: unknown }[]): LocalizedError {
+  const reason = (e: unknown): I18nText =>
+    e instanceof AiError && e.code === 'content-policy' ? { tr: 'içerik politikası', en: 'content policy' } : errorToText(e);
+  const part = (lang: Lang) => failed.map((f) => `${VIEW_LABELS[f.view][lang]}: ${reason(f.error)[lang]}`).join(' · ');
+  return new LocalizedError({
+    tr: `${ok}/${n} görünüm üretildi; ${part('tr')}`,
+    en: `${ok}/${n} views generated; ${part('en')}`,
+  });
+}
+
+/** The heuristic driver offered when a model download fails (needs no network). */
+export const OFFLINE_DRIVER_ID = 'silhouette-inflate';
 
 /** OS colour-scheme preference (used until the user picks a theme). */
 function prefersLightScheme(): boolean {
@@ -442,9 +466,21 @@ export function useStudio() {
   /** A procedural sample; samples with extra views (the T-pose mannequin) fill the view slots too. */
   const loadSample = useCallback(
     async (spec: SampleSpec) => {
+      // Claim the load before rendering: the old image must not stay generatable
+      // meanwhile, and a later pick supersedes this one even if it renders first.
+      const pick = ++loadSeq.current;
+      cancel();
+      loadingRef.current = true;
+      dispatch({ type: 'imageLoading' });
+      let loaded = false;
       try {
         const blob = await renderSample(spec);
+        if (pick !== loadSeq.current) return; // a newer sample / file / clear came in
         if (!(await loadFile(new File([blob], spec.fileName, { type: 'image/png' }), spec.fileName))) return;
+        loaded = true;
+        // Samples come with the driver they were made for (fusion for the T-pose views…).
+        const d = getDriver(spec.driverId);
+        if (d && d.id !== stateRef.current.driverId) dispatch({ type: 'selectDriver', driver: d });
         const seq = viewSeq.current;
         for (const [view, draw] of Object.entries(spec.views ?? {}) as [OtherViewId, NonNullable<SampleSpec['draw']>][]) {
           const name = aiFileName(spec.fileName, view);
@@ -453,10 +489,15 @@ export function useStudio() {
           dispatch({ type: 'viewSet', view, entry });
         }
       } catch (e) {
+        if (!loaded) {
+          // loadFile handles its own failures; this is the sample render itself.
+          if (pick !== loadSeq.current) return;
+          loadingRef.current = false;
+        }
         dispatch({ type: 'imageFailed', error: errorToText(e) });
       }
     },
-    [loadFile],
+    [cancel, loadFile],
   );
 
   const clearImage = useCallback(() => {
@@ -534,6 +575,7 @@ export function useStudio() {
           elapsedMs: performance.now() - t0,
           sourceName: source.name,
           fusion: fusionReportOf(built.object),
+          fusionOff: OTHER_VIEWS.filter((v) => s.views[v]?.align.trust === 'off'),
         },
         source,
         bgMode,
@@ -548,10 +590,27 @@ export function useStudio() {
       if (ctrl.signal.aborted || isAbortError(e)) dispatch({ type: 'jobCancelled' });
       else {
         console.error(e);
-        dispatch({ type: 'jobFailed', error: errorToText(e) });
+        const error = errorToText(e);
+        // A model download that failed (offline, blocked host): an offline driver still works.
+        const offline = drv.id !== OFFLINE_DRIVER_ID && (isNetworkError(e) || isNetworkError(new Error(error.en)));
+        dispatch({ type: 'jobFailed', error, offline });
       }
     }
   }, [analyze, setModel]);
+
+  // "Try Silhouette inflate" after a failed model download: generate once the driver switch has rendered.
+  const fallbackPending = useRef(false);
+  const generateOffline = useCallback(() => {
+    const d = getDriver(OFFLINE_DRIVER_ID);
+    if (!d) return;
+    fallbackPending.current = true;
+    dispatch({ type: 'selectDriver', driver: d });
+  }, []);
+  useEffect(() => {
+    if (!fallbackPending.current || state.driverId !== OFFLINE_DRIVER_ID || availability === 'checking') return;
+    fallbackPending.current = false;
+    void generate();
+  }, [state.driverId, availability, generate]);
 
   // Live re-meshing: rebuild the surface from the cached depth (never re-runs the driver).
   // Paused while the model carries sculpt edits, is being sculpted or is rigged.
@@ -657,25 +716,36 @@ export function useStudio() {
           const e = s.views[v];
           if (e) others[v] = e.file;
         }
+        const failed: { view: OtherViewId; error: unknown }[] = [];
         for (const view of targets) {
           throwIfAborted(job.signal);
           const refs = { ...others };
           delete refs[view]; // a view being redone is not its own reference
-          const blob = await generateViewImage(view, { front: source.file, others: refs }, s.prep, cfg, {
-            signal: job.signal,
-            onProgress: job.onProgress,
-            isHuman,
-            bgProvider: bgProviderOf(s),
-            frontPrep: s.frontPrep,
-          });
-          throwIfAborted(job.signal);
-          const entry = await decodeView(blob, aiFileName(source.name, view), 'ai');
+          let blob: Blob;
+          let entry: ViewEntry;
+          try {
+            blob = await generateViewImage(view, { front: source.file, others: refs }, s.prep, cfg, {
+              signal: job.signal,
+              onProgress: job.onProgress,
+              isHuman,
+              bgProvider: bgProviderOf(s),
+              frontPrep: s.frontPrep,
+            });
+            throwIfAborted(job.signal);
+            entry = await decodeView(blob, aiFileName(source.name, view), 'ai');
+          } catch (e) {
+            // One refused view (content policy, a bad output…) must not cancel the rest of the batch;
+            // key, billing, quota or network problems would fail every view the same way.
+            if (targets.length === 1 || job.signal.aborted || isAbortError(e) || isBatchFatal(e)) throw e;
+            failed.push({ view, error: e });
+            continue;
+          }
           throwIfAborted(job.signal);
           if (!job.isCurrent()) return;
           dispatch({ type: 'viewSet', view, entry });
           others[view] = blob;
         }
-        job.finish();
+        job.finish(failed.length ? viewsSummaryError(targets.length - failed.length, targets.length, failed) : undefined);
       } catch (e) {
         job.finish(e);
       }
@@ -867,6 +937,14 @@ export function useStudio() {
     dispatch({ type: 'revertOriginal', mask, maskNote: note });
   }, []);
 
+  /** Undo of revertOriginal: the AI-prepared front and its AI views come back. */
+  const restorePrepared = useCallback(() => {
+    const s = stateRef.current;
+    if (!s.revertedAi || jobRef.current || aiJobRef.current || loadingRef.current) return;
+    const { mask, note } = quickMask(s.revertedAi.source.image, s.bgMode);
+    dispatch({ type: 'restorePrepared', mask, maskNote: note });
+  }, []);
+
   const detectHuman = useCallback(() => {
     const src = stateRef.current.source;
     if (src) void analyze(src.image);
@@ -1020,6 +1098,8 @@ export function useStudio() {
       acceptPrepared,
       discardPrepared: () => dispatch({ type: 'prepDiscard' }),
       revertOriginal,
+      restorePrepared,
+      generateOffline,
       generateView,
       generateMissing,
       uploadView,
@@ -1052,6 +1132,8 @@ export function useStudio() {
       cancelAi,
       acceptPrepared,
       revertOriginal,
+      restorePrepared,
+      generateOffline,
       generateView,
       generateMissing,
       uploadView,

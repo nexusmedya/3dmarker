@@ -10,6 +10,7 @@
 import type { Availability, Driver, DriverInput, DriverResult, I18nText, ParamSpec, ParamValues } from '../../core/types';
 import { AbortError, throwIfAborted } from '../../core/types';
 import { LocalizedError } from '../../core/errors';
+import { apiServerDisabled } from '../../ai/settings';
 import {
   API_KEY_PATTERN,
   CLIENT_HEADER,
@@ -65,6 +66,11 @@ export const TRIPO_TEXT = {
   serverUnreachable: {
     tr: 'API sunucusuna ulaşılamadı; bulut sürücüsü sunucu olmadan çalışmaz.',
     en: 'Could not reach the API server; the cloud driver needs it.',
+  },
+  // Shown before a run when no proxy answers (e.g. the static GitHub Pages demo): name the working alternative.
+  noServer: {
+    tr: 'Bu sürücü kendi API sunucunuzu gerektirir; çevrimiçi demo sunucusuz çalışır. Tripo3D için “Yapay zekâ sağlayıcısı” sürücüsünü fal.ai anahtarıyla kullanın (Yapay zekâ sağlayıcıları → fal.ai).',
+    en: 'This driver needs your own API server; the online demo runs without one. For Tripo3D, use the “AI provider” driver with a fal.ai key (AI providers → fal.ai).',
   },
   needsKey: {
     tr: 'Sunucuda Tripo3D anahtarı tanımlı değil: parametrelerden kendi API anahtarınızı (tsk_…) girin.',
@@ -448,6 +454,8 @@ export function createTripoTaskRunner(options: TripoDriverOptions = {}): TripoTa
   }
 
   async function isAvailable(): Promise<Availability> {
+    // Static build (GitHub Pages): no API server, so skip the probe (and its console 404).
+    if (apiServerDisabled()) return { ok: false, reason: TRIPO_TEXT.noServer };
     let body: Partial<StatusResponse> | null = null;
     try {
       const res = await doFetch(TRIPO_STATUS_PATH, { signal: AbortSignal.timeout(5000) });
@@ -455,7 +463,7 @@ export function createTripoTaskRunner(options: TripoDriverOptions = {}): TripoTa
     } catch {
       body = null;
     }
-    if (!body || typeof body.configured !== 'boolean') return { ok: false, reason: TRIPO_TEXT.serverUnreachable };
+    if (!body || typeof body.configured !== 'boolean') return { ok: false, reason: TRIPO_TEXT.noServer };
     return body.configured ? { ok: true } : { ok: true, reason: TRIPO_TEXT.needsKey };
   }
 
@@ -477,8 +485,8 @@ export function createTripoDriver(options: TripoDriverOptions = {}): Driver {
     id: 'tripo3d-cloud',
     name: { tr: 'Tripo3D (bulut, tam 3B)', en: 'Tripo3D (cloud, full 3D)' },
     description: {
-      tr: 'Görseli Tripo3D API’sine gönderir; görünmeyen yüzleri de tamamlanmış, dokulu ve kapalı bir 3B model (GLB) döner. En gerçekçi sonuç budur ancak Tripo3D API anahtarı (sunucuda tanımlı ya da kendi anahtarınız) gerektirir, kredi harcar ve görsel üçüncü taraf bir hizmete yüklenir. Genellikle 1–3 dakika sürer.',
-      en: 'Sends the image to the Tripo3D API and returns a textured, closed 3D model (GLB) with the unseen sides reconstructed. The most realistic option, but it needs a Tripo3D API key (configured on the server, or your own), uses credits and uploads the image to a third-party service. Usually takes 1–3 minutes.',
+      tr: 'Görseli Tripo3D API’sine gönderir; görünmeyen yüzleri de tamamlanmış, dokulu ve kapalı bir 3B model (GLB) döner. En gerçekçi sonuç budur ancak Tripo3D API anahtarı (sunucuda tanımlı ya da kendi anahtarınız) gerektirir, kredi harcar ve görsel üçüncü taraf bir hizmete yüklenir. Genellikle 1–3 dakika sürer. Kendi 3D Marker API sunucunuzu gerektirir; çevrimiçi demoda çalışmaz.',
+      en: 'Sends the image to the Tripo3D API and returns a textured, closed 3D model (GLB) with the unseen sides reconstructed. The most realistic option, but it needs a Tripo3D API key (configured on the server, or your own), uses credits and uploads the image to a third-party service. Usually takes 1–3 minutes. Needs your own 3D Marker API server; not available on the online demo.',
     },
     category: 'cloud',
     badges: ['api-key', 'full-3d', 'closed-mesh'],

@@ -13,13 +13,73 @@ import {
   type DeviceType,
 } from '@huggingface/transformers';
 import type { LoadRequest } from './mlEngine';
-import type { BackgroundRemovalJob, DepthJob, ImagePayload, MlEnvConfig } from './mlProtocol';
+import { DEFAULT_STALL_TIMEOUT_MS, modelStalledError, type BackgroundRemovalJob, type DepthJob, type ImagePayload, type MlEnvConfig } from './mlProtocol';
 import { alphaChannel } from '../core/preprocess/alphaMask';
 
 export type AnyPipeline = DepthEstimationPipeline | BackgroundRemovalPipeline;
 
 /** ORT wasm file URLs transformers.js picked at import time (jsDelivr); configureEnv reuses their file names. */
 let ortDefaultPaths: { mjs?: string | URL; wasm?: string | URL } | undefined;
+
+let stallTimeoutMs = DEFAULT_STALL_TIMEOUT_MS;
+const stallWrapped = new WeakSet<FetchFn>();
+
+type FetchFn = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+/** Statuses whose Response must have a null body. */
+const NULL_BODY = new Set([101, 103, 204, 205, 304]);
+
+/**
+ * Wrap `fetchFn` so a request fails with ModelStalledError when its response
+ * headers, or the next body chunk while the consumer is reading, take longer
+ * than `stallMs()`. fetch has no timeout of its own: a blackholed host or a
+ * stalled proxy would otherwise hang the model load forever. The timer only
+ * runs while a read is pending, so a slow consumer never trips it.
+ */
+export function withStallTimeout(fetchFn: FetchFn, stallMs: () => number): FetchFn {
+  const wrapped: FetchFn = async (input, init = {}) => {
+    const ms = stallMs();
+    if (!(ms > 0)) return fetchFn(input, init);
+    const url = input instanceof Request ? input.url : String(input);
+    const ac = new AbortController();
+    const outer = init.signal;
+    if (outer?.aborted) ac.abort(outer.reason);
+    else outer?.addEventListener('abort', () => ac.abort(outer.reason), { once: true });
+    const stalled = () => {
+      const err = modelStalledError(url, ms);
+      ac.abort(err);
+      return err;
+    };
+    // Race a timer instead of relying on the abort alone: not every fetch honours the signal promptly.
+    const race = <T>(p: Promise<T>): Promise<T> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(stalled()), ms);
+      });
+      return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+    };
+    const res = await race(fetchFn(input, { ...init, signal: ac.signal }));
+    const body = res.body;
+    if (!body || NULL_BODY.has(res.status) || res.status < 200 || res.status > 599) return res;
+    const reader = body.getReader();
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(ctrl) {
+        try {
+          const { done, value } = await race(reader.read());
+          if (done) ctrl.close();
+          else ctrl.enqueue(value);
+        } catch (e) {
+          ctrl.error(e);
+          reader.cancel(e).catch(() => undefined);
+        }
+      },
+      cancel: (reason) => reader.cancel(reason),
+    });
+    return new Response(stream, { status: res.status, statusText: res.statusText, headers: res.headers });
+  };
+  stallWrapped.add(wrapped);
+  return wrapped;
+}
 
 /**
  * Browser defaults: never probe /models/ on our origin; fetch from the Hub and
@@ -34,6 +94,9 @@ export function initEnv(): void {
   env.allowLocalModels = false;
   env.allowRemoteModels = true;
   env.useBrowserCache = typeof caches !== 'undefined';
+  // Every Hub and ORT-runtime download goes through env.fetch.
+  const base = env.fetch as FetchFn | undefined;
+  if (base && !stallWrapped.has(base)) env.fetch = withStallTimeout(base, () => stallTimeoutMs) as typeof env.fetch;
   const wasm = env.backends.onnx.wasm;
   const cur = wasm?.wasmPaths;
   if (wasm && cur && typeof cur === 'object') {
@@ -47,6 +110,7 @@ export function configureEnv(c: MlEnvConfig): void {
   if (c.remoteHost) env.remoteHost = slash(c.remoteHost);
   if (c.remotePathTemplate) env.remotePathTemplate = c.remotePathTemplate;
   if (c.useBrowserCache !== undefined) env.useBrowserCache = c.useBrowserCache && typeof caches !== 'undefined';
+  if (c.stallTimeoutMs !== undefined && c.stallTimeoutMs >= 0) stallTimeoutMs = c.stallTimeoutMs;
   const wasm = env.backends.onnx.wasm;
   if (c.wasmPrefix && wasm) {
     // transformers.js chose the right build (asyncify or plain) and pointed

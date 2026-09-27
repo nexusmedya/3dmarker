@@ -4,12 +4,13 @@
  * trust. The report comes from the model's geometry (pipeline.fusionReportOf).
  */
 import type { FusionReport, ViewReport } from '../core/fusion/types';
+import type { ViewId } from '../core/types';
 import { VIEW_LABELS } from '../ai/views';
 import { useI18n } from './i18n';
 import { IconAlert, IconInfo } from './icons';
 import { IconViews } from './ai/icons';
 
-export function FusionReportNote({ report }: { report: FusionReport | null }) {
+export function FusionReportNote({ report, offViews = [] }: { report: FusionReport | null; offViews?: readonly ViewId[] }) {
   const { t, tx } = useI18n();
   if (!report) return null;
   return (
@@ -23,6 +24,14 @@ export function FusionReportNote({ report }: { report: FusionReport | null }) {
         {report.views.map((v) => (
           <ReportChip key={v.id} view={v} />
         ))}
+        {offViews
+          .filter((id) => !report.views.some((v) => v.id === id))
+          .map((id) => (
+            <li key={id} className="fusion-chip is-off" data-testid={`fusion-view-${id}`} data-trust="off" title={tx(TEXT.offNote)}>
+              <span>{tx(VIEW_LABELS[id])}</span>
+              <span className="muted"> · {t('fusionOff')}</span>
+            </li>
+          ))}
       </ul>
       {report.warnings.map((w, i) => (
         <p key={i} className="note small" role="status">
@@ -40,6 +49,7 @@ export function FusionReportNote({ report }: { report: FusionReport | null }) {
 
 const TEXT = {
   consistent: { tr: 'Görünümler tutarlı; uyarı yok.', en: 'The views are consistent; no warnings.' },
+  offNote: { tr: 'Bu görünüm kapatıldı; birleştirmeye katılmadı.', en: 'This view was switched off and not used in the fusion.' },
 };
 
 function ReportChip({ view }: { view: ViewReport }) {

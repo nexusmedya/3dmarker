@@ -3,6 +3,7 @@
  * ONNX Runtime, missing weight files) into bilingual messages the UI can show.
  */
 import { LocalizedError } from '../../core/errors';
+import { MODEL_STALLED_ERROR } from '../../workers/mlProtocol';
 
 /**
  * Browser fetch failures: Chromium, Firefox, Safari wording (+ ORT's dynamic
@@ -24,6 +25,12 @@ export function localizeMlError(e: unknown, model: string): unknown {
     return new LocalizedError({
       tr: `Yapay zekâ modeli (${model}) indirilemedi: Hugging Face'e veya ONNX Runtime dosyalarına ulaşılamıyor. İnternet bağlantınızı kontrol edin ya da çevrimdışı çalışan sezgisel bir sürücü (ör. Siluet şişirme) seçin. [${detail}]`,
       en: `Could not download the AI model (${model}): Hugging Face or the ONNX Runtime files are unreachable. Check your internet connection, or pick an offline heuristic driver (e.g. Silhouette inflate). [${detail}]`,
+    });
+  }
+  if (e.name === MODEL_STALLED_ERROR) {
+    return new LocalizedError({
+      tr: `Model indirmesi yanıt vermiyor (${model}; ağ / proxy sorunu olabilir). Birkaç dakika sonra tekrar deneyin, derinlik iyileştirmeyi kapatın ya da çevrimdışı çalışan bir sürücü seçin. [${detail}]`,
+      en: `The model download stopped responding (${model}; possibly a network / proxy problem). Try again in a few minutes, turn off depth refinement, or pick an offline driver. [${detail}]`,
     });
   }
   if (e.name === 'ModelFileNotFoundError') {

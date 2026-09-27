@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AbortError, type RGBAImage } from '../types';
-import { analyzeHuman, clearHumanCache, LOAD_FAILURE_TTL_MS, SLOW_LOAD_FAILURE_MS, faceAgreesWithPose, headBoxFromPose, landmarkBox, resolveHandedness, setDetectorBackend, toPixels } from './analyze';
+import { analyzeHuman, clearHumanCache, forgetHumanLoadFailures, LOAD_FAILURE_TTL_MS, SLOW_LOAD_FAILURE_MS, faceAgreesWithPose, headBoxFromPose, landmarkBox, resolveHandedness, setDetectorBackend, toPixels } from './analyze';
 import type { Detector, DetectorBackend, RawDetections, RawLandmark } from './backend';
 import { syntheticFace, syntheticPose } from './testing';
 import { FACE, LEFT_EYE_LOOP, RIGHT_EYE_LOOP } from './topology';
@@ -254,6 +254,12 @@ describe('analyzeHuman', () => {
       vi.setSystemTime(Date.now() + LOAD_FAILURE_TTL_MS);
       await analyzeHuman(img(), { signal: new AbortController().signal, detect: { hands: false, pose: false } });
       expect(calls).toHaveLength(2); // retried after the TTL
+      // A user retry (the card's "Try again") does not wait for the TTL.
+      await analyzeHuman(img(), { signal: new AbortController().signal, detect: { hands: false, pose: false } });
+      expect(calls).toHaveLength(2);
+      forgetHumanLoadFailures();
+      await analyzeHuman(img(), { signal: new AbortController().signal, detect: { hands: false, pose: false } });
+      expect(calls).toHaveLength(3);
     } finally {
       vi.useRealTimers();
     }

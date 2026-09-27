@@ -446,7 +446,8 @@ test.describe('phone layout', () => {
       await page.getByTestId(`lang-${lang}`).click();
       const footer = await page.locator('.generate-panel').evaluate((el) => el.getBoundingClientRect().height);
       expect(footer, `footer height (${lang})`).toBeLessThan(240);
-      await expect(alert.getByRole('button')).toBeInViewport();
+      await expect(alert.getByRole('button', { name: lang === 'tr' ? 'Kapat' : 'Dismiss' })).toBeInViewport();
+      await expect(page.getByTestId('error-action')).toBeInViewport();
     }
     await page.screenshot({ path: `${SHOTS}/phone-ml-error.png` });
   });

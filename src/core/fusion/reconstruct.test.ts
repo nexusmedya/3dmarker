@@ -6,7 +6,8 @@ import { LocalizedError } from '../errors';
 import { computeMeshStats } from '../mesh/stats';
 import { distanceTransform } from '../image/distance';
 import { estimateObjectBox, viewProjection } from './frame';
-import { FUSION_TEXT, reconstructFromViews, sanitizeFusionOptions, viewWarning } from './reconstruct';
+import { DepthOfflineError, FUSION_TEXT, reconstructFromViews, sanitizeFusionOptions, viewWarning } from './reconstruct';
+import { SRGB_TO_LINEAR } from './color';
 import { LEGACY_FUSION_OPTIONS, type DepthEstimator, type FusionContext, type FusionOptions, type FusionViewInput } from './types';
 import {
   box,
@@ -24,6 +25,7 @@ import {
   renderViews,
   sphere,
   VIEW_COLORS,
+  CHARACTER_COLORS,
   type CharacterViews,
   type Solid,
   type ViewPerturbation,
@@ -413,12 +415,29 @@ describe('reconstructFromViews: robustness', () => {
     expect(r.info.warnings[0]).toEqual(FUSION_TEXT.depthUnavailable);
     expect(r.info.warnings[1]).toEqual({ tr: 'Model indirilemedi', en: 'Could not download the model' });
     expect(Object.values(r.info.depth).every((s) => s === 'none')).toBe(true);
-    const after = c.progress.slice(c.progress.findIndex((p) => p.label.en.includes(FUSION_TEXT.depthUnavailable.en)));
+    // The failure shows once on the depth line; later stage labels stay plain (the report carries it).
+    const at = c.progress.findIndex((p) => p.label.en.includes(FUSION_TEXT.depthUnavailable.en));
+    expect(c.progress[at].label.tr).toContain(FUSION_TEXT.depthUnavailable.tr);
+    const after = c.progress.slice(at + 1);
     expect(after.length).toBeGreaterThan(3);
-    for (const p of after) {
-      expect(p.label.tr).toContain(FUSION_TEXT.depthUnavailable.tr);
-      expect(p.label.en).toContain(FUSION_TEXT.depthUnavailable.en);
+    const stages = Object.values(FUSION_TEXT).map((t) => t.en);
+    for (const p of after) expect(stages).toContain(p.label.en);
+  });
+
+  it('says the depth model could not be downloaded in its own words, without the drivers\' advice', async () => {
+    const { inputs } = renderViews([sphere([0, 0, 0], 1)], ['front', 'left', 'top'], { width: 96, height: 96, scale: 40 });
+    const offline = await reconstructFromViews(inputs, { resolution: 48 }, ctx({ estimateDepth: async () => { throw new DepthOfflineError(); } }));
+    expect(offline.info.warnings).toEqual([FUSION_TEXT.depthOffline]);
+    for (const w of offline.info.warnings) {
+      expect(w.tr).not.toMatch(/Siluet şişirme|\[/);
+      expect(w.en).not.toMatch(/Silhouette inflate|\[/);
     }
+    // A raw (unlocalised) error stays in the console: only the generic line.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const raw = await reconstructFromViews(inputs, { resolution: 48 }, ctx({ estimateDepth: async () => { throw new Error('worker crashed'); } }));
+    expect(raw.info.warnings).toEqual([FUSION_TEXT.depthUnavailable]);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
   });
 
   it('reports monotonic progress with ratios and passes depth progress through', async () => {
@@ -484,6 +503,23 @@ describe('reconstructFromViews: robustness', () => {
     const done = await reconstructFromViews(inputs, { resolution: 64 }, ctx({ sliceMs: 0, yieldControl: async () => void ticks++ }));
     expect(done.info.triangles).toBeGreaterThan(0);
     expect(ticks).toBeGreaterThan(200);
+  });
+
+  it('yields between the views while preparing and aligning them, and while building their colour sources', async () => {
+    const set = renderCharacterViews(['front', 'back', 'left', 'right'], { size: 128 });
+    const labels: string[] = [];
+    const ticksIn: Record<string, number> = {};
+    await reconstructFromViews(set.inputs, { resolution: 32 }, ctx({
+      sliceMs: 0,
+      onProgress: (p) => labels.push(p.label.en),
+      yieldControl: async () => {
+        const l = labels.at(-1)!;
+        ticksIn[l] = (ticksIn[l] ?? 0) + 1;
+      },
+    }));
+    // 4 preparations + the front's reference + 3 registrations, each with its profile searches.
+    expect(ticksIn[FUSION_TEXT.prepare.en]).toBeGreaterThanOrEqual(4 + 1 + 3 * 3);
+    expect(ticksIn[FUSION_TEXT.color.en]).toBeGreaterThanOrEqual(4 * 3);
   });
 
   it('rejects a missing front, a lone front and views that do not overlap', async () => {
@@ -580,11 +616,24 @@ describe('robust fusion of hand-made views (integration)', () => {
     expect(r.geometry.userData.multiview).toBe(r.info);
   };
 
+  /** Share of a's occupied voxels that b occupies too. */
+  const within = (a: Float32Array, b: Float32Array) => {
+    let n = 0, k = 0;
+    for (let i = 0; i < a.length; i++) if (a[i] > 0.5) {
+      n++;
+      if (b[i] > 0.5) k++;
+    }
+    return k / Math.max(1, n);
+  };
+
   it('A1: keeps a consistent set as it was, with the guard armed but idle', async () => {
     const r = await A1(), legacy = await A1_LEGACY();
     sane(r);
     for (const k of ['arm', 'leg', 'torso', 'head'] as const) expect(r.m[k]).toBeGreaterThanOrEqual(0.99);
-    expect(fieldIoU(r.field, legacy.field)).toBeGreaterThanOrEqual(0.99);
+    // Without depth maps the arms, which the side views see end-on in front of the chest, are rounded
+    // (GuardField.capHidden) instead of keeping the chest's depth: the one change, and it only removes.
+    expect(within(r.field, legacy.field)).toBeGreaterThanOrEqual(0.99);
+    expect(r.m.bloat).toBeLessThan(legacy.m.bloat - 0.2);
     expect(r.info.guardColumns).toBeGreaterThan(0);
     expect(r.info.warnings).toEqual([]);
     expect(r.info.alignment.map((a) => a.status)).toEqual(['bbox', 'aligned', 'aligned', 'aligned']);
@@ -594,7 +643,33 @@ describe('robust fusion of hand-made views (integration)', () => {
     expect(legacy.info.alignment.every((a) => a.status === 'bbox')).toBe(true);
     expect(legacy.info.guardColumns).toBe(0);
     const strict = await fuse(consistent(), { hull: 'strict' }), strictLegacy = await fuse(consistent(), { ...LEGACY_FUSION_OPTIONS, hull: 'strict' });
-    expect(fieldIoU(strict.field, strictLegacy.field)).toBeGreaterThanOrEqual(0.99);
+    expect(within(strict.field, strictLegacy.field)).toBeGreaterThanOrEqual(0.99);
+    // With depth maps nothing is capped: the consistent set is the legacy hull.
+    const guardOff = await fuse(consistent(), { guard: 0 });
+    expect(fieldIoU(guardOff.field, legacy.field)).toBeGreaterThanOrEqual(0.99);
+  }, 60000);
+
+  it('A7: without depth maps, T-pose arms seen end-on by the side views come out round, not as deep as the chest', async () => {
+    const r = await A1(), legacy = await A1_LEGACY();
+    const set = consistent(), ch = set.character;
+    const armDepth = (f: Fused) => {
+      const box = estimateObjectBox(f.views.filter((v) => v.trust === 'full'), 0.5);
+      const t = characterTruth(set, f.views[0], box, f.grid);
+      let z0 = Infinity, z1 = -Infinity;
+      for (let i = 0; i < f.field.length; i++) {
+        if (f.field[i] <= 0.5 || Math.abs(t.wx[i] - 0.37) > 0.01 || Math.abs(t.wy[i] - ch.armY) > 0.005) continue;
+        z0 = Math.min(z0, t.wz[i]);
+        z1 = Math.max(z1, t.wz[i]);
+      }
+      return z1 - z0;
+    };
+    const diameter = 2 * ch.proportions.armRadius;
+    expect(armDepth(legacy)).toBeGreaterThan(2 * diameter); // ≈ 0.16: the chest's depth
+    expect(armDepth(r)).toBeLessThanOrEqual(1.6 * diameter);
+    expect(r.m.arm).toBeGreaterThanOrEqual(0.99);
+    // A top view measures the arms itself: nothing to cap there.
+    const withTop = await fuse(renderCharacterViews([...V4, 'top'], { size: SIZE }));
+    expect(withTop.m.arm).toBeGreaterThanOrEqual(0.99);
   }, 60000);
 
   it('A2: knee-up back and side views keep the arms, the shoulders and the chest depth', async () => {
@@ -797,5 +872,181 @@ describe('robust fusion: non-character subjects with depth', () => {
     const b = await run([sphere([0, 0, 0], 1)], ['front', 'back'], LEGACY_FUSION_OPTIONS, false);
     expect(Math.abs(a.info.triangles / b.info.triangles - 1)).toBeLessThanOrEqual(0.05);
     expect(a.info.depth).toEqual({ front: 'silhouette', back: 'silhouette' });
+  }, 30000);
+});
+
+describe('colour of thin parts seen end-on (visual-hull bleed)', () => {
+  const V4: ViewId[] = ['front', 'back', 'left', 'right'];
+  /** Shirt blue in linear RGB: the torso colour a side / top view shows behind the arm or the head. */
+  const isBlue = (c: Float32Array, i: number) => c[i + 2] > 0.3 && c[i + 2] > 2 * c[i];
+  async function blueShares(set: CharacterViews) {
+    const { geometry: g } = await reconstructFromViews(set.inputs, {}, ctx());
+    const p = attr(g, 'position'), c = attr(g, 'color');
+    let maxX = 0, top = -Infinity, bottom = Infinity;
+    for (let i = 0; i < p.length; i += 3) {
+      maxX = Math.max(maxX, Math.abs(p[i]));
+      top = Math.max(top, p[i + 1]);
+      bottom = Math.min(bottom, p[i + 1]);
+    }
+    let hands = 0, handsBlue = 0, crown = 0, crownBlue = 0;
+    for (let i = 0; i < p.length; i += 3) {
+      if (Math.abs(p[i]) > 0.85 * maxX) {
+        hands++;
+        if (isBlue(c, i)) handsBlue++;
+      }
+      if (p[i + 1] > top - 0.08 * (top - bottom)) {
+        crown++;
+        if (isBlue(c, i)) crownBlue++;
+      }
+    }
+    expect(hands).toBeGreaterThan(200);
+    expect(crown).toBeGreaterThan(200);
+    return { hands: handsBlue / hands, crown: crownBlue / crown };
+  }
+
+  it('keeps the hands skin-coloured with left / right views (arms seen end-on in front of the torso)', async () => {
+    // Before: ≈ 39 % of the hand vertices took the shirt blue behind them in the side views.
+    expect((await blueShares(renderCharacterViews(V4))).hands).toBeLessThan(0.05);
+    const thicker = renderCharacterViews(V4, {
+      perturb: { left: { proportions: { armRadius: 0.04, armHeight: 0.01 } }, right: { proportions: { armRadius: 0.04, armHeight: -0.01 } } },
+    });
+    expect((await blueShares(thicker)).hands).toBeLessThan(0.05);
+  }, 60000);
+
+  it('keeps the crown free of the shoulders a top view shows around the head, on hand-made sets too', async () => {
+    // Before: front + back + top ≈ 19 % of the crown blue; five independent views ≈ 22 % hands, 6 % crown.
+    const fbt = await blueShares(renderCharacterViews(['front', 'back', 'top']));
+    expect(fbt.crown).toBeLessThan(0.02);
+    const artists = await blueShares(independentArtistViews([...V4, 'top'], 7));
+    expect(artists.hands).toBeLessThan(0.02);
+    expect(artists.crown).toBeLessThan(0.02);
+  }, 60000);
+});
+
+describe('colour across views that disagree (exposure, photo-consistency)', () => {
+  const V4: ViewId[] = ['front', 'back', 'left', 'right'];
+  const lin = (c: readonly number[]) => c.map((v) => SRGB_TO_LINEAR[v]);
+  const SKIN = [lin(CHARACTER_COLORS.arm), lin(CHARACTER_COLORS.hand)];
+  const BLUE = lin(CHARACTER_COLORS.torso);
+  const near = (c: Float32Array, i: number, refs: number[][], tol = 0.08) => refs.some((r) => Math.hypot(c[i] - r[0], c[i + 1] - r[1], c[i + 2] - r[2]) < tol);
+  /** Shares of the arm + hand vertices (|x| > 0.4 of the span) in the front's skin colours and of the mid-torso ones in its shirt blue. */
+  async function shares(set: CharacterViews) {
+    const { geometry: g } = await reconstructFromViews(set.inputs, {}, ctx());
+    const p = attr(g, 'position'), c = attr(g, 'color');
+    const { min, max } = bounds(g);
+    const maxX = Math.max(-min[0], max[0]), H = max[1] - min[1];
+    let arm = 0, armOk = 0, torso = 0, torsoOk = 0;
+    for (let i = 0; i < p.length; i += 3) {
+      const x = Math.abs(p[i]), y = (p[i + 1] - min[1]) / H;
+      if (x > 0.4 * maxX) {
+        arm++;
+        if (near(c, i, SKIN)) armOk++;
+      } else if (x < 0.12 * maxX && y > 0.5 && y < 0.7) {
+        torso++;
+        if (near(c, i, [BLUE])) torsoOk++;
+      }
+    }
+    expect(arm).toBeGreaterThan(300);
+    return { arm: armOk / arm, torso: torsoOk / torso };
+  }
+
+  it('matches every view\'s exposure / white balance to the front (independent artists, ±15 % per channel)', async () => {
+    // Before: 40–57 % of the arm vertices and ≈ 50 % of the torso (its back half) off the front's colours.
+    for (const seed of [1, 2, 3, 4, 5]) {
+      const r = await shares(independentArtistViews(V4, seed, { size: 512, tint: 0.15 }));
+      expect(r.arm).toBeGreaterThanOrEqual(0.95);
+    }
+    const top = await shares(independentArtistViews([...V4, 'top'], 3, { size: 512, tint: 0.15 }));
+    expect(top.arm).toBeGreaterThanOrEqual(0.95);
+    expect(top.torso).toBeGreaterThanOrEqual(0.95);
+  }, 120000);
+
+  it('leaves consistent and untinted hand-made sets as they were', async () => {
+    const c = await shares(renderCharacterViews(V4, { size: 512 }));
+    expect(c.arm).toBeGreaterThanOrEqual(0.98);
+    expect(c.torso).toBe(1);
+    for (const seed of [1, 4]) {
+      const r = await shares(independentArtistViews(V4, seed, { size: 512 }));
+      expect(r.arm).toBeGreaterThanOrEqual(0.98);
+      expect(r.torso).toBe(1);
+    }
+  }, 60000);
+
+  it('drops a view\'s colour where the better-supported views contradict it, and keeps it where only it sees', async () => {
+    // A grey sphere from all six sides, but the top view is painted red all over.
+    const grey: [number, number, number] = [150, 150, 150];
+    const { inputs, renders } = renderViews([sphere([0, 0, 0], 1)], ALL, { width: 160, height: 160, scale: 60, color: (_q, v) => (v === 'top' ? [220, 30, 30] : grey) });
+    const redness = async () => {
+      const { geometry: g } = await reconstructFromViews(inputs, { resolution: 64 }, ctx({ estimateDepth: fakeDepthEstimator(renders) }));
+      const n = attr(g, 'normal'), c = attr(g, 'color');
+      let diag = 0, diagRed = 0, pole = 0, poleRed = 0;
+      for (let i = 0; i < n.length; i += 3) {
+        const red = c[i] > 2 * c[i + 1];
+        // The upper corners, where two grey views (front / back and a side) see the surface as well as the red top.
+        if (n[i + 1] > 0.45 && Math.abs(n[i]) > 0.45 && Math.abs(n[i + 2]) > 0.45) {
+          diag++;
+          if (red) diagRed++;
+        }
+        if (n[i + 1] > 0.95) {
+          pole++;
+          if (red) poleRed++;
+        }
+      }
+      return { diag: diagRed / diag, pole: poleRed / pole };
+    };
+    // Before: ≈ 47 % of those corners red (the views blended); now the two grey views outvote the top.
+    const r = await redness();
+    expect(r.diag).toBeLessThan(0.05);
+    // Where only the top sees the surface, its colour stands.
+    expect(r.pole).toBeGreaterThan(0.9);
+  }, 30000);
+});
+
+describe('warnings for views in the wrong slot', () => {
+  const V4: ViewId[] = ['front', 'back', 'left', 'right'];
+  const set = renderCharacterViews(V4, { size: 256, withMask: true });
+  const byId = (id: ViewId) => set.inputs.find((i) => i.id === id)!;
+  const codesOf = (r: Awaited<ReturnType<typeof reconstructFromViews>>, id: ViewId) => r.info.report.views.find((v) => v.id === id)!.notes.map((n) => n.code);
+
+  it('names a poor view and what to do about it (a side view placed far off by hand)', async () => {
+    const off = { ...byId('left'), align: { mode: 'manual' as const, dx: 0, dy: 0.2, scale: 1, flipX: false, trust: 'full' as const } };
+    const r = await reconstructFromViews([byId('front'), byId('back'), off, byId('right')], { resolution: 64 }, ctx());
+    const left = r.info.alignment.find((a) => a.id === 'left')!;
+    expect(left.level).toBe('poor');
+    expect(r.info.warnings).toContainEqual(viewWarning(FUSION_TEXT.viewPoor, 'left', { score: String(left.score) }));
+    expect(r.info.warnings.find((w) => w.tr.startsWith('Sol'))!.tr).toMatch(new RegExp(`%${left.score}.*Hizala`));
+    expect(codesOf(r, 'left')[0]).toBe('poor');
+    // Consistent views get neither.
+    const ok = await reconstructFromViews(set.inputs, { resolution: 64 }, ctx());
+    expect(ok.info.warnings).toEqual([]);
+    expect(ok.info.report.views.every((v) => !v.notes.some((n) => n.code === 'poor'))).toBe(true);
+  }, 30000);
+
+  it('says why a side view in the top slot is poor: its proportions, and the same image as the left', async () => {
+    const r = await reconstructFromViews([...set.inputs, { ...byId('left'), id: 'top' }], { resolution: 64 }, ctx());
+    const top = r.info.alignment.find((a) => a.id === 'top')!;
+    expect(top.level).toBe('poor');
+    expect(top.trust).toBe('color');
+    expect(codesOf(r, 'top').slice(0, 2).sort()).toEqual(['extent', 'sameImage']);
+    const en = r.info.warnings.map((w) => w.en);
+    expect(en).toContain(viewWarning(FUSION_TEXT.viewSameImage, 'top').en);
+    expect(en).toContain(viewWarning(FUSION_TEXT.viewExtent, 'top').en);
+    // Specific warnings replace the generic one, and the colour-only line.
+    expect(en).not.toContain(viewWarning(FUSION_TEXT.viewPoor, 'top', { score: String(top.score) }).en);
+    expect(en).not.toContain(viewWarning(FUSION_TEXT.viewColorOnly, 'top').en);
+    // The left view it copies is untouched.
+    expect(r.info.alignment.find((a) => a.id === 'left')!.level).toBe('good');
+  }, 30000);
+
+  it('warns about a front/back image in a side slot, a side view facing the wrong way and a duplicated front', async () => {
+    const back = byId('back'), front = byId('front');
+    const r = await reconstructFromViews([front, { ...front, id: 'back' }, { ...back, id: 'left' }, { ...byId('left'), id: 'right' }], { resolution: 64 }, ctx());
+    const en = r.info.warnings.map((w) => w.en);
+    expect(en).toContain(viewWarning(FUSION_TEXT.viewWrongSlot, 'left').en);
+    expect(en).toContain(viewWarning(FUSION_TEXT.viewFacing, 'right').en);
+    expect(en).toContain(viewWarning(FUSION_TEXT.viewDuplicate, 'back').en);
+    expect(en).not.toContain(viewWarning(FUSION_TEXT.viewColorOnly, 'left').en); // the wrong-slot line says so
+    expect(r.info.trust.left).toBe('color');
+    expect(codesOf(r, 'left')[0]).toBe('wrongSlot');
   }, 30000);
 });

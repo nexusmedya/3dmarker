@@ -11,11 +11,17 @@
  *  3. Optional depth refinement: each view's monocular depth carves in front
  *     of its estimated surface (./depthCarve.ts, anchored calibration, never
  *     below the guard); falls back to the hull (with a warning) when the
- *     depth model is unavailable.
+ *     depth model is unavailable, rounding the thin parts no profile view
+ *     measures (GuardField.capHidden: T-pose arms seen end-on by the sides).
  *  4. Gaussian-smoothed occupancy → marching cubes (./marchingCubes.ts) →
  *     Taubin smoothing → normals (./meshOps.ts); the voxel step grows when the
  *     triangle cap would be exceeded.
- *  5. Vertex colours from the views, visibility-aware (./color.ts).
+ *  5. Vertex colours from the views (./color.ts): visibility from depth buffers
+ *     of the smoothed mesh itself, colours eroded away from silhouette and
+ *     occlusion edges, per-view exposure matched to the front, samples the
+ *     better-supported views contradict dropped (photo-consistency), seams
+ *     feathered; on thin parts the front / back colour wins where a side / cap
+ *     view sees behind.
  *  6. Rescale: longest side 2, centred. `info.report` (also
  *     geometry.userData.fusion) tells per view how it was placed and trusted.
  */
@@ -24,7 +30,7 @@ import type { I18nText, Mask, Progress, RGBAImage, ViewId, ViewTrust } from '../
 import { throwIfAborted } from '../types';
 import { LocalizedError } from '../errors';
 import { yieldToPaint } from '../yield';
-import { registerViews } from './align';
+import { alignNote, registerViewsSteps } from './align';
 import {
   constrainsDepth,
   estimateObjectBox,
@@ -34,11 +40,11 @@ import {
   type PreparedView,
 } from './frame';
 import { applyCarve, carveTargets, silhouetteDepth, type ViewDepth } from './depthCarve';
-import { colorSource, colorVerticesSteps } from './color';
+import { colorSourceSteps, colorVerticesSteps } from './color';
 import { buildGuardSteps, GUARD_FILL, type GuardField } from './guard';
 import { marchingCubesSteps, type IsoMesh } from './marchingCubes';
 import { buildAdjacency, fitToFrame, taubinSmoothSteps, vertexNormals } from './meshOps';
-import { macrotask, runSliced, type Steps } from './steps';
+import { drain, macrotask, runSliced, type Steps } from './steps';
 import { buildHullPlanesSteps, countSurfaceCellsSteps, createGrid, dilationRadius, downsampleSteps, gaussianBlur3DSteps, type Grid } from './volume';
 import {
   DEFAULT_FUSION_OPTIONS,
@@ -76,6 +82,10 @@ export const FUSION_TEXT = {
     tr: 'Derinlik modeli kullanılamadı; yalnız siluetler kullanılıyor',
     en: 'Depth model unavailable; using the silhouettes only',
   },
+  depthOffline: {
+    tr: 'Derinlik modeli indirilemedi (bağlantı yok); model yalnız siluetlerden oluşturuldu. Bağlantı gelince yeniden oluşturarak derinlikle iyileştirebilirsiniz.',
+    en: 'The depth model could not be downloaded (no connection); the model was built from the silhouettes only. Rebuild once you are online to refine it with depth.',
+  },
   noFront: {
     tr: 'Ön görünümde nesne bulunamadı. Saydam arka planlı ya da düz renk arka planlı bir görsel kullanın.',
     en: 'No subject found in the front view. Use an image with a transparent or plain single-colour background.',
@@ -90,7 +100,7 @@ export const FUSION_TEXT = {
   },
   // Per-view registration warnings; {view} = FUSION_VIEW_NAMES[id] (see viewWarning).
   viewCropped: {
-    tr: 'Özne {view} görünümünde kenarda kesik; eksik kısım diğer görünümlerden tamamlanıyor',
+    tr: '{view} görünümünde figür kenarda kesik; eksik kısım diğer görünümlerden tamamlanıyor',
     en: 'The subject is cut off at the edge of the {view} view; the missing part is filled from the other views',
   },
   viewStretched: {
@@ -107,12 +117,57 @@ export const FUSION_TEXT = {
     en: 'The {view} view does not quite match the front; thin parts were protected',
   },
   viewMirrored: { tr: '{view} görünümü aynalanmış görünüyor', en: 'The {view} view looks mirrored' },
+  viewWrongSlot: {
+    tr: '{view} görünümü bir ön/arka görsel gibi görünüyor; yanlış yuvaya yüklenmiş olabilir. Yalnız renk için kullanıldı',
+    en: 'The {view} view looks like a front/back image; it may be in the wrong slot. It was used for colour only',
+  },
+  viewFacing: {
+    tr: '{view} görünümü ters yöne bakıyor olabilir; "Yatay aynala"yı deneyin',
+    en: 'The {view} view may face the wrong way; try "Flip horizontally"',
+  },
+  viewDuplicate: {
+    tr: '{view} görünümü ön görselle aynı görünüyor; yüz ve ön renkler arkaya geçmiş olabilir',
+    en: 'The {view} view looks identical to the front; the face and front colours may appear on the back',
+  },
+  viewSameImage: {
+    tr: '{view} görünümü başka bir yuvadaki görselle aynı; görsel yanlışlıkla bu yuvaya yüklenmiş olabilir. Bu yönden çekilmiş görseli yükleyin ya da güveni "Yalnız renk"/"Kapalı" yapın',
+    en: 'The {view} view is the same image as another slot\'s; it may have been uploaded here by mistake. Upload the image taken from this side or set its trust to "Colour only"/"Off"',
+  },
+  viewExtent: {
+    tr: '{view} görünümünün boyutları bu yuvaya ya da diğer görünümlere uymuyor (üst/alt görsel yan yuvada ya da tersi olabilir); yalnız renk için kullanıldı. Doğru yuvaya yükleyin ya da güveni "Kapalı" yapın',
+    en: 'The proportions of the {view} view do not fit its slot or the other views (a top/bottom image in a side slot, or the other way round?); it was used for colour only. Upload it into the right slot or set its trust to "Off"',
+  },
+  viewFeatureless: {
+    tr: '{view} görünümünde ayırt edici ayrıntı yok (düz bir leke ya da siluet); ön görünümle eşleştirilemez. Doğru görseli yükleyin ya da güveni "Yalnız renk"/"Kapalı" yapın',
+    en: 'The {view} view has no distinguishing detail (a plain blob or silhouette); it cannot be matched to the front. Upload the right image or set its trust to "Colour only"/"Off"',
+  },
+  viewPoor: {
+    tr: '{view} görünümü ön görünümle uyuşmuyor (%{score}); yanlış yuvaya yüklenmiş olabilir. Hizala panelinden düzeltin ya da güveni "Yalnız renk"/"Kapalı" yapın',
+    en: 'The {view} view does not match the front ({score} %); it may be in the wrong slot. Fix it in the Align panel or set its trust to "Colour only"/"Off"',
+  },
 } satisfies Record<string, I18nText>;
 
-/** A per-view warning with the view's name filled in. */
-export function viewWarning(text: I18nText, id: ViewId): I18nText {
+/** A per-view warning with the view's name (and any other {key}) filled in. */
+export function viewWarning(text: I18nText, id: ViewId, vars: Record<string, string> = {}): I18nText {
   const name = FUSION_VIEW_NAMES[id];
-  return { tr: text.tr.replace('{view}', name.tr), en: text.en.replace('{view}', name.en) };
+  const sub = (t: string, view: string, lang: string) => {
+    const out = t.replace(/\{(\w+)\}/g, (m, k: string) => (k === 'view' ? view : vars[k] ?? m));
+    // A sentence may start with the (lower-case) view name.
+    return out.charAt(0).toLocaleUpperCase(lang) + out.slice(1);
+  };
+  return { tr: sub(text.tr, name.tr, 'tr'), en: sub(text.en, name.en, 'en') };
+}
+
+/**
+ * The depth model could not be downloaded (a network failure): the fusion
+ * says so in its own words (the drivers' generic advice to switch to an
+ * offline driver would throw the views away). Thrown by depth estimators.
+ */
+export class DepthOfflineError extends LocalizedError {
+  constructor() {
+    super(FUSION_TEXT.depthOffline);
+    this.name = 'DepthOfflineError';
+  }
 }
 
 const clamp = (v: number, lo: number, hi: number) => (Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : lo);
@@ -211,9 +266,15 @@ function* extractCapped(field: Float32Array, grid: Grid, maxTriangles: number): 
  * views (see testing.ts reconstructWithField).
  */
 export function prepareFusionViews(inputs: FusionViewInput[], o: Pick<FusionOptions, 'align'>): { views: PreparedView[]; alignments: ViewAlignment[] } {
+  return drain(prepareFusionViewsSteps(inputs, o));
+}
+
+/** prepareFusionViews as cooperative steps (a yield after every view's preparation and registration). */
+export function* prepareFusionViewsSteps(inputs: FusionViewInput[], o: Pick<FusionOptions, 'align'>): Steps<{ views: PreparedView[]; alignments: ViewAlignment[] }> {
   const front = inputs.find((v) => v.id === 'front');
   const frontView = front ? prepareView(front) : null;
   if (!frontView) throw new LocalizedError(FUSION_TEXT.noFront);
+  yield;
   const views: PreparedView[] = [frontView];
   const seen = new Set<ViewId>(['front']);
   for (const input of inputs) {
@@ -221,20 +282,37 @@ export function prepareFusionViews(inputs: FusionViewInput[], o: Pick<FusionOpti
     seen.add(input.id);
     const v = prepareView(input);
     if (v) views.push(v);
+    yield;
   }
-  const alignments = registerViews(views, { mode: o.align });
+  const alignments = yield* registerViewsSteps(views, { mode: o.align });
   return { views, alignments };
+}
+
+/** Slot notes that explain a poor score themselves (each has its own warning). */
+const EXPLAINED: readonly AlignNote['code'][] = ['wrongSlot', 'sameImage', 'extent', 'featureless'];
+
+/** A view that scores poor for no reason another warning already names (see registrationWarnings). */
+function unexplainedPoor(a: ViewAlignment): boolean {
+  return a.level === 'poor' && a.status !== 'weak' && a.trust !== 'color' && !a.notes.some((n) => EXPLAINED.includes(n.code));
 }
 
 /** Registration warnings of a view, in note order (one per code). */
 function registrationWarnings(a: ViewAlignment): I18nText[] {
   const out: I18nText[] = [];
   const codes = new Set(a.notes.map((n) => n.code));
+  if (codes.has('sameImage')) out.push(viewWarning(FUSION_TEXT.viewSameImage, a.id));
+  if (codes.has('wrongSlot')) out.push(viewWarning(FUSION_TEXT.viewWrongSlot, a.id));
+  if (codes.has('extent')) out.push(viewWarning(FUSION_TEXT.viewExtent, a.id));
+  if (codes.has('featureless')) out.push(viewWarning(FUSION_TEXT.viewFeatureless, a.id));
+  if (codes.has('facing')) out.push(viewWarning(FUSION_TEXT.viewFacing, a.id));
+  if (codes.has('duplicate')) out.push(viewWarning(FUSION_TEXT.viewDuplicate, a.id));
+  if (unexplainedPoor(a)) out.push(viewWarning(FUSION_TEXT.viewPoor, a.id, { score: String(a.score) }));
   if (codes.has('cropped')) out.push(viewWarning(FUSION_TEXT.viewCropped, a.id));
   if (a.status === 'stretched') out.push(viewWarning(FUSION_TEXT.viewStretched, a.id));
   if (a.status === 'weak') out.push(viewWarning(FUSION_TEXT.viewWeak, a.id));
   if (codes.has('mirrored')) out.push(viewWarning(FUSION_TEXT.viewMirrored, a.id));
-  if (a.trust === 'color') out.push(viewWarning(FUSION_TEXT.viewColorOnly, a.id));
+  // A wrong-slot / same-image / extent view says why it is colour-only itself.
+  if (a.trust === 'color' && !codes.has('wrongSlot') && !codes.has('sameImage') && !codes.has('extent')) out.push(viewWarning(FUSION_TEXT.viewColorOnly, a.id));
   return out;
 }
 
@@ -246,12 +324,12 @@ export async function reconstructFromViews(
   const o = sanitizeFusionOptions(options);
   const { signal } = ctx;
   const pause = ctx.yieldControl ?? yieldToPaint;
+  // Warnings reach the user through the report (info.report) after the run; progress labels stay plain
+  // (a warning appended to every stage label pushed the stage itself out of sight).
   const warnings: I18nText[] = [];
-  // Once something went wrong, every later label carries the first warning (the progress line is the only channel).
-  const label = (l: I18nText): I18nText => (warnings.length ? joinLabel(l, warnings[0], ' — ') : l);
   const stage = async (l: I18nText, ratio: number) => {
     throwIfAborted(signal);
-    ctx.onProgress({ label: label(l), ratio });
+    ctx.onProgress({ label: l, ratio });
     await pause();
     throwIfAborted(signal);
   };
@@ -267,7 +345,7 @@ export async function reconstructFromViews(
 
   // 1. Normalisation and registration.
   await stage(FUSION_TEXT.prepare, 0.02);
-  const { views, alignments } = prepareFusionViews(inputs, o);
+  const { views, alignments } = await sliced(prepareFusionViewsSteps(inputs, o));
   await between();
   if (views.length < 2) throw new LocalizedError(FUSION_TEXT.needViews);
   const shapeViews = views.filter((v) => v.trust === 'full');
@@ -308,7 +386,7 @@ export async function reconstructFromViews(
           {
             signal,
             onProgress: (p: Progress) => ctx.onProgress({
-              label: label(joinLabel(head, p.label)),
+              label: joinLabel(head, p.label),
               ratio: r0 + (0.5 / candidates.length) * (p.ratio ?? 0),
             }),
           },
@@ -318,11 +396,16 @@ export async function reconstructFromViews(
         depthFrom[view.id] = 'model';
       } catch (e) {
         if (isAbort(e) || signal.aborted) throw e;
-        // Download / backend failures repeat for every view: stop asking.
-        warnings.unshift(FUSION_TEXT.depthUnavailable);
-        if (e instanceof LocalizedError) warnings.splice(1, 0, e.i18n);
-        else if (e instanceof Error && e.message) warnings.splice(1, 0, { tr: e.message, en: e.message });
-        ctx.onProgress({ label: label(head), ratio: r0 });
+        // Download / backend failures repeat for every view: stop asking. Offline: one line of our own.
+        // Other failures: the reason when it is localised (a missing model file, no Web Worker); a raw
+        // error is for the console only.
+        if (e instanceof DepthOfflineError) warnings.unshift(FUSION_TEXT.depthOffline);
+        else {
+          warnings.unshift(FUSION_TEXT.depthUnavailable);
+          if (e instanceof LocalizedError) warnings.splice(1, 0, e.i18n);
+          else console.warn('fusion: depth estimation failed', e);
+        }
+        ctx.onProgress({ label: joinLabel(head, warnings[0], ' — '), ratio: r0 });
         break;
       }
     }
@@ -337,6 +420,9 @@ export async function reconstructFromViews(
     }
   }
   for (const v of views) depthFrom[v.id] ??= 'none';
+  // No depth map at all (refinement off, or the model could not be loaded): round the thin parts whose
+  // depth the profile views read off a bigger part behind them (T-pose arms would keep the chest's depth).
+  if (depths.size === 0 && guard) guard.capHidden(field);
 
   const consistency: Partial<Record<ViewId, number>> = {};
   const inconsistent = new Set<ViewId>();
@@ -398,12 +484,16 @@ export async function reconstructFromViews(
   await stage(FUSION_TEXT.color, 0.9);
   const sources = [];
   for (const v of colorViews) {
-    sources.push(colorSource(v, viewProjection(v, box.size), ext.field, ext.grid));
+    sources.push(await sliced(colorSourceSteps(v, viewProjection(v, box.size), null, ext.grid)));
     await between();
   }
   const colors = await sliced(colorVerticesSteps(positions, normals, adj, sources, ext.grid, {
     sharpness: o.colorSharpness,
     tolerance: 2.5 * ext.grid.spacing,
+    // Visibility from the smoothed mesh's own depth buffers (not the voxel field it was extracted from).
+    indices,
+    // Thin parts take the front / back colour where the side / cap views see what lies behind them.
+    thin: guard ? { support: (p, axis) => guard!.colorSupport(p, axis), gate: (p) => guard!.gateAt(p) } : undefined,
   }));
 
   // 6. Shared frame and the report.
@@ -414,6 +504,8 @@ export async function reconstructFromViews(
   const reportViews: ViewReport[] = alignments.map((a) => {
     const notes: AlignNote[] = a.notes.slice();
     if (inconsistent.has(a.id)) notes.push({ code: 'inconsistent', text: { tr: 'Ön görünümle tam örtüşmüyor; ince parçalar korundu', en: 'Does not quite match the front; thin parts were protected' } });
+    // The chip's explanation (its title) for a poor view: the first note.
+    if (unexplainedPoor(a)) notes.unshift(alignNote('poor'));
     return {
       id: a.id,
       trust: a.trust,

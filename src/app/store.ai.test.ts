@@ -95,7 +95,7 @@ function check(id: ViewAlignment['id'], score = 90, over: Partial<ViewAlignment>
     cut: { top: false, bottom: false, left: false, right: false },
     fitBox: { x0: 0, y0: 0, x1: 2, y1: 2 },
     trust: 'full',
-    notes: [{ code: 'aligned', text: { tr: 'Önle hizalı', en: 'Aligned with the front' } }],
+    notes: [{ code: 'aligned', text: { tr: 'Ön görünümle hizalı', en: 'Aligned with the front' } }],
     guides: { rows: [], cols: [] },
   };
 }
@@ -278,6 +278,42 @@ describe('AI job, prepared image and views', () => {
     expect(s.original).toBeNull();
     expect(s.maskNote).toBe('no-alpha');
     expect(reducer(s, { type: 'revertOriginal', mask: null, maskNote: null })).toBe(s);
+  });
+
+  it('revert keeps an undo slot: the AI image and its AI views come back', () => {
+    const original = src();
+    const prepared = src('cat-ai.png');
+    let s = reducer(loaded(init(), original), { type: 'prepReady', prepared, options: { ...DEFAULT_PREP_OPTIONS } });
+    s = reducer(s, { type: 'prepAccept', mask: null, maskNote: null });
+    const aiBack = view('cat-ai-back.png', 'ai');
+    s = reducer(s, { type: 'viewSet', view: 'back', entry: aiBack });
+    s = reducer(s, { type: 'viewSet', view: 'left', entry: view('left.png') });
+    const frontPrep = s.frontPrep;
+
+    s = reducer(s, { type: 'revertOriginal', mask: null, maskNote: null });
+    expect(s.source).toBe(original);
+    expect(presentViews(s.views)).toEqual(['left']);
+    expect(s.revertedAi?.source).toBe(prepared);
+    // A view uploaded after the revert keeps its slot on restore.
+    const upRight = view('right.png');
+    s = reducer(s, { type: 'viewSet', view: 'right', entry: upRight });
+
+    const m = mask();
+    s = reducer(s, { type: 'restorePrepared', mask: m, maskNote: null });
+    expect(s.source).toBe(prepared);
+    expect(s.original).toBe(original);
+    expect(s.frontPrep).toBe(frontPrep);
+    expect(s.mask).toBe(m);
+    expect(s.views.back).toBe(aiBack);
+    expect(s.views.right).toBe(upRight);
+    expect(presentViews(s.views)).toEqual(['back', 'left', 'right']);
+    expect(s.revertedAi).toBeNull();
+    expect(reducer(s, { type: 'restorePrepared', mask: null, maskNote: null })).toBe(s);
+
+    // A new image drops the undo slot.
+    s = reducer(s, { type: 'revertOriginal', mask: null, maskNote: null });
+    s = loaded(s, src('other.png'));
+    expect(s.revertedAi).toBeNull();
   });
 
   it('discarding the prepared image keeps the source', () => {

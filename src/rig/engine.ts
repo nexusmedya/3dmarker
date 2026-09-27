@@ -3,7 +3,7 @@
  * lazily (three-mesh-bvh, the clip library and the loaders stay out of the
  * main chunk until the user rigs a model).
  */
-export { autoPlaceJoints, autoPlaceJointsDetailed, type AutoJointResult, type JointMethod } from './autoJoints';
+export { autoPlaceJoints, autoPlaceJointsDetailed, clampToSilhouette, type AutoJointResult, type JointMethod, type PlausibilityIssue, type Silhouette } from './autoJoints';
 export { buildLibrary, CLIP_DEFS } from './animations';
 export { collectMeshData, type MeshData } from './meshData';
 export { hasSkinnedMeshes, jointWorldPosition, rigModel, type RigHandle, type RigViewer } from './rig';

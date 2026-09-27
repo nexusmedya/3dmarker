@@ -9,11 +9,18 @@
  * backend/wasm init: after one ORT failure every later job in that worker
  * fails the same way. So a worker that reported an error is replaced, and a
  * WebGPU failure is retried on WASM in a fresh worker.
+ *
+ * Model downloads have a stall timeout inside the worker (mlTasks.ts); as a
+ * backstop the client also gives up on a job that stays silent in its
+ * load/download stage, and remembers stalled models for a few minutes so
+ * repeat runs (e.g. the fusion's depth pass) fail fast instead of waiting again.
  */
 import { AbortError } from '../../core/types';
 import { localizeMlError } from './errors';
 import {
+  DEFAULT_STALL_TIMEOUT_MS,
   deserializeError,
+  MODEL_STALLED_ERROR,
   WEBGPU_FAILED_ERROR,
   type AlphaPayload,
   type BackgroundRemovalJob,
@@ -51,12 +58,24 @@ interface Pending {
   onProgress?: (p: MlProgress) => void;
   /** The worker running the request. */
   worker: WorkerLike;
+  model: string;
+  /** Backstop timer while the job is in its load/download stage. */
+  watchdog?: ReturnType<typeof setTimeout>;
   stage?: MlStage;
   device?: MlDevice;
   /** device 'auto' jobs: the same job on WASM with its own copy of the pixels (the posted ones are transferred). */
   wasmRetry?: MlJob;
   /** Model id, set while the job re-runs on WASM after WebGPU failed. */
   wasmFallback?: string;
+}
+
+/** How long a stalled model is failed fast (like the MediaPipe loader's failure memory). */
+export const STALL_MEMORY_MS = 5 * 60_000;
+
+function stalledError(model: string, detail: string): Error {
+  const err = new Error(`${detail} (${model})`);
+  err.name = MODEL_STALLED_ERROR;
+  return err;
 }
 
 export class MlWorkerClient {
@@ -67,6 +86,8 @@ export class MlWorkerClient {
   private nextId = 1;
   /** Models whose WebGPU path failed while WASM worked: later 'auto' jobs go straight to WASM. */
   private wasmOnly = new Set<string>();
+  /** Model → Date.now() of its last stalled download. */
+  private stalledAt = new Map<string, number>();
 
   constructor(
     private readonly factory: () => WorkerLike,
@@ -82,6 +103,13 @@ export class MlWorkerClient {
    */
   run(input: MlJobInput, { signal, onProgress }: MlRequestOptions = {}): Promise<MlResult> {
     if (signal?.aborted) return Promise.reject(new AbortError());
+    const stalled = this.stalledAt.get(input.model);
+    if (stalled !== undefined) {
+      if (Date.now() - stalled < STALL_MEMORY_MS) {
+        return Promise.reject(stalledError(input.model, 'The download stopped responding moments ago'));
+      }
+      this.stalledAt.delete(input.model);
+    }
     const job: MlJobInput = input.device === 'auto' && this.wasmOnly.has(input.model) ? { ...input, device: 'wasm' } : input;
     let worker: WorkerLike;
     try {
@@ -92,12 +120,16 @@ export class MlWorkerClient {
     const id = this.nextId++;
     return new Promise<MlResult>((resolve, reject) => {
       const onAbort = () => this.abort(id);
-      const cleanup = () => signal?.removeEventListener('abort', onAbort);
+      const cleanup = () => {
+        clearTimeout(p.watchdog);
+        signal?.removeEventListener('abort', onAbort);
+      };
       const p: Pending = {
         resolve: (r) => { cleanup(); resolve(r); },
         reject: (e) => { cleanup(); reject(e); },
         onProgress,
         worker,
+        model: job.model,
       };
       this.pending.set(id, p);
       signal?.addEventListener('abort', onAbort, { once: true });
@@ -158,6 +190,7 @@ export class MlWorkerClient {
       if (p) {
         p.stage = msg.stage;
         if (msg.device) p.device = msg.device;
+        this.armWatchdog(msg.id, p);
         if (msg.device === 'wasm') p.wasmRetry = undefined; // past WebGPU: free the pixel copy
         p.onProgress?.(msg);
       }
@@ -176,11 +209,31 @@ export class MlWorkerClient {
           if (p.wasmFallback) this.wasmOnly.add(p.wasmFallback);
           p.resolve(msg.result);
         } else {
+          if (msg.error.name === MODEL_STALLED_ERROR) this.stalledAt.set(p.model, Date.now());
           p.reject(deserializeError(msg.error));
         }
       }
     }
     this.reap(w);
+  }
+
+  /**
+   * Silence in the load/download stage for twice the worker's stall timeout
+   * (it misses stalls outside env.fetch, e.g. a hung ORT runtime import): kill
+   * the worker and fail its jobs. Inference can legitimately be long and silent.
+   */
+  private armWatchdog(id: number, p: Pending): void {
+    clearTimeout(p.watchdog);
+    p.watchdog = undefined;
+    const stallMs = this.config.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
+    if (!(stallMs > 0) || (p.stage !== 'load' && p.stage !== 'download')) return;
+    p.watchdog = setTimeout(() => {
+      if (this.pending.get(id) !== p) return;
+      this.stalledAt.set(p.model, Date.now());
+      const w = p.worker;
+      this.kill(w);
+      this.fail(stalledError(p.model, `The ML worker sent nothing for ${Math.round((2 * stallMs) / 1000)} s while loading the model`), w);
+    }, 2 * stallMs);
   }
 
   /** Re-run a job whose WebGPU attempt failed on WASM in a fresh worker (same id, callbacks and abort handling). */
@@ -190,6 +243,8 @@ export class MlWorkerClient {
     p.wasmFallback = job.model;
     p.stage = undefined;
     p.device = undefined;
+    clearTimeout(p.watchdog);
+    p.watchdog = undefined;
     try {
       p.worker = this.ensureWorker();
       p.worker.postMessage(job, [job.image.data.buffer as ArrayBuffer]);
@@ -250,7 +305,7 @@ export class MlWorkerClient {
   }
 }
 
-/** transformers.js env overrides from Vite env vars (VITE_MODEL_HOST, VITE_ORT_WASM_PREFIX). */
+/** transformers.js env overrides from Vite env vars (VITE_MODEL_HOST, VITE_ORT_WASM_PREFIX, VITE_MODEL_STALL_MS). */
 export function mlEnvConfigFrom(vars: Record<string, unknown>): MlEnvConfig {
   const str = (k: string) => (typeof vars[k] === 'string' && vars[k] ? (vars[k] as string) : undefined);
   const config: MlEnvConfig = {};
@@ -258,6 +313,8 @@ export function mlEnvConfigFrom(vars: Record<string, unknown>): MlEnvConfig {
   const wasm = str('VITE_ORT_WASM_PREFIX');
   if (host) config.remoteHost = host;
   if (wasm) config.wasmPrefix = wasm;
+  const stall = Number(str('VITE_MODEL_STALL_MS'));
+  if (Number.isFinite(stall) && stall >= 0 && str('VITE_MODEL_STALL_MS')) config.stallTimeoutMs = stall;
   return config;
 }
 
@@ -270,9 +327,11 @@ let client: MlWorkerClient | null = null;
 
 /** Lazy singleton; the worker starts on the first request. */
 export function getMlClient(): MlWorkerClient {
+  // Dev builds: tests may preset overrides (e.g. a short stall timeout) on window.__3dmarkerMlConfig.
+  const dev = import.meta.env?.DEV ? (globalThis as { __3dmarkerMlConfig?: MlEnvConfig }).__3dmarkerMlConfig : undefined;
   client ??= new MlWorkerClient(
     () => new Worker(new URL('../../workers/ml.worker.ts', import.meta.url), { type: 'module' }),
-    mlEnvConfigFrom(import.meta.env ?? {}),
+    { ...mlEnvConfigFrom(import.meta.env ?? {}), ...dev },
   );
   return client;
 }

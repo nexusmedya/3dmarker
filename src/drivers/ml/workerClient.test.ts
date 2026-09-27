@@ -1,7 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AbortError } from '../../core/types';
 import type { MlRequest, MlResponse } from '../../workers/mlProtocol';
-import { mlEnvConfigFrom, MlWorkerClient, type MlJobInput, type WorkerLike } from './workerClient';
+import { mlEnvConfigFrom, MlWorkerClient, STALL_MEMORY_MS, type MlJobInput, type WorkerLike } from './workerClient';
 
 class FakeWorker implements WorkerLike {
   sent: { msg: MlRequest; transfer?: Transferable[] }[] = [];
@@ -316,7 +316,79 @@ describe('MlWorkerClient recovery (ONNX Runtime keeps failures in module state)'
   });
 });
 
+describe('MlWorkerClient stalled downloads', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('kills a worker that stays silent while loading, rejects its jobs and fails fast for a while', async () => {
+    vi.useFakeTimers();
+    const { client, workers } = setup({ stallTimeoutMs: 1_000 });
+    const p = client.run(job()).catch((e: unknown) => e);
+    const queued = client.run({ ...job(), model: 'other/model' }).catch((e: unknown) => e);
+    workers[0].reply({ type: 'progress', id: 1, stage: 'download', device: 'wasm' });
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(workers[0].terminated).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(workers[0].terminated).toBe(true);
+    expect(((await p) as Error).name).toBe('ModelStalledError');
+    expect(((await queued) as Error).name).toBe('ModelStalledError'); // it would have waited behind the stuck load
+    expect(client.pendingCount).toBe(0);
+
+    // Remembered: the same model fails at once without a worker round trip…
+    const again = await client.run(job()).catch((e: unknown) => e);
+    expect((again as Error).name).toBe('ModelStalledError');
+    expect(workers).toHaveLength(1);
+    // …until the memory expires.
+    vi.setSystemTime(Date.now() + STALL_MEMORY_MS);
+    const later = client.run(job());
+    expect(workers).toHaveLength(2);
+    workers[1].reply(depthResult(3));
+    await expect(later).resolves.toMatchObject({ kind: 'depth' });
+  });
+
+  it('re-arms on every progress message and never times out inference', async () => {
+    vi.useFakeTimers();
+    const { client, workers } = setup({ stallTimeoutMs: 1_000 });
+    const p = client.run(job());
+    for (let i = 0; i < 5; i++) {
+      workers[0].reply({ type: 'progress', id: 1, stage: 'download', ratio: i / 5, device: 'wasm' });
+      await vi.advanceTimersByTimeAsync(1_500);
+    }
+    workers[0].reply({ type: 'progress', id: 1, stage: 'inference', device: 'wasm' });
+    await vi.advanceTimersByTimeAsync(60_000); // long WASM inference
+    expect(workers[0].terminated).toBe(false);
+    workers[0].reply(depthResult(1));
+    await expect(p).resolves.toMatchObject({ kind: 'depth' });
+  });
+
+  it("remembers a stall the worker reported and passes the worker's error on", async () => {
+    const { client, workers } = setup();
+    const p = client.run(job());
+    workers[0].reply({ type: 'progress', id: 1, stage: 'download', device: 'wasm' });
+    workers[0].reply({ type: 'error', id: 1, error: { name: 'ModelStalledError', message: 'No data from https://hf/x for 30 s' } });
+    await expect(p).rejects.toMatchObject({ name: 'ModelStalledError', message: 'No data from https://hf/x for 30 s' });
+    await expect(client.run(job())).rejects.toMatchObject({ name: 'ModelStalledError' });
+    expect(workers).toHaveLength(1);
+    client.terminate();
+  });
+
+  it('stallTimeoutMs 0 disables the watchdog', async () => {
+    vi.useFakeTimers();
+    const { client, workers } = setup({ stallTimeoutMs: 0 });
+    const p = client.run(job());
+    workers[0].reply({ type: 'progress', id: 1, stage: 'load', device: 'wasm' });
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(workers[0].terminated).toBe(false);
+    workers[0].reply(depthResult(1));
+    await expect(p).resolves.toMatchObject({ kind: 'depth' });
+  });
+});
+
 describe('mlEnvConfigFrom', () => {
+  it('reads VITE_MODEL_STALL_MS', () => {
+    expect(mlEnvConfigFrom({ VITE_MODEL_STALL_MS: '5000' })).toEqual({ stallTimeoutMs: 5000 });
+    expect(mlEnvConfigFrom({ VITE_MODEL_STALL_MS: 'x' })).toEqual({});
+  });
+
   it('reads Vite env vars and ignores empty values', () => {
     expect(mlEnvConfigFrom({ VITE_MODEL_HOST: 'https://m/', VITE_ORT_WASM_PREFIX: '/ort/' })).toEqual({
       remoteHost: 'https://m/',

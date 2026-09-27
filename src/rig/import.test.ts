@@ -7,7 +7,7 @@ import { exportObject } from '../core/export/exporters';
 import { buildLibrary } from './animations';
 import { autoPlaceJoints } from './autoJoints';
 import {
-  classifyBoneName, detectFormat, importAnimationFile, mapSkeleton, parseAnimationFile, retargetAnimation, splitSide, stripBoneName,
+  classifyBoneName, detectFormat, IMPORT_TEXT, importAnimationFile, mapSkeleton, parseAnimationFile, retargetAnimation, splitSide, stripBoneName,
 } from './import';
 import { rigModel } from './rig';
 import { buildSkeleton, describeRig } from './skeleton';
@@ -142,7 +142,7 @@ describe('bone name mapping', () => {
 });
 
 // Classic-named BVH, T-pose rest, arbitrary units (hips 50 above the toes).
-function classicBvh(frames: number[][]): string {
+function classicBvh(frames: number[][], { toes = true } = {}): string {
   const limb = (side: 'Left' | 'Right') => {
     const s = side === 'Left' ? 1 : -1;
     return `
@@ -186,7 +186,7 @@ function classicBvh(frames: number[][]): string {
       {
         OFFSET 0 -22 0
         CHANNELS 3 Zrotation Xrotation Yrotation
-        JOINT ${side}Toe
+        ${toes ? `JOINT ${side}Toe
         {
           OFFSET 0 -3 6
           CHANNELS 3 Zrotation Xrotation Yrotation
@@ -194,7 +194,10 @@ function classicBvh(frames: number[][]): string {
           {
             OFFSET 0 0 3
           }
-        }
+        }` : `End Site
+        {
+          OFFSET 0 -3 6
+        }`}
       }
     }
   }`;
@@ -305,6 +308,19 @@ describe('BVH import', () => {
     expect(inPlace.info.category).toBe('locomotion');
   });
 
+  it('a toe-less file (CMU / SecondLife) keeps the feet on the floor: floored at the ankle on both sides', async () => {
+    const hipsYAt0 = async (bvh: string) => {
+      const [imp] = await importAnimationFile(new Blob([bvh]), 'stand.bvh', rig);
+      return poseAt(layout, imp.clip, 0).sk.byName.get('Hips')!.position.y;
+    };
+    // Standing still, hips 50 above the toe tip (47 above the ankle); zero rotations → drop the 6 toe channels.
+    const withToes = await hipsYAt0(classicBvh([frame([0, 50, 0]), frame([0, 50, 0])]));
+    const toeless = await hipsYAt0(classicBvh([frame([0, 50, 0]).slice(0, -6), frame([0, 50, 0]).slice(0, -6)], { toes: false }));
+    expect(Math.abs(withToes - layout.Hips!.y)).toBeLessThan(0.01 * rig.legLength);
+    // Was one ankle-to-toe height (~6% of the leg) below the rest.
+    expect(Math.abs(toeless - layout.Hips!.y)).toBeLessThan(0.01 * rig.legLength);
+  });
+
   it('a feetless file whose rest skeleton stands at the origin keeps the hips at their rest height', async () => {
     // Legs end at the knee-less "Leg" joint (no foot → no floor); frames carry the standing height (44).
     const bvh = `HIERARCHY
@@ -375,6 +391,19 @@ Frame Time: 0.5
     await expect(parseAnimationFile(new Blob([text]), 'x.bvh', { maxMB: 0.0001 })).rejects.toMatchObject({ i18n: { en: expect.stringContaining('too large') } });
     const odd = text.replace(/Chest2|Chest|Neck|Head|Left|Right|Hips/g, (s) => `Q${s.length}x`);
     await expect(parseAnimationFile(new Blob([odd]), 'odd.bvh')).rejects.toMatchObject({ i18n: { en: expect.stringContaining('not recognised') } });
+  });
+
+  it('broken files get a plain bilingual message, not the loader\'s exception text', async () => {
+    const hierarchyOnly = text.slice(0, text.indexOf('MOTION'));
+    const garbageFbx = new Uint8Array([...new TextEncoder().encode('Kaydara FBX Binary  \0'), 0x1a, 0, 0xff, 0xff, 1, 2, 3]);
+    const cases: [Blob, string][] = [[new Blob(['garbage']), 'x.bvh'], [new Blob([hierarchyOnly]), 'cut.bvh'], [new Blob([garbageFbx]), 'x.fbx'], [new Blob(['{ "asset": 1']), 'x.gltf']];
+    for (const [blob, name] of cases) {
+      const err = await parseAnimationFile(blob, name).then(() => null, (e: unknown) => e);
+      expect(err, name).toBeInstanceOf(LocalizedError);
+      const i18n = (err as LocalizedError).i18n;
+      expect(i18n, name).toEqual(IMPORT_TEXT.parse);
+      expect(i18n.en).not.toMatch(/Cannot read|THREE\.|undefined/);
+    }
   });
 
   it('detects formats by extension or content', () => {

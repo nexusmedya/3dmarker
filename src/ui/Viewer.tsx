@@ -1,13 +1,22 @@
 /** React wrapper around ViewerCore: canvas host, toolbar and overlays. */
 import { useEffect, useRef, useState, type MutableRefObject, type ReactNode } from 'react';
 import type { Progress, RGBAImage } from '../core/types';
-import { ViewerCore } from '../app/viewer';
+import { VIEW_PRESETS, ViewerCore, type ViewPreset } from '../app/viewer';
+import type { UIKey } from '../app/i18n';
 import type { BuiltModel } from '../app/pipeline';
 import type { ViewSettings } from '../app/store';
 import { useI18n } from './i18n';
 import { RGBACanvas } from './RGBACanvas';
 import { ProgressBar } from './GeneratePanel';
-import { IconAlert, IconContrast, IconCube, IconFocus, IconLayers, IconRotate, IconSphere, IconTexture, IconWireframe } from './icons';
+import { IconAlert, IconContrast, IconCube, IconFocus, IconLayers, IconRotate, IconSphere, IconTexture, IconViews, IconWireframe } from './icons';
+
+const PRESET_LABELS: Record<ViewPreset, UIKey> = {
+  front: 'viewFront',
+  back: 'viewBack',
+  left: 'viewLeft',
+  right: 'viewRight',
+  top: 'viewTop',
+};
 
 interface Props {
   model: BuiltModel | null;
@@ -20,12 +29,16 @@ interface Props {
   progress: Progress | null;
   /** An image is loaded: the empty state points to the remaining steps instead of the upload. */
   hasSource?: boolean;
+  /** Touch screens: let one-finger vertical swipes scroll the page (off while a tool such as the sculpt brush needs every touch). */
+  touchScroll?: boolean;
   children?: ReactNode;
 }
 
-export function Viewer({ model, geometryVersion, view, onView, coreRef, depthPreview, running, progress, hasSource, children }: Props) {
+export function Viewer({ model, geometryVersion, view, onView, coreRef, depthPreview, running, progress, hasSource, touchScroll = true, children }: Props) {
   const { t } = useI18n();
   const hostRef = useRef<HTMLDivElement>(null);
+  const toolbarRef = useRef<HTMLDivElement>(null);
+  const [presetsOpen, setPresetsOpen] = useState(false);
   const [webglError, setWebglError] = useState(false);
   const viewRef = useRef(view);
   viewRef.current = view;
@@ -42,9 +55,16 @@ export function Viewer({ model, geometryVersion, view, onView, coreRef, depthPre
       return;
     }
     coreRef.current = core;
+    // Framing keeps the model below the floating toolbar (it may wrap on narrow screens).
+    const toolbar = toolbarRef.current;
+    const measure = () => toolbar && core.setFrameInsets({ top: toolbar.offsetTop + toolbar.offsetHeight + 8 });
+    measure();
+    const ro = toolbar && typeof ResizeObserver !== 'undefined' ? new ResizeObserver(measure) : null;
+    if (toolbar) ro?.observe(toolbar);
     // Dev-only handle for debugging / leak checks (renderer.info.memory).
     if (import.meta.env.DEV) (window as unknown as { __3dmarkerViewer?: ViewerCore }).__3dmarkerViewer = core;
     return () => {
+      ro?.disconnect();
       core.dispose();
       if (coreRef.current === core) coreRef.current = null;
     };
@@ -62,12 +82,16 @@ export function Viewer({ model, geometryVersion, view, onView, coreRef, depthPre
     coreRef.current?.setDisplay(view);
   }, [view, coreRef]);
 
+  useEffect(() => {
+    coreRef.current?.setTouchScroll(touchScroll);
+  }, [touchScroll, coreRef]);
+
   const toggle = (key: keyof ViewSettings) => onView({ [key]: !view[key] });
   const hasModel = !!model;
 
   return (
     <div className={`viewer${view.darkBackground ? ' is-dark' : ' is-light'}`}>
-      <div className="viewer-toolbar" role="toolbar" aria-label={t('viewerLabel')}>
+      <div ref={toolbarRef} className="viewer-toolbar" role="toolbar" aria-label={t('viewerLabel')}>
         <ToolButton label={t('viewTexture')} pressed={view.texture && !view.clay} onClick={() => toggle('texture')} disabled={view.clay} testId="view-texture">
           <IconTexture />
         </ToolButton>
@@ -84,6 +108,26 @@ export function Viewer({ model, geometryVersion, view, onView, coreRef, depthPre
         <ToolButton label={t('viewReset')} onClick={() => coreRef.current?.resetView()} testId="view-reset">
           <IconFocus />
         </ToolButton>
+        <span className="viewer-presets-wrap">
+          <ToolButton
+            label={t('viewPresets')}
+            pressed={presetsOpen}
+            onClick={() => setPresetsOpen((o) => !o)}
+            disabled={!hasModel}
+            testId="camera-presets"
+          >
+            <IconViews />
+          </ToolButton>
+          {presetsOpen && hasModel && (
+            <span className="viewer-presets" role="group" aria-label={t('viewPresets')}>
+              {VIEW_PRESETS.map((p) => (
+                <button key={p} type="button" className="btn btn-ghost btn-sm" onClick={() => coreRef.current?.viewFrom(p)} data-testid={`camera-${p}`}>
+                  {t(PRESET_LABELS[p])}
+                </button>
+              ))}
+            </span>
+          )}
+        </span>
         <ToolButton label={t('viewBackground')} pressed={!view.darkBackground} onClick={() => toggle('darkBackground')} testId="view-bg">
           <IconContrast />
         </ToolButton>

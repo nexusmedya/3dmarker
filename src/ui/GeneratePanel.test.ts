@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import type { Lang, Progress } from '../core/types';
 import { LangProvider } from './i18n';
-import { ProgressBar, labelHasPercent } from './GeneratePanel';
+import { GeneratePanel, ProgressBar, labelHasPercent, splitErrorDetail } from './GeneratePanel';
 
 const render = (lang: Lang, progress: Progress | null, extra: { decorative?: boolean } = {}) =>
   renderToStaticMarkup(createElement(LangProvider, { value: lang }, createElement(ProgressBar, { progress, ...extra })));
@@ -37,5 +37,37 @@ describe('ProgressBar', () => {
     expect(overlay).not.toContain('aria-live');
     expect(overlay).not.toContain('role="progressbar"');
     expect(overlay).toContain('aria-hidden="true"');
+  });
+});
+
+describe('error alert', () => {
+  const base = {
+    status: 'error' as const,
+    progress: null,
+    errorTitle: 'Generation failed',
+    canGenerate: true,
+    blockedReason: null,
+    hasResult: false,
+    onGenerate: () => {},
+    onCancel: () => {},
+    onDismiss: () => {},
+  };
+  const error = { tr: 'Model indirilemedi. [Failed to fetch]', en: 'Could not download the model. [Failed to fetch]' };
+
+  it('keeps the technical tail in a closed disclosure and offers the recovery action', () => {
+    const html = renderToStaticMarkup(
+      createElement(LangProvider, { value: 'tr' }, createElement(GeneratePanel, { ...base, error, errorAction: { label: 'Siluet şişirme ile dene', onClick: () => {} } })),
+    );
+    expect(html).toContain('<p>Model indirilemedi.</p>');
+    expect(html).toMatch(/<details class="error-detail"[^>]*><summary>Ayrıntılar<\/summary><code>Failed to fetch<\/code>/);
+    expect(html).not.toMatch(/<details[^>]* open/);
+    expect(html).toContain('data-testid="error-action"');
+    expect(html).toContain('Siluet şişirme ile dene');
+  });
+
+  it('splitErrorDetail leaves messages without a tail alone', () => {
+    expect(splitErrorDetail('Plain message.')).toEqual({ message: 'Plain message.', detail: null });
+    expect(splitErrorDetail('[only]')).toEqual({ message: '[only]', detail: null });
+    expect(splitErrorDetail('A [x] b')).toEqual({ message: 'A [x] b', detail: null });
   });
 });

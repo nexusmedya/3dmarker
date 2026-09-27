@@ -9,20 +9,20 @@
  * registered to the front by their silhouette profiles, thin parts (arms)
  * are guarded against inconsistent views, and each view's ViewAlign (manual
  * offset / scale / flip, trust) travels with it; views switched off are skipped.
+ * The fusion runs in the geometry worker (src/workers/geometry.worker.ts)
+ * when it can, else on the main thread.
  */
-import type { Driver, DriverInput, I18nText, ParamSpec, ParamValues } from '../../core/types';
+import type { Driver, DriverInput, I18nText, ParamSpec, ParamValues, Progress } from '../../core/types';
 import { throwIfAborted } from '../../core/types';
 import { LocalizedError } from '../../core/errors';
 import { reconstructFromViews } from '../../core/fusion/reconstruct';
-import type { DepthEstimator, FusionOptions, FusionViewInput } from '../../core/fusion/types';
+import type { DepthEstimator, FusionOptions, FusionResult, FusionViewInput } from '../../core/fusion/types';
 import { DEFAULT_FUSION_OPTIONS } from '../../core/fusion/types';
 import { DEPTH_MODEL_SPECS } from '../ml';
 import type { DepthModelSpec } from '../ml/depthDriver';
-import { mlProgressToProgress, processDepth } from '../ml/postprocess';
-import { prepareInferenceImage } from '../ml/prepare';
 import { isMlSupported, requestDepth } from '../ml/workerClient';
-
-const ACTION: I18nText = { tr: 'Derinlik hesaplanıyor', en: 'Estimating depth' };
+import { createFusionDepthEstimator, type DepthInfer, type FusionDepthSpec } from '../../workers/fusionDepth';
+import { getGeometryClient, GeometryWorkerUnavailableError } from '../../workers/geometryClient';
 
 /** Depth models offered for refinement (dynamic-size ViT models only: views are cropped to any aspect). */
 const DEPTH_MODELS = DEPTH_MODEL_SPECS.filter((s) => s.patchMultiple);
@@ -229,18 +229,25 @@ const NO_ML: I18nText = {
   en: 'This browser does not support Web Workers / WebAssembly',
 };
 
-/** Depth estimator backed by the ML worker (same pipeline as the depth drivers). */
+/** One depth-model run in the ML worker (the fusion prepares the image and post-processes the output). */
+export const mlDepthInfer: DepthInfer = async (job, { signal, onProgress }) => {
+  if (!isMlSupported()) throw new LocalizedError(NO_ML);
+  return requestDepth({ ...job, device: 'auto', precision: 'auto' }, { signal, onProgress });
+};
+
+const fusionDepthSpec = (s: DepthModelSpec): FusionDepthSpec => ({
+  model: s.model,
+  convention: s.convention,
+  nativeSide: s.nativeSide,
+  patchMultiple: s.patchMultiple,
+});
+
+/**
+ * Depth estimator backed by the ML worker (same pipeline as the depth
+ * drivers), for the main-thread fusion; see createFusionDepthEstimator.
+ */
 export function createWorkerDepthEstimator(spec: DepthModelSpec): DepthEstimator {
-  return async ({ image, mask }, { signal, onProgress }) => {
-    if (!isMlSupported()) throw new LocalizedError(NO_ML);
-    const prepared = prepareInferenceImage(image, { side: spec.nativeSide, multiple: spec.patchMultiple ?? 1 });
-    const raw = await requestDepth(
-      { model: spec.model, image: prepared, exactSize: !!spec.patchMultiple, device: 'auto', precision: 'auto' },
-      { signal, onProgress: (p) => onProgress(mlProgressToProgress(p, ACTION)) },
-    );
-    throwIfAborted(signal);
-    return processDepth(raw, { width: image.width, height: image.height, convention: spec.convention, mask, refine: null });
-  };
+  return createFusionDepthEstimator(fusionDepthSpec(spec), mlDepthInfer);
 }
 
 function depthSpec(id: unknown): DepthModelSpec {
@@ -258,6 +265,35 @@ export function fusionInputs(input: Pick<DriverInput, 'image' | 'mask' | 'views'
     out.push({ id: v.id, image: v.image, mask: v.mask, align: v.align });
   }
   return out;
+}
+
+/**
+ * reconstructFromViews in the geometry worker, so the page stays responsive
+ * (only the depth-model runs come back here: the ML worker is driven from the
+ * main thread). Without a usable worker (Node, old browsers, a worker that
+ * could not start) the same code runs here, time-sliced.
+ */
+export async function fuseViews(
+  inputs: FusionViewInput[],
+  options: Partial<FusionOptions>,
+  ctx: { signal: AbortSignal; onProgress: (p: Progress) => void; depth: DepthModelSpec | null },
+): Promise<FusionResult> {
+  const { signal, onProgress } = ctx;
+  const client = getGeometryClient();
+  if (client) {
+    try {
+      const depth = ctx.depth ? { spec: fusionDepthSpec(ctx.depth), infer: mlDepthInfer } : null;
+      return await client.fuse(inputs, options, { signal, onProgress, depth });
+    } catch (e) {
+      if (!(e instanceof GeometryWorkerUnavailableError)) throw e;
+      console.warn('fusion: geometry worker unavailable, running on the main thread');
+    }
+  }
+  return reconstructFromViews(inputs, options, {
+    signal,
+    onProgress,
+    estimateDepth: ctx.depth ? createWorkerDepthEstimator(ctx.depth) : null,
+  });
 }
 
 export const multiviewFusionDriver: Driver = {
@@ -281,11 +317,10 @@ export const multiviewFusionDriver: Driver = {
   async run(input) {
     const { params, signal, onProgress } = input;
     throwIfAborted(signal);
-    const estimateDepth = params.depthRefine === false ? null : createWorkerDepthEstimator(depthSpec(params.depthModel));
-    const { geometry, info } = await reconstructFromViews(fusionInputs(input), fusionOptionsFromParams(params), {
+    const { geometry, info } = await fuseViews(fusionInputs(input), fusionOptionsFromParams(params), {
       signal,
       onProgress,
-      estimateDepth,
+      depth: params.depthRefine === false ? null : depthSpec(params.depthModel),
     });
     // The consistency report the 3D step shows (reconstruct sets it too; kept in step here).
     if (info.report) geometry.userData.fusion ??= info.report;

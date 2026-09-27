@@ -5,7 +5,9 @@
  * orbit controls are paused while dragging; the move is committed on release
  * (the rig then re-binds and re-weights, which is too slow per pointer move).
  * With `mirror`, the opposite side's joint follows, mirrored about the hips'
- * X. Browser-only (DOM pointer events); the picking math is pure.
+ * X. A drag starts after a few pixels (a slip on click does not re-weight)
+ * and `clamp` can keep the dropped joints inside the body. Browser-only (DOM
+ * pointer events); the picking math is pure.
  */
 import { Group, Mesh, MeshBasicMaterial, Plane, Raycaster, SphereGeometry, Vector2, Vector3 } from 'three';
 import type { Camera, Object3D } from 'three';
@@ -29,7 +31,12 @@ export interface JointEditorOptions {
   onSelect: (bone: HumanoidBone | null) => void;
   /** A drag finished: the moved joint(s), in the root's frame. */
   onCommit: (patch: JointLayout) => void;
+  /** Where a dropped joint may go (root frame), e.g. back inside the mesh; fingers are not clamped. */
+  clamp?: (bone: HumanoidBone, p: Vec3) => Vec3;
 }
+
+/** Pointer travel (px) before a press on a joint becomes a drag. */
+export const DRAG_THRESHOLD_PX = 3;
 
 export interface ScreenJoint {
   bone: HumanoidBone;
@@ -71,7 +78,7 @@ export class JointEditor {
   };
   private layout: JointLayout;
   private selected: HumanoidBone | null = null;
-  private drag: { bone: HumanoidBone; pointerId: number; plane: Plane; moved: boolean } | null = null;
+  private drag: { bone: HumanoidBone; pointerId: number; plane: Plane; moved: boolean; x: number; y: number } | null = null;
   private readonly raycaster = new Raycaster();
   private disposed = false;
 
@@ -183,7 +190,7 @@ export class JointEditor {
     const normal = new Vector3();
     this.host.camera.getWorldDirection(normal);
     const plane = new Plane().setFromNormalAndCoplanarPoint(normal, this.markers.get(bone)!.position);
-    this.drag = { bone, pointerId: e.pointerId, plane, moved: false };
+    this.drag = { bone, pointerId: e.pointerId, plane, moved: false, x: e.clientX, y: e.clientY };
     this.host.setOrbitEnabled(false);
     try {
       this.host.canvas.setPointerCapture(e.pointerId);
@@ -198,6 +205,7 @@ export class JointEditor {
       return;
     }
     if (e.pointerId !== this.drag.pointerId) return;
+    if (!this.drag.moved && Math.hypot(e.clientX - this.drag.x, e.clientY - this.drag.y) < DRAG_THRESHOLD_PX) return;
     const hit = this.ray(e).ray.intersectPlane(this.drag.plane, new Vector3());
     if (!hit) return;
     this.drag.moved = true;
@@ -224,9 +232,17 @@ export class JointEditor {
       /* not captured */
     }
     if (!d.moved) return;
-    const patch: JointLayout = { [d.bone]: this.toLocal(this.markers.get(d.bone)!.position) };
+    const bones = [d.bone];
     const twin = mirrorBone(d.bone);
-    if (this.opts.mirror() && twin !== d.bone && this.markers.has(twin)) patch[twin] = this.toLocal(this.markers.get(twin)!.position);
+    if (this.opts.mirror() && twin !== d.bone && this.markers.has(twin)) bones.push(twin);
+    const patch: JointLayout = {};
+    for (const b of bones) {
+      const p = this.toLocal(this.markers.get(b)!.position);
+      patch[b] = this.opts.clamp && !isFingerBone(b) ? this.opts.clamp(b, p) : p;
+    }
+    // Show where the joints went (clamped) until the commit's setLayout.
+    this.layout = { ...this.layout, ...patch };
+    this.place();
     this.opts.onCommit(patch);
   };
 

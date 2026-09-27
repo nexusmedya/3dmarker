@@ -8,7 +8,7 @@
  * landmark-based relief (nose, lips, eye sockets, ears, fingers).
  */
 import { analyzeHuman } from '../../core/human/analyze';
-import { enhanceHumanDepth } from '../../core/human/enhance';
+import { enhanceHumanDepth, humanDetailRegions, withDetailRegions } from '../../core/human/enhance';
 import type { HumanAnalysis } from '../../core/human/types';
 import {
   AbortError,
@@ -166,6 +166,30 @@ export const HUMAN_PARAMS: ParamSpec[] = [
   },
 ];
 
+/**
+ * Progress note when human detection could not run (models blocked, no
+ * WebGL, timeout): generation goes on without face / hand relief. The step
+ * card (HumanDetailNote) keeps the reason on screen with a retry.
+ */
+export function humanUnavailableNote(analysis: HumanAnalysis | null): I18nText | null {
+  if (analysis && !analysis.unavailableReason && !analysis.unavailableText && !analysis.failed) return null;
+  const why = analysis?.unavailableText;
+  if (analysis && !why && !analysis.unavailableReason) {
+    // Some detectors failed, others worked.
+    const names: Record<string, I18nText> = { faces: { tr: 'yüz', en: 'face' }, hands: { tr: 'el', en: 'hand' }, pose: { tr: 'vücut', en: 'body' } };
+    const list = Object.keys(analysis.failed ?? {}).map((k) => names[k] ?? { tr: k, en: k });
+    return {
+      tr: `İnsan detayı kısmen kullanılamadı (${list.map((n) => n.tr).join(', ')} algılama modeli yüklenemedi); bulunanlarla devam ediliyor…`,
+      en: `Human detail partly unavailable (the ${list.map((n) => n.en).join(', ')} detection model did not load); continuing with what was found…`,
+    };
+  }
+  const reason = why ?? (analysis?.unavailableReason ? { tr: analysis.unavailableReason, en: analysis.unavailableReason } : { tr: 'bilinmeyen hata', en: 'unknown error' });
+  return {
+    tr: `İnsan detayı kullanılamadı, yüz/el kabartması olmadan devam ediliyor: ${reason.tr}`,
+    en: `Human detail unavailable, continuing without face / hand relief: ${reason.en}`,
+  };
+}
+
 const isAbort = (e: unknown) => e instanceof AbortError || (typeof e === 'object' && e !== null && (e as { name?: unknown }).name === 'AbortError');
 
 /**
@@ -274,9 +298,13 @@ export function createDepthDriver(spec: DepthModelSpec): Driver {
       }
       const analysis = await human.promise;
       throwIfAborted(signal);
+      const note = humanUnavailableNote(analysis);
+      if (note) onProgress({ label: note });
       if (!analysis || (analysis.faces.length === 0 && analysis.hands.length === 0 && analysis.poses.length === 0)) {
         return { kind: 'depth', depth, mask };
       }
+      // Face / hand areas: the mesh builder keeps their fine relief (no smoothing, finer grid).
+      const regions = humanDetailRegions(analysis, depth.width, depth.height);
       // High-res crop pass: the same model at its native input size on each face / hand crop.
       const refineCrop = async (crop: RGBAImage, sig: AbortSignal): Promise<DepthMap> => {
         const r = await requestDepth({ ...job, image: prepareInferenceImage(crop, { side: spec.nativeSide, multiple }) }, { signal: sig });
@@ -294,12 +322,12 @@ export function createDepthDriver(spec: DepthModelSpec): Driver {
           signal,
           onProgress,
         });
-        return { kind: 'depth', depth: refined, mask };
+        return { kind: 'depth', depth: withDetailRegions(refined, regions), mask };
       } catch (e) {
         if (isAbort(e) || signal.aborted) throw e;
         // Detail is a bonus: never lose the base depth over it.
         console.warn('[ml] human detail refinement failed; keeping the plain depth', e);
-        return { kind: 'depth', depth, mask };
+        return { kind: 'depth', depth: withDetailRegions(depth, regions), mask };
       }
     },
   };

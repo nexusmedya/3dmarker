@@ -47,7 +47,10 @@ export const IMPORT_TEXT = {
   unsupported: { tr: 'Desteklenmeyen dosya türü. BVH, FBX veya GLB / GLTF seçin.', en: 'Unsupported file type. Choose a BVH, FBX or GLB / GLTF file.' },
   tooLarge: { tr: 'Dosya çok büyük (en fazla {mb} MB).', en: 'The file is too large (max {mb} MB).' },
   empty: { tr: 'Dosya boş.', en: 'The file is empty.' },
-  parse: { tr: 'Animasyon dosyası okunamadı', en: 'Could not read the animation file' },
+  parse: {
+    tr: 'Animasyon dosyası okunamadı: dosya bozuk ya da geçerli bir BVH / FBX / GLB animasyonu değil.',
+    en: 'Could not read the animation file: it is damaged or not a valid BVH / FBX / GLB animation.',
+  },
   noAnimation: { tr: 'Dosyada animasyon bulunamadı.', en: 'The file contains no animation.' },
   noBones: {
     tr: 'Dosyadaki kemik adları tanınmadı (ör. Hips, Spine, LeftArm, LeftUpLeg bekleniyor).',
@@ -238,9 +241,10 @@ interface Loaded {
   nodes: Object3D[];
 }
 
+/** Loader exceptions are technical ("Cannot read properties of undefined…"): console only, a fixed message for the user. */
 function fail(detail: unknown): never {
-  const msg = detail instanceof Error ? detail.message : String(detail);
-  throw new LocalizedError({ tr: `${IMPORT_TEXT.parse.tr}: ${msg}`, en: `${IMPORT_TEXT.parse.en}: ${msg}` });
+  console.warn('[rig/import] animation parse failed', detail);
+  throw new LocalizedError(IMPORT_TEXT.parse);
 }
 
 async function load(format: AnimationFormat, buffer: ArrayBuffer): Promise<Loaded> {
@@ -481,7 +485,9 @@ export function retargetAnimation(src: AnimationSource, rig: RigDescriptor, opts
     const srcRest = src.rest.get('Hips')!;
     const FEET: HumanoidBone[] = ['LeftFoot', 'RightFoot', 'LeftToeBase', 'RightToeBase'];
     const lowest = (get: (b: HumanoidBone) => { y: number } | undefined) => Math.min(...FEET.map((b) => get(b)?.y ?? Infinity));
-    const tgtFeet = lowest((b) => rig.layout[b]);
+    // Same joints on both sides: a toe-less source (CMU, SecondLife) is floored at the ankle, so is the target.
+    const srcFeet = FEET.filter((b) => src.rest.has(b));
+    const tgtFeet = lowest((b) => (srcFeet.includes(b) ? rig.layout[b] : undefined));
     const srcFloor = src.floor ?? lowest((b) => src.rest.get(b));
     const legRef = legLengthOf(src.rest) ?? 1;
     // Horizontal reference: the rest, unless the take starts far away from it (mocap walking in from the side).

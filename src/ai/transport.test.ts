@@ -129,6 +129,24 @@ describe('error normalisation', () => {
     expect(errorFromStatus(401, { error: 'No Tripo API key: the server has none configured' }, proxy).code).toBe('missing-key');
     expect(errorFromStatus(404, { error: 'Unknown or disabled provider kind: replicate' }, { ...proxy, proxyError: true }).code).toBe('needs-server');
   });
+
+  it('keeps provider text out of our sentences, without double periods', () => {
+    const policy = errorFromStatus(400, {
+      error: { message: 'Your request was rejected as a result of our safety system. Your request may contain content that is not allowed by our safety system.', code: 'moderation_blocked' },
+    }, direct);
+    const bad = errorFromStatus(400, { error: { message: 'Invalid model' } }, direct);
+    const forbidden = errorFromStatus(403, { error: { message: 'Organization must be verified' } }, direct);
+    for (const e of [policy, bad, forbidden]) {
+      for (const text of [e.i18n.tr, e.i18n.en]) expect(text).not.toMatch(/\.\.|[a-z] [A-ZÇĞİÖŞÜ][a-zçğıöşü]+ adını/);
+    }
+    expect(policy.i18n.tr).toMatch(/^OpenAI içerik politikası .*deneyin\.\nSağlayıcı yanıtı: Your request .*safety system\.$/s);
+    expect(policy.i18n.en).toMatch(/style or description\.\nProvider response: Your request/);
+    expect(bad.i18n.tr).toBe('OpenAI isteği geçersiz buldu. Model adını ve ayarları kontrol edin.\nSağlayıcı yanıtı: Invalid model.');
+    expect(bad.i18n.en).toBe('OpenAI rejected the request as invalid. Check the model id and settings.\nProvider response: Invalid model.');
+    expect(forbidden.i18n.tr).toMatch(/erişimi\)\.\nSağlayıcı yanıtı: Organization must be verified\.$/);
+    expect(errorFromStatus(503, 'Overloaded.', direct).i18n.en).toBe('OpenAI returned a temporary error (HTTP 503: Overloaded); try again shortly.');
+    expect(errorFromStatus(400, {}, direct).i18n.tr).toBe('OpenAI isteği geçersiz buldu. Model adını ve ayarları kontrol edin.');
+  });
 });
 
 describe('aiFetch', () => {

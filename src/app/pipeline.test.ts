@@ -136,6 +136,27 @@ describe('quickMask', () => {
     expect(quickMask(image(20, 20), 'auto')).toEqual({ mask: null, note: 'no-alpha' });
   });
 
+  it('auto: an opaque image on a plain background gets the border mask (no rectangular slab)', () => {
+    const m = quickMask(onWhite(40, 60, 10), 'auto');
+    expect(m.note).toBeNull();
+    expect(m.mask).not.toBeNull();
+    const area = m.mask!.data.reduce((a, v) => a + v, 0);
+    expect(area).toBeGreaterThan(0.8 * 20 * 40);
+    expect(area).toBeLessThanOrEqual(20 * 40);
+    // Busy (photo-like) background: nothing to separate, keep the note.
+    const noisy = image(40, 40);
+    for (let i = 0; i < noisy.data.length; i += 4) noisy.data.set([(i * 37) % 256, (i * 91) % 256, (i * 13) % 256], i);
+    expect(quickMask(noisy, 'auto')).toEqual({ mask: null, note: 'no-alpha' });
+  });
+
+  it('auto: a few soft-alpha pixels do not hide a plain background', () => {
+    const img = onWhite(40, 40, 10);
+    img.data[3] = 200; // one semi-transparent corner pixel (not meaningful alpha)
+    const m = quickMask(img, 'auto');
+    expect(m.mask).not.toBeNull();
+    expect(m.mask!.data.reduce((a, v) => a + v, 0)).toBeLessThanOrEqual(400);
+  });
+
   it('border: flood-fills a plain background, notes failure on a busy border', () => {
     const m = quickMask(onWhite(40, 40, 10), 'border');
     expect(m.note).toBeNull();

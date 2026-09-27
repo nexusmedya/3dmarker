@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { BoxGeometry, Mesh, PlaneGeometry, SphereGeometry } from 'three';
+import { BoxGeometry, ExtrudeGeometry, Mesh, PlaneGeometry, Shape, SphereGeometry } from 'three';
 import type { HandResult, Landmark } from '../core/human/types';
-import { autoPlaceJoints, autoPlaceJointsDetailed, completeLayout } from './autoJoints';
+import { autoPlaceJoints, autoPlaceJointsDetailed, clampToSilhouette, completeLayout } from './autoJoints';
 import { bonesOfLayout, CORE_BONES } from './bones';
 import { collectMeshData } from './meshData';
 import { FAKE_IMAGE, fakeMask, fakePose, makeGroupedMannequin, makeMannequin, toPixel } from './testing';
@@ -81,6 +81,39 @@ describe('autoPlaceJoints – silhouette heuristic (no pose)', () => {
     const box = autoPlaceJointsDetailed(new Mesh(new BoxGeometry(0.6, 2, 0.4)));
     expect(box.method).toBe('proportional');
     expect(box.layout.HeadTop_End!.y).toBeCloseTo(1, 1);
+  });
+
+  it('rates how human the shape looks: the mannequin (solid or as a flat relief) is plausible, an extruded star or a blob is not', () => {
+    expect(res.plausibility).toBeGreaterThanOrEqual(0.7);
+    expect(res.reasons).toEqual([]);
+    // The same figure squashed to a relief keeps its head and legs.
+    const relief = makeMannequin(1).mesh;
+    relief.geometry.scale(1, 1, 0.3);
+    expect(autoPlaceJointsDetailed(relief).plausibility).toBeGreaterThanOrEqual(0.5);
+    for (const inner of [0.38, 0.45, 0.5]) {
+      const star = new Shape();
+      for (let k = 0; k < 10; k++) {
+        const a = Math.PI / 2 + (k * Math.PI) / 5, r = k % 2 ? inner : 1;
+        if (k === 0) star.moveTo(r * Math.cos(a), r * Math.sin(a));
+        else star.lineTo(r * Math.cos(a), r * Math.sin(a));
+      }
+      const r = autoPlaceJointsDetailed(new Mesh(new ExtrudeGeometry(star, { depth: 0.1, bevelEnabled: false })));
+      expect(r.plausibility, `star ${inner}`).toBeLessThan(0.5);
+      expect(r.reasons, `star ${inner}`).toContain('no-head');
+    }
+    const blob = autoPlaceJointsDetailed(new Mesh(new SphereGeometry(0.8, 32, 16)));
+    expect(blob.plausibility).toBeLessThan(0.5);
+  });
+
+  it('clampToSilhouette keeps a dragged joint inside the body', () => {
+    const sil = res.silhouette;
+    const elbow = l.LeftForeArm!;
+    expect(clampToSilhouette(sil, elbow)).toBe(elbow); // inside: untouched
+    // Dragged 0.17 above the arm and out in depth: back onto the arm, depth inside it.
+    const off = clampToSilhouette(sil, { x: elbow.x, y: elbow.y + 0.17, z: elbow.z - 0.3 });
+    expect(Math.abs(off.x - elbow.x)).toBeLessThan(0.03);
+    expect(off.y - elbow.y).toBeLessThan(0.08);
+    expect(Math.abs(off.z - elbow.z)).toBeLessThan(0.05);
   });
 
   it('a single surface (relief) puts joints slightly behind it', () => {

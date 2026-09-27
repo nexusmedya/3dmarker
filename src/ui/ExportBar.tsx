@@ -123,9 +123,14 @@ export function ExportBar({ result, getObject, stlSizeMm, onStlSize, disabled, a
           />
         </label>
       </div>
-      {clips && (
+      {/* Always takes its line, so rigging / unrigging never resizes the viewer above. */}
+      {clips ? (
         <p className="muted small export-anim" data-testid="export-animations">
           <IconBone size={14} /> {t('exportAnimations', { n: clips.length })}
+        </p>
+      ) : (
+        <p className="muted small export-anim is-empty" aria-hidden="true">
+          <IconBone size={14} />
         </p>
       )}
       {error && (

@@ -157,6 +157,14 @@ export function authHeaders(cfg: Pick<ProviderConfig, 'kind' | 'values'>, key: s
   }
 }
 
+/** Provider detail without trailing punctuation, so it can sit inside our own sentence. */
+const tail = (d: string): string => d.trim().replace(/[\s.。!?！？]+$/u, '');
+/** " (detail)" or "" — for short codes / hosts inside a sentence. */
+const paren = (d: string): string => (tail(d) ? ` (${tail(d)})` : '');
+/** The provider's own (usually English) message on its own line after our sentence. */
+const said = (d: string, lang: 'tr' | 'en'): string =>
+  tail(d) ? `\n${lang === 'tr' ? 'Sağlayıcı yanıtı' : 'Provider response'}: ${tail(d)}.` : '';
+
 const T = {
   missingKey: (n: string): I18nText => ({
     tr: `${n} için API anahtarı girilmemiş. AI sağlayıcı ayarlarından anahtarı ekleyin.`,
@@ -175,56 +183,56 @@ const T = {
     en: `${n} requests must go through the 3D Marker server, but the server or its AI proxy could not be reached (the static demo has no server). Use a provider the browser can call directly (OpenAI, Gemini, fal.ai) or run the app with its server.`,
   }),
   auth: (n: string, d: string): I18nText => ({
-    tr: `${n} API anahtarı geçersiz ya da reddedildi${d ? ` (${d})` : ''}. Anahtarı kontrol edin.`,
-    en: `The ${n} API key is invalid or was rejected${d ? ` (${d})` : ''}. Please check it.`,
+    tr: `${n} API anahtarı geçersiz ya da reddedildi${paren(d)}. Anahtarı kontrol edin.`,
+    en: `The ${n} API key is invalid or was rejected${paren(d)}. Please check it.`,
   }),
   forbidden: (n: string, d: string): I18nText => ({
-    tr: `${n} bu isteğe izin vermedi (anahtarın yetkisi, hesap doğrulaması ya da model erişimi)${d ? `: ${d}` : '.'}`,
-    en: `${n} did not allow this request (key permissions, account verification or model access)${d ? `: ${d}` : '.'}`,
+    tr: `${n} bu isteğe izin vermedi (anahtarın yetkisi, hesap doğrulaması ya da model erişimi).${said(d, 'tr')}`,
+    en: `${n} did not allow this request (key permissions, account verification or model access).${said(d, 'en')}`,
   }),
   billing: (n: string, d: string): I18nText => ({
-    tr: `${n}: kredi / kota yetersiz ya da faturalandırma gerekli${d ? ` (${d})` : ''}.`,
-    en: `${n}: out of credits / quota, or billing is required${d ? ` (${d})` : ''}.`,
+    tr: `${n}: kredi / kota yetersiz ya da faturalandırma gerekli${paren(d)}.`,
+    en: `${n}: out of credits / quota, or billing is required${paren(d)}.`,
   }),
   rateLimit: (n: string, sec: number | null): I18nText => ({
     tr: `${n} hız sınırına takıldı; ${sec ? `${sec} sn sonra` : 'biraz sonra'} tekrar deneyin.`,
     en: `${n} rate limit reached; try again ${sec ? `in ${sec} s` : 'shortly'}.`,
   }),
   contentPolicy: (n: string, d: string): I18nText => ({
-    tr: `${n} içerik politikası isteği reddetti (görsel ya da istem güvenlik filtresine takıldı)${d ? `: ${d}` : ''}. Başka bir görsel, stil ya da açıklama deneyin.`,
-    en: `${n} rejected the request under its content policy (the image or prompt hit a safety filter)${d ? `: ${d}` : ''}. Try another image, style or description.`,
+    tr: `${n} içerik politikası isteği reddetti (görsel ya da istem güvenlik filtresine takıldı). Başka bir görsel, stil ya da açıklama deneyin.${said(d, 'tr')}`,
+    en: `${n} rejected the request under its content policy (the image or prompt hit a safety filter). Try another image, style or description.${said(d, 'en')}`,
   }),
   badRequest: (n: string, d: string): I18nText => ({
-    tr: `${n} isteği geçersiz buldu${d ? `: ${d}` : '.'} Model adını ve ayarları kontrol edin.`,
-    en: `${n} rejected the request as invalid${d ? `: ${d}` : '.'} Check the model id and settings.`,
+    tr: `${n} isteği geçersiz buldu. Model adını ve ayarları kontrol edin.${said(d, 'tr')}`,
+    en: `${n} rejected the request as invalid. Check the model id and settings.${said(d, 'en')}`,
   }),
   notFound: (n: string, d: string): I18nText => ({
-    tr: `${n}: model ya da uç nokta bulunamadı${d ? ` (${d})` : ''}. Model kimliğini kontrol edin.`,
-    en: `${n}: model or endpoint not found${d ? ` (${d})` : ''}. Check the model id.`,
+    tr: `${n}: model ya da uç nokta bulunamadı${paren(d)}. Model kimliğini kontrol edin.`,
+    en: `${n}: model or endpoint not found${paren(d)}. Check the model id.`,
   }),
   tooLarge: (n: string): I18nText => ({
     tr: `${n} için gönderilen görsel çok büyük.`,
     en: `The image sent to ${n} is too large.`,
   }),
   server: (n: string, status: number, d: string): I18nText => ({
-    tr: `${n} geçici bir hata döndürdü (HTTP ${status}${d ? `: ${d}` : ''}); biraz sonra tekrar deneyin.`,
-    en: `${n} returned a temporary error (HTTP ${status}${d ? `: ${d}` : ''}); try again shortly.`,
+    tr: `${n} geçici bir hata döndürdü (HTTP ${status}${d ? `: ${tail(d)}` : ''}); biraz sonra tekrar deneyin.`,
+    en: `${n} returned a temporary error (HTTP ${status}${d ? `: ${tail(d)}` : ''}); try again shortly.`,
   }),
   timeout: (n: string, sec: number): I18nText => ({
     tr: `${n} ${sec} sn içinde yanıt vermedi.`,
     en: `${n} did not respond within ${sec} s.`,
   }),
   badResponse: (n: string, d: string): I18nText => ({
-    tr: `${n} beklenmeyen bir yanıt döndürdü${d ? `: ${d}` : ''}.`,
-    en: `${n} returned an unexpected response${d ? `: ${d}` : ''}.`,
+    tr: `${n} beklenmeyen bir yanıt döndürdü${d ? `: ${tail(d)}` : ''}.`,
+    en: `${n} returned an unexpected response${d ? `: ${tail(d)}` : ''}.`,
   }),
   notProxied: (n: string, d: string): I18nText => ({
-    tr: `3D Marker sunucusu ${n} isteklerini iletmiyor${d ? ` (${d})` : ''}. Sunucu yöneticisinin bu sağlayıcıyı açması gerekir.`,
-    en: `The 3D Marker server does not forward ${n} requests${d ? ` (${d})` : ''}. The server admin has to enable this provider.`,
+    tr: `3D Marker sunucusu ${n} isteklerini iletmiyor${paren(d)}. Sunucu yöneticisinin bu sağlayıcıyı açması gerekir.`,
+    en: `The 3D Marker server does not forward ${n} requests${paren(d)}. The server admin has to enable this provider.`,
   }),
   downloadFailed: (d: string): I18nText => ({
-    tr: `Üretilen dosya indirilemedi${d ? ` (${d})` : ''}. Sağlayıcının dosya adresi tarayıcıdan erişilemiyor olabilir; sunucu ile çalıştırmayı deneyin.`,
-    en: `The generated file could not be downloaded${d ? ` (${d})` : ''}. The provider’s file URL may not be reachable from the browser; try running with the server.`,
+    tr: `Üretilen dosya indirilemedi${paren(d)}. Sağlayıcının dosya adresi tarayıcıdan erişilemiyor olabilir; sunucu ile çalıştırmayı deneyin.`,
+    en: `The generated file could not be downloaded${paren(d)}. The provider’s file URL may not be reachable from the browser; try running with the server.`,
   }),
 };
 

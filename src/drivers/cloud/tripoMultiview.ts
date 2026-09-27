@@ -114,8 +114,8 @@ export function createTripoMultiviewDriver(options: TripoDriverOptions = {}): Dr
     id: 'tripo3d-multiview',
     name: { tr: 'Tripo3D çoklu görünüm (bulut, tam 3B)', en: 'Tripo3D multi-view (cloud, full 3D)' },
     description: {
-      tr: 'Ön görünümü sol, arka ve/veya sağ görünümlerle birlikte Tripo3D’ye gönderir; arka ve yanlar tahmin edilmek yerine verdiğiniz görünümlerden kurulur, dokulu ve kapalı bir 3B model (GLB) döner. Görünümleri “Görünümler” panelinden yükleyin ya da yapay zekâ ile üretin. Tripo3D API anahtarı gerektirir, kredi harcar; görseller üçüncü taraf bir hizmete yüklenir.',
-      en: 'Sends the front view together with the left, back and/or right views to Tripo3D; the back and sides are built from your views instead of being guessed, returning a textured, closed 3D model (GLB). Add the views in the Views panel (upload them or generate them with AI). Needs a Tripo3D API key and uses credits; the images are uploaded to a third-party service.',
+      tr: 'Ön görünümü sol, arka ve/veya sağ görünümlerle birlikte Tripo3D’ye gönderir; arka ve yanlar tahmin edilmek yerine verdiğiniz görünümlerden kurulur, dokulu ve kapalı bir 3B model (GLB) döner. Görünümleri “Görünümler” panelinden yükleyin ya da yapay zekâ ile üretin. Tripo3D API anahtarı gerektirir, kredi harcar; görseller üçüncü taraf bir hizmete yüklenir. Kendi 3D Marker API sunucunuzu gerektirir; çevrimiçi demoda çalışmaz.',
+      en: 'Sends the front view together with the left, back and/or right views to Tripo3D; the back and sides are built from your views instead of being guessed, returning a textured, closed 3D model (GLB). Add the views in the Views panel (upload them or generate them with AI). Needs a Tripo3D API key and uses credits; the images are uploaded to a third-party service. Needs your own 3D Marker API server; not available on the online demo.',
     },
     category: 'cloud',
     badges: ['api-key', 'full-3d', 'closed-mesh', 'multi-view'],

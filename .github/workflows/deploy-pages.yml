@@ -54,6 +54,8 @@ jobs:
       - name: Build (static, project-page base path)
         env:
           BASE_PATH: ${{ steps.pages.outputs.base_path }}/
+          # No API server on Pages: skip the /api/ai/providers probe (console 404).
+          VITE_STATIC_DEMO: '1'
         run: npm run build
 
       - name: Upload Pages artifact
