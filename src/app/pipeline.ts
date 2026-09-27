@@ -37,8 +37,14 @@ import { disposeObject } from './dispose';
 import { yieldToPaint } from './throttle';
 import { UI } from './i18n';
 
-/** Longest side of the working image handed to drivers and used as texture. */
+/** Longest side of the working image handed to drivers (and the texture when there is no larger copy). */
 export const WORKING_MAX_SIDE = 1024;
+/**
+ * Longest side of the 3D texture. Sources decoded larger than the working
+ * image keep a copy up to this size for the texture only (drivers still get
+ * the working image), so the model is not blurrier than the picture.
+ */
+export const TEXTURE_MAX_SIDE = 2048;
 
 export type BackgroundMode = 'auto' | 'border' | 'ai' | 'none';
 export const BACKGROUND_MODES: BackgroundMode[] = ['auto', 'border', 'ai', 'none'];
@@ -54,17 +60,41 @@ export interface SourceImage {
   file: Blob;
   /** Working image, longest side ≤ WORKING_MAX_SIDE. */
   image: RGBAImage;
+  /**
+   * Higher-resolution copy for the 3D texture (longest side ≤ TEXTURE_MAX_SIDE),
+   * only when the decoded / enhanced image is larger than `image`.
+   */
+  texture?: RGBAImage;
+}
+
+export interface PrepareSourceOptions {
+  /** Longest side kept for the texture copy; ≤ WORKING_MAX_SIDE keeps none (e.g. extra views). */
+  textureMaxSide?: number;
+}
+
+/** A source from full-resolution pixels: the working image plus, when larger, a texture copy. */
+export function sourceFromImage(full: RGBAImage, name: string, file: Blob, textureMaxSide = TEXTURE_MAX_SIDE): SourceImage {
+  const image = fitRGBA(full, WORKING_MAX_SIDE);
+  if (image === full || textureMaxSide <= WORKING_MAX_SIDE) return { name, file, image };
+  return { name, file, image, texture: fitRGBA(full, textureMaxSide) };
 }
 
 export async function prepareSource(
   file: Blob,
   name: string,
   load: (f: Blob, maxSide?: number) => Promise<RGBAImage> = loadImageFile,
+  opts: PrepareSourceOptions = {},
 ): Promise<SourceImage> {
-  // Decode straight to the working size (the full-size pixels are never used;
-  // cloud drivers upload the original file); fitRGBA is a no-op safety net then.
-  const decoded = await load(file, WORKING_MAX_SIDE);
-  return { name, file, image: fitRGBA(decoded, WORKING_MAX_SIDE) };
+  // Decode straight to the largest size used (the texture copy; cloud drivers
+  // upload the original file); fitRGBA is a no-op safety net then.
+  const textureMaxSide = opts.textureMaxSide ?? TEXTURE_MAX_SIDE;
+  const decoded = await load(file, Math.max(WORKING_MAX_SIDE, textureMaxSide));
+  return sourceFromImage(decoded, name, file, textureMaxSide);
+}
+
+/** The pixels the 3D texture is made from: the texture copy when there is one, else the working image. */
+export function textureImageOf(source: SourceImage): RGBAImage {
+  return source.texture ?? source.image;
 }
 
 /** Why the preview has no mask: 'no-alpha' (auto: neither alpha nor a plain background), 'border-failed', 'deferred' (AI runs on Generate). */
@@ -156,7 +186,11 @@ export function opaqueTextureImage(img: RGBAImage, alphaThreshold = 16): RGBAIma
   return { width: w, height: h, data: out };
 }
 
-/** sRGB texture of a top-row-first RGBA image; flipY so that UV (0,0) is the image's bottom-left. */
+/**
+ * sRGB texture of a top-row-first RGBA image; flipY so that UV (0,0) is the
+ * image's bottom-left. Trilinear mipmapping; the viewer raises anisotropy to
+ * what the GPU offers (ViewerCore.setObject), 4 is the default elsewhere.
+ */
 export function createImageTexture(img: RGBAImage): DataTexture {
   const data = new Uint8Array(img.data.buffer, img.data.byteOffset, img.data.byteLength);
   const tex = new DataTexture(data, img.width, img.height, RGBAFormat, UnsignedByteType);
@@ -166,6 +200,7 @@ export function createImageTexture(img: RGBAImage): DataTexture {
   tex.magFilter = LinearFilter;
   tex.minFilter = LinearMipmapLinearFilter;
   tex.generateMipmaps = true;
+  tex.anisotropy = 4;
   tex.needsUpdate = true;
   return tex;
 }
@@ -356,7 +391,7 @@ export async function buildGltfModel(glb: ArrayBuffer): Promise<BuiltModel> {
   }
 }
 
-/** Turn a driver result into a displayable model. */
+/** Turn a driver result into a displayable model; `image` is textured onto it (see textureImageOf). */
 export async function buildModel(
   result: DriverResult,
   image: RGBAImage,
@@ -420,7 +455,8 @@ export async function runPipeline(req: PipelineRequest): Promise<PipelineResult>
   throwIfAborted(signal);
   onProgress({ label: result.kind === 'model' ? UI.loadingGlb : UI.buildingMesh });
   await yieldToPaint(); // show the label before the synchronous build
-  const model = await buildModel(result, source.image, inputMask, req.meshParams);
+  // The texture may be sharper than the working image the driver saw (same framing, UVs are normalised).
+  const model = await buildModel(result, textureImageOf(source), inputMask, req.meshParams);
   // Let a Cancel / Esc that queued up during the build run before the job completes.
   await yieldToPaint();
   if (signal.aborted) {

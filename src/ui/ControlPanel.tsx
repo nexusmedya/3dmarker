@@ -17,6 +17,9 @@ import { providerUsable, supports } from '../ai/settings';
 import { OFFLINE_DRIVER_ID, type Studio } from './useStudio';
 import { useI18n } from './i18n';
 import { UploadCard } from './UploadCard';
+import { EnhanceCard, reasonsText, useImageAnalysis } from './EnhanceCard';
+import { enhanceSuggestion } from '../core/enhance/presets';
+import { textureImageOf } from '../app/pipeline';
 import { DriverPicker } from './DriverPicker';
 import { ParamForm } from './ParamForm';
 import { GeneratePanel } from './GeneratePanel';
@@ -62,6 +65,24 @@ export function ControlPanel({ studio }: Props) {
   const pendingMode = state.pendingMeshMode ? meshModeLabel(state.pendingMeshMode) : null;
   const human = state.human && state.source && state.human.image === state.source.image ? state.human.analysis : null;
   const aiBusy = state.aiJob?.kind ?? null;
+  const enhancing = aiBusy === 'enhance';
+
+  // ---- Image enhancement: analysis of the front, suggestion, card open state ----
+  const analysis = useImageAnalysis(state.source ? textureImageOf(state.source) : null);
+  const suggestion = analysis ? enhanceSuggestion(analysis) : null;
+  const enhanceApplied = state.enhanceApplied && state.enhanceApplied.after === state.source ? state.enhanceApplied : null;
+  const [enhanceOpen, setEnhanceOpen] = useState(false);
+  // An image that looks small / blurry / pixelated opens the card once.
+  const openedFor = useRef<typeof analysis>(null);
+  useEffect(() => {
+    if (!analysis || openedFor.current === analysis) return;
+    openedFor.current = analysis;
+    if (suggestion && !enhanceApplied) setEnhanceOpen(true);
+  }, [analysis, suggestion, enhanceApplied]);
+  const openEnhance = () => {
+    setEnhanceOpen(true);
+    requestAnimationFrame(() => document.getElementById('enhance-card')?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' }));
+  };
 
   // Steps visited once stay mounted (hidden): the rig keeps its playback, the panels their local state.
   const [visited, setVisited] = useState<ReadonlySet<StepId>>(() => new Set([step]));
@@ -95,7 +116,8 @@ export function ControlPanel({ studio }: Props) {
     hasModel: !!model,
     sculpted: state.sculpted,
     rigged: state.rigged,
-    aiBusy,
+    // The step navigator knows the AI prep / views jobs; enhancement belongs to step 1.
+    aiBusy: aiBusy === 'enhance' ? null : aiBusy,
     modelBusy: running,
   };
   const status = {} as Record<StepId, StepStatus>;
@@ -228,8 +250,30 @@ export function ControlPanel({ studio }: Props) {
             onFile={(f) => void actions.loadFile(f, f.name || 'image.png')}
             onSample={(s) => void actions.loadSample(s)}
             onClear={actions.clearImage}
+            enhanceHint={suggestion && !enhanceApplied && !enhanceOpen ? t('enhanceSuggestShort', { reasons: reasonsText(suggestion.reasons, t) }) : null}
+            onEnhance={openEnhance}
           />
           {revertNote}
+          {state.source && (
+            <EnhanceCard
+              source={state.source}
+              analysis={analysis}
+              open={enhanceOpen}
+              onOpenChange={setEnhanceOpen}
+              running={enhancing}
+              progress={enhancing ? (state.aiJob?.progress ?? null) : null}
+              error={state.enhanceError}
+              onDismissError={actions.dismissEnhanceError}
+              pending={state.enhanced && state.enhanced.from === state.source ? state.enhanced : null}
+              applied={enhanceApplied}
+              onRun={(preset) => void actions.runEnhance(preset)}
+              onCancel={actions.cancelAi}
+              onApply={actions.applyEnhanced}
+              onDiscard={actions.discardEnhanced}
+              onRevert={actions.revertEnhanced}
+              disabled={busy || (!!aiBusy && !enhancing)}
+            />
+          )}
 
           <section className="card" aria-labelledby="bg-title">
             <div className="card-head">
@@ -282,7 +326,7 @@ export function ControlPanel({ studio }: Props) {
             original={state.source?.image ?? null}
             onAccept={actions.acceptPrepared}
             onDiscard={actions.discardPrepared}
-            disabled={busy || aiBusy === 'views'}
+            disabled={busy || aiBusy === 'views' || enhancing}
           />
           <StepFooter id="prep" onStep={actions.setStep} />
         </StepPanel>
@@ -303,7 +347,7 @@ export function ControlPanel({ studio }: Props) {
             aiReady={editReady}
             aiReason={aiReason}
             onOpenSettings={actions.openAiSettings}
-            disabled={busy || aiBusy === 'prep'}
+            disabled={busy || aiBusy === 'prep' || enhancing}
             onUseFusion={
               unusedViews
                 ? () => {

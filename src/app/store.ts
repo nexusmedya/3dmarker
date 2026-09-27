@@ -24,6 +24,7 @@ import { getStyle } from '../ai/styles';
 import { detectLang, type UIKey } from './i18n';
 import { suggestedMeshMode } from './driverMeta';
 import { isBackgroundMode, type BackgroundMode, type MaskNote, type SourceImage } from './pipeline';
+import type { EnhancePlan, EnhancePresetId } from '../core/enhance/presets';
 import { loadJSON, persistableParams, sanitizeParams, saveJSON, type KeyValueStore } from './persist';
 import type { StepId } from './steps';
 
@@ -73,7 +74,8 @@ export interface ViewEntry {
 
 export type ViewEntries = Partial<Record<OtherViewId, ViewEntry>>;
 
-export type AiJobKind = 'prep' | 'views';
+/** 'enhance': image enhancement (AI super-resolution or a local enhancer). */
+export type AiJobKind = 'prep' | 'views' | 'enhance';
 
 /** The AI job in flight (one at a time). */
 export interface AiJob {
@@ -81,6 +83,27 @@ export interface AiJob {
   /** Views jobs: the view being made, or 'all' for "generate the missing views". */
   target: OtherViewId | 'all' | null;
   progress: Progress | null;
+}
+
+/** An enhanced front image awaiting Apply / Discard. */
+export interface EnhancePending {
+  /** The new source (working image, texture copy, encoded file). */
+  source: SourceImage;
+  /** The front it was made from (Apply only while that is still the front). */
+  from: SourceImage;
+  preset: EnhancePresetId;
+  /** What actually ran (the local fallback's plan when the AI could not run). */
+  plan: EnhancePlan;
+  /** The automatic preset fell back to the local upscaler (the AI model could not run). */
+  fallback: I18nText | null;
+  elapsedMs: number;
+}
+
+/** The enhancement in use: `after` is the front, `before` comes back with Revert. */
+export interface EnhanceApplied {
+  before: SourceImage;
+  after: SourceImage;
+  preset: EnhancePresetId;
 }
 
 /** Human analysis of one image: running, or its result. */
@@ -167,6 +190,13 @@ export interface AppState {
    */
   viewChecks: Partial<Record<OtherViewId, ViewAlignment>>;
 
+  // ---- Image enhancement (step 1) ----
+  /** Enhanced image awaiting Apply / Discard. */
+  enhanced: EnhancePending | null;
+  /** The applied enhancement (Revert restores `before` while `after` is still the front). */
+  enhanceApplied: EnhanceApplied | null;
+  enhanceError: I18nText | null;
+
   // ---- Model edits ----
   /** Sculpt mode is on (a session owns the viewer's pointer input). */
   sculptActive: boolean;
@@ -234,6 +264,11 @@ export type Action =
   | { type: 'revertOriginal'; mask: Mask | null; maskNote: MaskNote }
   | { type: 'restorePrepared'; mask: Mask | null; maskNote: MaskNote }
   | { type: 'dismissAiError'; kind: AiJobKind }
+  // Image enhancement
+  | { type: 'enhanceReady'; pending: EnhancePending }
+  | { type: 'enhanceDiscard' }
+  | { type: 'enhanceApply'; mask: Mask | null; maskNote: MaskNote }
+  | { type: 'enhanceRevert'; mask: Mask | null; maskNote: MaskNote }
   // Views
   | { type: 'viewSet'; view: OtherViewId; entry: ViewEntry }
   | { type: 'viewClear'; view: OtherViewId }
@@ -296,7 +331,13 @@ const freshSubject = (): Partial<AppState> => ({
     aiJob: null,
     prepError: null,
     viewsError: null,
+    enhanced: null,
+    enhanceApplied: null,
+    enhanceError: null,
 });
+
+/** The front was replaced by an AI preparation / revert: enhancement results made from the old one are stale. */
+const frontReplaced: Partial<AppState> = { enhanced: null, enhanceApplied: null };
 
 /** A new model replaced the one on screen: edits / rig belonged to the old one. */
 const freshModel: Partial<AppState> = {
@@ -484,6 +525,7 @@ export function reducer(state: AppState, action: Action): AppState {
         aiJob: { kind: action.kind, target: action.target ?? null, progress: null },
         prepError: action.kind === 'prep' ? null : state.prepError,
         viewsError: action.kind === 'views' ? null : state.viewsError,
+        enhanceError: action.kind === 'enhance' ? null : state.enhanceError,
       };
     case 'aiJobProgress':
       return state.aiJob ? { ...state, aiJob: { ...state.aiJob, progress: action.progress } } : state;
@@ -496,8 +538,10 @@ export function reducer(state: AppState, action: Action): AppState {
         aiJob: null,
         prepError: action.kind === 'prep' ? action.error : state.prepError,
         viewsError: action.kind === 'views' ? action.error : state.viewsError,
+        enhanceError: action.kind === 'enhance' ? action.error : state.enhanceError,
       };
     case 'dismissAiError':
+      if (action.kind === 'enhance') return { ...state, enhanceError: null };
       return action.kind === 'prep' ? { ...state, prepError: null } : { ...state, viewsError: null };
     case 'prepReady':
       return { ...state, aiJob: null, prepError: null, prepared: action.prepared, preparedWith: action.options ?? null, revertedAi: null };
@@ -526,6 +570,7 @@ export function reducer(state: AppState, action: Action): AppState {
         maskNote: action.maskNote,
         aiMask: null,
         human: null,
+        ...frontReplaced,
       };
     }
     case 'revertOriginal': {
@@ -543,6 +588,7 @@ export function reducer(state: AppState, action: Action): AppState {
         maskNote: action.maskNote,
         aiMask: null,
         human: null,
+        ...frontReplaced,
       };
     }
     case 'restorePrepared': {
@@ -559,6 +605,50 @@ export function reducer(state: AppState, action: Action): AppState {
         original: r.original,
         frontPrep: r.frontPrep,
         revertedAi: null,
+        mask: action.mask,
+        maskNote: action.maskNote,
+        aiMask: null,
+        human: null,
+        ...frontReplaced,
+      };
+    }
+
+    case 'enhanceReady':
+      // A result for a front that has been replaced meanwhile is dropped.
+      if (state.source !== action.pending.from) return { ...state, aiJob: null };
+      return { ...state, aiJob: null, enhanceError: null, enhanced: action.pending };
+    case 'enhanceDiscard':
+      return state.enhanced ? { ...state, enhanced: null } : state;
+    case 'enhanceApply': {
+      const pending = state.enhanced;
+      if (!pending || !state.source || pending.from !== state.source) return state;
+      // The enhanced image becomes the front; the picture is the same, so every
+      // view (AI-made ones too) stays, but registrations, masks and the human
+      // analysis belong to the old pixels. Applying on top of an applied
+      // enhancement keeps the first "before" for Revert.
+      const before = state.enhanceApplied && state.enhanceApplied.after === state.source ? state.enhanceApplied.before : state.source;
+      return {
+        ...state,
+        source: pending.source,
+        enhanced: null,
+        enhanceApplied: { before, after: pending.source, preset: pending.preset },
+        enhanceError: null,
+        viewChecks: {},
+        mask: action.mask,
+        maskNote: action.maskNote,
+        aiMask: null,
+        human: null,
+      };
+    }
+    case 'enhanceRevert': {
+      const applied = state.enhanceApplied;
+      if (!applied || state.source !== applied.after) return state;
+      return {
+        ...state,
+        source: applied.before,
+        enhanced: null,
+        enhanceApplied: null,
+        viewChecks: {},
         mask: action.mask,
         maskNote: action.maskNote,
         aiMask: null,
@@ -798,6 +888,9 @@ export function createInitialState(env: InitEnv): AppState {
     revertedAi: null,
     views: {},
     viewChecks: {},
+    enhanced: null,
+    enhanceApplied: null,
+    enhanceError: null,
     sculptActive: false,
     sculpted: false,
     sculptBase: false,

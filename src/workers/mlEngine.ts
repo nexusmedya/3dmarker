@@ -138,8 +138,9 @@ export class MlEngine<P> {
         if (webgpuFailed) this.webgpuBroken.add(spec.model);
         return { result, device, dtype };
       } catch (e) {
-        // A stalled download is the network's fault, and WASM would wait just as long.
-        if (device === 'wasm' || (e instanceof Error && e.name === MODEL_STALLED_ERROR)) throw e;
+        // A stalled download is the network's fault, and WASM would wait just as long;
+        // a job cancelled between tiles (AbortError) is not a WebGPU failure either.
+        if (device === 'wasm' || (e instanceof Error && (e.name === MODEL_STALLED_ERROR || e.name === 'AbortError'))) throw e;
         await this.drop(`${spec.task}|${spec.model}|webgpu|`);
         const beforeOrt = isMissingWeightsError(e) || isUnsupportedDtypeError(e);
         console.warn(`[ml] WebGPU failed for ${spec.model}, retrying on WASM${beforeOrt ? '' : ' in a fresh worker'}:`, e);

@@ -14,13 +14,16 @@ import {
   Vector3,
   VectorKeyframeTrack,
   Box3,
+  LinearMipmapLinearFilter,
 } from 'three';
 import type { DepthMap, Driver, DriverResult, Mask, ParamValues, Progress, RGBAImage, ViewSet } from '../core/types';
 import { AbortError } from '../core/types';
 import { LocalizedError } from '../core/errors';
 import { exportObject } from '../core/export/exporters';
 import { computeMeshStats } from '../core/mesh/stats';
+import { disposeObject } from './dispose';
 import {
+  TEXTURE_MAX_SIDE,
   WORKING_MAX_SIDE,
   buildDepthModel,
   buildGeometryModel,
@@ -38,7 +41,9 @@ import {
   quickMask,
   resolveMask,
   runPipeline,
+  sourceFromImage,
   statsForObject,
+  textureImageOf,
   type SourceImage,
 } from './pipeline';
 
@@ -115,16 +120,79 @@ describe('prepareSource', () => {
     expect(src.name).toBe('big.png');
   });
 
-  it('decodes straight to the working size', async () => {
+  it('decodes straight to the texture size (no full-size intermediate)', async () => {
     const load = vi.fn(async () => image(8, 8));
     await prepareSource(new Blob(), 'x.png', load);
-    expect(load).toHaveBeenCalledWith(expect.any(Blob), WORKING_MAX_SIDE);
+    expect(load).toHaveBeenCalledWith(expect.any(Blob), TEXTURE_MAX_SIDE);
+    // Extra views need no texture copy: decoded at the working size.
+    await prepareSource(new Blob(), 'v.png', load, { textureMaxSide: WORKING_MAX_SIDE });
+    expect(load).toHaveBeenLastCalledWith(expect.any(Blob), WORKING_MAX_SIDE);
   });
 
   it('keeps small images untouched', async () => {
     const small = image(64, 32);
     const src = await prepareSource(new Blob(), 's.png', async () => small);
     expect(src.image).toBe(small);
+    expect(src.texture).toBeUndefined();
+    expect(textureImageOf(src)).toBe(small);
+  });
+
+  it('keeps a texture copy (≤ TEXTURE_MAX_SIDE) when the image is larger than the working size', async () => {
+    const huge = image(3000, 1500);
+    const src = await prepareSource(new Blob(), 'h.png', async () => huge);
+    expect([src.image.width, src.image.height]).toEqual([WORKING_MAX_SIDE, WORKING_MAX_SIDE / 2]);
+    expect([src.texture!.width, src.texture!.height]).toEqual([TEXTURE_MAX_SIDE, TEXTURE_MAX_SIDE / 2]);
+    expect(textureImageOf(src)).toBe(src.texture);
+    const views = await prepareSource(new Blob(), 'h.png', async () => huge, { textureMaxSide: WORKING_MAX_SIDE });
+    expect(views.texture).toBeUndefined();
+  });
+
+  it('sourceFromImage splits an enhanced image into working image + texture', () => {
+    const file = new Blob();
+    const big = sourceFromImage(image(1536, 768), 'e.png', file);
+    expect(big.image.width).toBe(WORKING_MAX_SIDE);
+    expect(big.texture!.width).toBe(1536);
+    expect(big.file).toBe(file);
+    const small = sourceFromImage(image(600, 300), 'e.png', file);
+    expect(small.texture).toBeUndefined();
+  });
+});
+
+describe('texture', () => {
+  it('uses trilinear mipmaps and anisotropic filtering', () => {
+    const tex = createImageTexture(image(16, 8));
+    expect(tex.generateMipmaps).toBe(true);
+    expect(tex.minFilter).toBe(LinearMipmapLinearFilter);
+    expect(tex.anisotropy).toBeGreaterThan(1);
+    tex.dispose();
+  });
+
+  it('runPipeline textures the model with the texture copy while the driver gets the working image', async () => {
+    const tex = image(64, 64);
+    const work = image(32, 32);
+    let seen: RGBAImage | null = null;
+    const driver = {
+      id: 'probe',
+      run: async (input: { image: RGBAImage }) => {
+        seen = input.image;
+        return { kind: 'geometry' as const, geometry: new BoxGeometry(1, 1, 1) };
+      },
+    } as unknown as Driver;
+    const out = await runPipeline({
+      source: { name: 's.png', file: new Blob(), image: work, texture: tex },
+      bgMode: 'none',
+      driver,
+      params: {},
+      meshParams: {},
+      signal: new AbortController().signal,
+      onProgress: () => {},
+      mask: null,
+    });
+    expect(seen).toBe(work);
+    const mesh = out.model.object as Mesh;
+    const map = (mesh.material as MeshStandardMaterial).map!;
+    expect((map.image as { width: number }).width).toBe(64);
+    disposeObject(out.model.object);
   });
 });
 

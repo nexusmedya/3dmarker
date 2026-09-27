@@ -1,4 +1,8 @@
-/** Upload: drag & drop / file picker / samples, and the image preview with its mask overlay. */
+/**
+ * Upload: drag & drop / file picker / samples, and the image preview with its
+ * mask overlay. A small / blurry / pixelated image gets a hint that opens the
+ * enhancement card.
+ */
 import { useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
 import type { Mask } from '../core/types';
 import type { SourceImage } from '../app/pipeline';
@@ -8,7 +12,7 @@ import { getDriver } from '../drivers';
 import { useI18n } from './i18n';
 import { RGBACanvas } from './RGBACanvas';
 import { Switch } from './ParamField';
-import { IconImage, IconUpload, IconX } from './icons';
+import { IconImage, IconInfo, IconUpload, IconWand, IconX } from './icons';
 
 interface Props {
   source: SourceImage | null;
@@ -19,9 +23,13 @@ interface Props {
   onFile: (file: File) => void;
   onSample: (spec: SampleSpec) => void;
   onClear: () => void;
+  /** "The image looks small / blurry…" (null: nothing to suggest). */
+  enhanceHint?: string | null;
+  /** Opens the enhancement card. */
+  onEnhance?: () => void;
 }
 
-export function UploadCard({ source, loading, mask, showMask, onShowMask, onFile, onSample, onClear }: Props) {
+export function UploadCard({ source, loading, mask, showMask, onShowMask, onFile, onSample, onClear, enhanceHint, onEnhance }: Props) {
   const { t, tx } = useI18n();
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -97,9 +105,21 @@ export function UploadCard({ source, loading, mask, showMask, onShowMask, onFile
             </span>
             <span className="muted">
               {t('imageInfo', { w: source.image.width, h: source.image.height })}
+              {source.texture && (
+                <span data-testid="texture-info"> · {t('textureInfo', { w: source.texture.width, h: source.texture.height })}</span>
+              )}
               {coverage !== null && <> · {t('foreground', { pct: coverage })}</>}
             </span>
           </div>
+          {enhanceHint && onEnhance && (
+            <p className="note small upload-enhance-hint" role="status" data-testid="enhance-hint">
+              <IconInfo size={14} />
+              <span className="grow">{enhanceHint}</span>
+              <button type="button" className="btn btn-ghost btn-sm" onClick={onEnhance} disabled={loading} data-testid="enhance-hint-open">
+                <IconWand size={14} /> {t('enhanceSuggestAction')}
+              </button>
+            </p>
+          )}
           <Switch
             id="show-mask"
             checked={showMask && !!mask}

@@ -1911,3 +1911,54 @@ select {
   border: 1px dashed currentColor;
   opacity: 0.75;
 }
+
+/* ---------- Image enhancement (step 1) ---------- */
+
+.enhance-card.is-suggested { border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+.enhance-card > summary { gap: 8px; }
+.enhance-card > summary .state-chip { margin-left: auto; }
+.enhance-body { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.enhance-suggest { color: var(--text); }
+
+.enhance-presets {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+  gap: 6px;
+}
+
+.enhance-preset {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 0;
+  min-height: 44px;
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.enhance-preset:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.enhance-preset:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.enhance-preset:disabled { cursor: not-allowed; opacity: 0.6; }
+.enhance-preset.is-on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.enhance-preset-label { font-size: 12.5px; font-weight: 600; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.enhance-preset-size { font-size: 11px; color: var(--text-muted); }
+.enhance-plan { display: flex; flex-direction: column; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
+.enhance-plan p { margin: 0; }
+
+.upload-enhance-hint { align-items: center; }
+.upload-enhance-hint .grow { min-width: 0; }
+
+@media (max-width: 420px) {
+  .enhance-presets { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

@@ -34,6 +34,8 @@ import {
   type MlResponse,
   type MlResult,
   type MlStage,
+  type UpscaleJob,
+  type UpscalePayload,
 } from '../../workers/mlProtocol';
 
 /** The part of `Worker` the client uses. */
@@ -197,8 +199,9 @@ export class MlWorkerClient {
       return;
     }
     // Any failure may have poisoned ORT in this worker (see the header), even
-    // for an aborted job. Missing weight files are reported before ORT runs.
-    if (msg.type === 'error' && msg.error.name !== 'ModelFileNotFoundError') this.retire(w);
+    // for an aborted job. Missing weight files are reported before ORT runs,
+    // and a tiled job stopped between tiles (AbortError) never failed in ORT.
+    if (msg.type === 'error' && msg.error.name !== 'ModelFileNotFoundError' && msg.error.name !== 'AbortError') this.retire(w);
     if (p) {
       if (msg.type === 'error' && msg.error.name === WEBGPU_FAILED_ERROR && p.wasmRetry) {
         this.retryOnWasm(msg.id, p);
@@ -352,5 +355,19 @@ export async function requestForegroundAlpha(
     .run({ ...job, type: 'background-removal' }, opts)
     .catch((e: unknown) => Promise.reject(localizeMlError(e, job.model)));
   if (r.kind !== 'alpha') throw new Error(`Unexpected ML result kind '${r.kind}'`);
+  return r;
+}
+
+/**
+ * Super-resolution of an opaque RGBA image in the ML worker ('image-to-image',
+ * tiled; see UpscaleJob). Progress reports tiles done / total in the
+ * inference stage. Aborting stops the job between tiles (WebGPU) or kills the
+ * worker (WASM inference cannot be interrupted).
+ */
+export async function requestUpscale(job: Omit<UpscaleJob, 'id' | 'type'>, opts: MlRequestOptions): Promise<UpscalePayload> {
+  const r = await getMlClient()
+    .run({ ...job, type: 'upscale' }, opts)
+    .catch((e: unknown) => Promise.reject(localizeMlError(e, job.model)));
+  if (r.kind !== 'image') throw new Error(`Unexpected ML result kind '${r.kind}'`);
   return r;
 }

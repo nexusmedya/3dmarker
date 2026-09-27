@@ -49,7 +49,10 @@ import {
   quickMask,
   resolveMask,
   runPipeline,
+  sourceFromImage,
   statsForObject,
+  textureImageOf,
+  WORKING_MAX_SIDE,
   type BackgroundMode,
   type BuiltModel,
   type SourceImage,
@@ -66,6 +69,7 @@ import {
   saveState,
   type AiJobKind,
   type AppState,
+  type EnhancePending,
   type OtherViewId,
   type Theme,
   type ViewEntry,
@@ -75,13 +79,19 @@ import type { StepId } from '../app/steps';
 import { browserStorage } from '../app/persist';
 import { baseName, errorToText } from '../app/format';
 import { UI, t } from '../app/i18n';
-import { throttleLatest } from '../app/throttle';
+import { throttleLatest, yieldToPaint } from '../app/throttle';
 import { disposeObject } from '../app/dispose';
 import { renderSample, type SampleSpec } from '../app/samples';
 import { AiError, type AiErrorCode } from '../ai/transport';
 import { VIEW_LABELS } from '../ai/views';
 import { LocalizedError } from '../core/errors';
 import { isNetworkError } from '../drivers/ml/errors';
+import { requestUpscale } from '../drivers/ml/workerClient';
+import type { MlProgress } from '../workers/mlProtocol';
+import { analyzeCached } from '../core/enhance/analyze';
+import { enhanceImage, type AiUpscaler } from '../core/enhance/enhance';
+import type { EnhancePresetId } from '../core/enhance/presets';
+import { encodePng } from '../ai/encode';
 import type { ViewerCore } from '../app/viewer';
 import { useAvailability } from './useAvailability';
 
@@ -140,7 +150,8 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
  * flood-filled away; null when neither works (the whole image is used).
  */
 export async function decodeView(file: Blob, name: string, origin: ViewEntry['origin']): Promise<ViewEntry> {
-  const src = await prepareSource(file, name);
+  // Views are never textured: no high-resolution copy.
+  const src = await prepareSource(file, name, undefined, { textureMaxSide: WORKING_MAX_SIDE });
   const { mask } = quickMask(src.image, 'border');
   return { file, image: src.image, mask, origin, name, align: DEFAULT_VIEW_ALIGN };
 }
@@ -171,6 +182,56 @@ export function weakAlignment(view: OtherViewId, image: RGBAImage, align: ViewAl
 /** "cat.png" → "cat-ai.png" (prepared front) / "cat-back.png" (a generated view). */
 export function aiFileName(sourceName: string, tag: string): string {
   return `${baseName(sourceName) || 'image'}-${tag}.png`;
+}
+
+/** "cat.png" → "cat-enhanced.png". */
+export function enhancedFileName(sourceName: string): string {
+  return aiFileName(sourceName, 'enhanced');
+}
+
+const fillText = (text: I18nText, vars: Record<string, string | number>): I18nText => ({
+  tr: text.tr.replace(/\{(\w+)\}/g, (m, k: string) => (k in vars ? String(vars[k]) : m)),
+  en: text.en.replace(/\{(\w+)\}/g, (m, k: string) => (k in vars ? String(vars[k]) : m)),
+});
+
+/** Progress of the ML worker's upscale job as a card progress label. */
+export function enhanceProgress(p: MlProgress): Progress {
+  switch (p.stage) {
+    case 'download':
+      return { label: UI.enhanceDownloading, ratio: p.ratio };
+    case 'load':
+      return { label: UI.enhanceLoadingModel };
+    case 'inference':
+      return p.total
+        ? { label: fillText(UI.enhanceTiles, { done: p.done ?? 0, total: p.total }), ratio: (p.done ?? 0) / p.total }
+        : { label: UI.enhanceUpscaling };
+  }
+}
+
+/** Swin2SR in the ML worker (WebGPU, else WASM; tiled, cancellable). */
+export const workerUpscaler: AiUpscaler = async (img, plan, { signal, onProgress }) => {
+  const r = await requestUpscale(
+    {
+      model: plan.model,
+      device: 'auto',
+      precision: 'auto',
+      // A private copy: the worker takes ownership of the buffer.
+      image: { width: img.width, height: img.height, data: new Uint8ClampedArray(img.data) },
+      scale: plan.scale,
+    },
+    { signal, onProgress: (p) => onProgress?.(enhanceProgress(p)) },
+  );
+  return { width: r.width, height: r.height, data: r.data };
+};
+
+/** PNG of an enhanced image for the drivers that upload the file; the previous file where no canvas can encode. */
+export async function encodeEnhanced(img: RGBAImage, fallback: Blob, encode: (i: RGBAImage) => Promise<Blob> = encodePng): Promise<Blob> {
+  try {
+    return await encode(img);
+  } catch (e) {
+    console.warn('[enhance] could not encode the enhanced image; cloud drivers get the previous file', e);
+    return fallback;
+  }
 }
 
 /** The image-edit provider to use now (the chosen one, else the default / first usable). */
@@ -945,6 +1006,69 @@ export function useStudio() {
     dispatch({ type: 'restorePrepared', mask, maskNote: note });
   }, []);
 
+  // ---------------------------------------------------------------- image enhancement
+
+  /**
+   * Enhances the front image with `preset` (AI super-resolution in the ML
+   * worker, or a local enhancer) into a pending result shown before / after;
+   * it becomes the front only on Apply. Runs as the one AI job.
+   */
+  const runEnhance = useCallback(
+    async (preset: EnhancePresetId) => {
+      const s = stateRef.current;
+      const source = s.source;
+      if (!source) return;
+      const job = startAiJob('enhance', null);
+      if (!job) return;
+      const t0 = performance.now();
+      try {
+        // The largest pixels we have (the texture copy when the upload was larger than the working size).
+        const input = textureImageOf(source);
+        const analysis = analyzeCached(input);
+        job.onProgress({ label: UI.enhanceWorking });
+        await yieldToPaint(); // local enhancers are synchronous: show the label first
+        throwIfAborted(job.signal);
+        const out = await enhanceImage(input, preset, { signal: job.signal, onProgress: job.onProgress, analysis, upscaleAi: workerUpscaler });
+        throwIfAborted(job.signal);
+        job.onProgress({ label: UI.enhanceEncoding });
+        const baseSource = s.enhanceApplied && s.enhanceApplied.after === source ? s.enhanceApplied.before : source;
+        const file = await encodeEnhanced(out.image, source.file);
+        throwIfAborted(job.signal);
+        if (!job.isCurrent()) return;
+        const pending: EnhancePending = {
+          source: sourceFromImage(out.image, enhancedFileName(baseSource.name), file),
+          from: source,
+          preset,
+          plan: out.plan,
+          fallback: out.fallbackError ? errorToText(out.fallbackError) : null,
+          elapsedMs: performance.now() - t0,
+        };
+        job.finish();
+        dispatch({ type: 'enhanceReady', pending });
+      } catch (e) {
+        job.finish(e);
+      }
+    },
+    [startAiJob],
+  );
+
+  /** The enhanced image becomes the front (masks recomputed, views kept, "before" kept for Revert). */
+  const applyEnhanced = useCallback(() => {
+    const s = stateRef.current;
+    if (!s.enhanced || !s.source || jobRef.current || aiJobRef.current || loadingRef.current) return;
+    const { mask, note } = quickMask(s.enhanced.source.image, s.bgMode);
+    dispatch({ type: 'enhanceApply', mask, maskNote: note });
+  }, []);
+
+  /** Back to the image before the enhancement. */
+  const revertEnhanced = useCallback(() => {
+    const s = stateRef.current;
+    const applied = s.enhanceApplied;
+    if (!applied || s.source !== applied.after || jobRef.current || aiJobRef.current || loadingRef.current) return;
+    const { mask, note } = quickMask(applied.before.image, s.bgMode);
+    dispatch({ type: 'enhanceRevert', mask, maskNote: note });
+  }, []);
+
   const detectHuman = useCallback(() => {
     const src = stateRef.current.source;
     if (src) void analyze(src.image);
@@ -994,7 +1118,7 @@ export function useStudio() {
       const m = modelRef.current;
       const input = modelSourceRef.current;
       if (!m?.depth || !input || jobRef.current) return;
-      const texture = createImageTexture(opaqueTextureImage(input.source.image));
+      const texture = createImageTexture(opaqueTextureImage(textureImageOf(input.source)));
       try {
         const built = buildDepthModel(depth, m.mask, texture, stateRef.current.meshParams);
         setModel(built, input);
@@ -1102,6 +1226,12 @@ export function useStudio() {
       generateOffline,
       generateView,
       generateMissing,
+      // Image enhancement
+      runEnhance,
+      applyEnhanced,
+      discardEnhanced: () => dispatch({ type: 'enhanceDiscard' }),
+      revertEnhanced,
+      dismissEnhanceError: () => dispatch({ type: 'dismissAiError', kind: 'enhance' }),
       uploadView,
       clearView,
       setViewAlign,
@@ -1136,6 +1266,9 @@ export function useStudio() {
       generateOffline,
       generateView,
       generateMissing,
+      runEnhance,
+      applyEnhanced,
+      revertEnhanced,
       uploadView,
       clearView,
       setViewAlign,

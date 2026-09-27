@@ -3,7 +3,7 @@
  * and the ML worker (src/workers/ml.worker.ts). Type-only module.
  */
 
-export type MlTask = 'depth-estimation' | 'background-removal';
+export type MlTask = 'depth-estimation' | 'background-removal' | 'image-to-image';
 
 /** Device preference: 'auto' = WebGPU when an adapter is available, else WASM. */
 export type MlDevicePref = 'auto' | 'wasm';
@@ -64,7 +64,27 @@ export interface BackgroundRemovalJob extends JobBase {
   type: 'background-removal';
 }
 
-export type MlJob = DepthJob | BackgroundRemovalJob;
+/**
+ * Super-resolution ('image-to-image', e.g. Swin2SR). The worker cuts the image
+ * into overlapping tiles (bounded memory), upscales them one by one (progress
+ * per tile, cancellable between tiles) and blends them with feathered seams.
+ * The result is opaque RGB(A); the caller handles transparency.
+ */
+export interface UpscaleJob extends JobBase {
+  type: 'upscale';
+  /** Expected scale factor (checked against the model's output). */
+  scale: number;
+  /** Tile side in input px (default: UPSCALE_TILE[device]). */
+  tile?: number;
+  /** Overlap between tiles in input px (default UPSCALE_OVERLAP). */
+  overlap?: number;
+}
+
+/** Default tile side per device: WebGPU keeps one shape (no shader recompiles), WASM stays small. */
+export const UPSCALE_TILE: Record<MlDevice, number> = { webgpu: 192, wasm: 128 };
+export const UPSCALE_OVERLAP = 16;
+
+export type MlJob = DepthJob | BackgroundRemovalJob | UpscaleJob;
 
 export type MlRequest =
   | MlJob
@@ -81,6 +101,9 @@ export interface MlProgress {
   loadedBytes?: number;
   totalBytes?: number;
   device?: MlDevice;
+  /** Inference stage of tiled jobs (upscale): tiles finished / total. */
+  done?: number;
+  total?: number;
 }
 
 export interface DepthPayload {
@@ -103,7 +126,19 @@ export interface AlphaPayload {
   dtype: string;
 }
 
-export type MlResult = DepthPayload | AlphaPayload;
+export interface UpscalePayload {
+  kind: 'image';
+  /** Opaque RGBA at width × height (= input × scale). */
+  data: Uint8ClampedArray;
+  width: number;
+  height: number;
+  /** Scale factor the model applied. */
+  scale: number;
+  device: MlDevice;
+  dtype: string;
+}
+
+export type MlResult = DepthPayload | AlphaPayload | UpscalePayload;
 
 export interface SerializedError {
   name: string;

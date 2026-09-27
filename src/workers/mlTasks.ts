@@ -11,12 +11,25 @@ import {
   type DataType,
   type DepthEstimationPipeline,
   type DeviceType,
+  type ImageToImagePipeline,
 } from '@huggingface/transformers';
 import type { LoadRequest } from './mlEngine';
-import { DEFAULT_STALL_TIMEOUT_MS, modelStalledError, type BackgroundRemovalJob, type DepthJob, type ImagePayload, type MlEnvConfig } from './mlProtocol';
+import {
+  DEFAULT_STALL_TIMEOUT_MS,
+  modelStalledError,
+  UPSCALE_OVERLAP,
+  UPSCALE_TILE,
+  type BackgroundRemovalJob,
+  type DepthJob,
+  type ImagePayload,
+  type MlDevice,
+  type MlEnvConfig,
+  type UpscaleJob,
+} from './mlProtocol';
 import { alphaChannel } from '../core/preprocess/alphaMask';
+import { extractTile, planTiles, roundUp, TileBlender } from '../core/enhance/tiles';
 
-export type AnyPipeline = DepthEstimationPipeline | BackgroundRemovalPipeline;
+export type AnyPipeline = DepthEstimationPipeline | BackgroundRemovalPipeline | ImageToImagePipeline;
 
 /** ORT wasm file URLs transformers.js picked at import time (jsDelivr); configureEnv reuses their file names. */
 let ortDefaultPaths: { mjs?: string | URL; wasm?: string | URL } | undefined;
@@ -157,4 +170,60 @@ export async function runBackgroundRemoval(pipe: BackgroundRemovalPipeline, job:
   // Returns the input image with the predicted matte as its alpha channel.
   const out = await pipe(toRawImage(job.image));
   return { data: alphaChannel(out.data, out.width, out.height, out.channels), width: out.width, height: out.height };
+}
+
+/** Swin2SR's attention window: tiles are padded to a multiple of it so the processor adds no padding. */
+export const SR_WINDOW = 8;
+
+export interface UpscaleHooks {
+  /** After each tile: tiles done / total. */
+  onTile?: (done: number, total: number) => void;
+  /** Checked between tiles; true stops the job with an AbortError. */
+  isCancelled?: () => boolean;
+}
+
+function abortError(): Error {
+  const err = new Error('Upscale cancelled');
+  err.name = 'AbortError';
+  return err;
+}
+
+/**
+ * Tiled super-resolution. Every tile is a padded RGB RawImage (a multiple of
+ * SR_WINDOW, so Swin2SRImageProcessor's own symmetric padding is a no-op); the
+ * pipeline returns the padded tile × scale as a 3-channel RawImage, whose
+ * top-left crop is blended in with feathered overlaps.
+ */
+export async function runUpscale(
+  pipe: ImageToImagePipeline,
+  job: Pick<UpscaleJob, 'image' | 'scale' | 'tile' | 'overlap'>,
+  device: MlDevice = 'wasm',
+  hooks: UpscaleHooks = {},
+): Promise<{ data: Uint8ClampedArray; width: number; height: number; scale: number }> {
+  const { width, height, data } = job.image;
+  if (data.length !== width * height * 4) throw new Error(`Expected ${width}×${height} RGBA pixels, got ${data.length} bytes`);
+  const tileSide = Math.max(SR_WINDOW, roundUp(job.tile ?? UPSCALE_TILE[device], SR_WINDOW));
+  const overlap = Math.max(0, Math.min(Math.floor(tileSide / 2), job.overlap ?? UPSCALE_OVERLAP));
+  const tiles = planTiles(width, height, tileSide, overlap);
+  let blender: TileBlender | null = null;
+  let scale = 0;
+  for (let i = 0; i < tiles.length; i++) {
+    if (hooks.isCancelled?.()) throw abortError();
+    const t = tiles[i];
+    const tile = extractTile(data, width, 4, t, SR_WINDOW);
+    const out = await pipe(new RawImage(tile.data, tile.width, tile.height, 3));
+    if (!scale) {
+      scale = out.width / tile.width;
+      if (!Number.isInteger(scale) || scale < 1 || out.height !== tile.height * scale) {
+        throw new Error(`Unexpected upscaler output ${out.width}×${out.height} for a ${tile.width}×${tile.height} tile`);
+      }
+      if (job.scale && scale !== job.scale) console.warn(`[ml] upscaler scale ×${scale}, expected ×${job.scale}`);
+      blender = new TileBlender(width * scale, height * scale, scale, overlap);
+    } else if (out.width !== tile.width * scale || out.height !== tile.height * scale) {
+      throw new Error(`Inconsistent upscaler output ${out.width}×${out.height}`);
+    }
+    blender!.add(t, out.data, out.width, out.channels);
+    hooks.onTile?.(i + 1, tiles.length);
+  }
+  return { data: blender!.result(), width: width * scale, height: height * scale, scale };
 }
