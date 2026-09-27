@@ -8,8 +8,9 @@ import { ML_DRIVERS } from './ml';
 import { HEURISTIC_DRIVERS } from './heuristic';
 import { MULTIVIEW_DRIVERS } from './multiview';
 import { CLOUD_DRIVERS } from './cloud';
+import { HYBRID_DRIVERS } from './hybrid';
 
-export const DRIVERS: Driver[] = [...ML_DRIVERS, ...HEURISTIC_DRIVERS, ...MULTIVIEW_DRIVERS, ...CLOUD_DRIVERS];
+export const DRIVERS: Driver[] = [...ML_DRIVERS, ...HYBRID_DRIVERS, ...HEURISTIC_DRIVERS, ...MULTIVIEW_DRIVERS, ...CLOUD_DRIVERS];
 
 export function getDriver(id: string): Driver | undefined {
   return DRIVERS.find((d) => d.id === id);

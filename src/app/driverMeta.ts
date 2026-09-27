@@ -56,6 +56,26 @@ const BEST_FOR: Record<string, I18nText> = {
     en: 'Characters and objects with front + back / side views — in-browser, closed and coloured',
   },
   'tripo3d-multiview': { tr: 'Ön + yan + arka görünümlerden gerçekçi tam 3D (bulut)', en: 'Realistic full 3D from front + side + back views (cloud)' },
+  'depth-volume': {
+    tr: 'Kirby gibi yuvarlak karakterler, oyuncaklar, arabalar — tarayıcıda kapalı, dokulu gövde (düz kabartma değil)',
+    en: 'Round characters like Kirby, toys, cars — a closed, textured body in the browser (not a flat relief)',
+  },
+  'hf-trellis': {
+    tr: 'En iyi genel kalite: karakterler, arabalar, nesneler — ücretsiz, anahtarsız tam 3D (tripo3d.ai’ye en yakın)',
+    en: 'Best overall quality: characters, cars, objects — free, keyless full 3D (closest to tripo3d.ai)',
+  },
+  'hf-hunyuan3d-2': {
+    tr: 'Çok ayrıntılı, keskin geometri: araba gövdeleri, mekanik parçalar, yüzler — ücretsiz tam 3D',
+    en: 'Very detailed, crisp geometry: car bodies, mechanical parts, faces — free full 3D',
+  },
+  'hf-triposg': {
+    tr: 'Yüksek sadakatli şekil (Tripo ekibinden, açık kaynak), karakter ve araçlar — ücretsiz tam 3D',
+    en: 'High-fidelity shapes (open model from the Tripo team), characters and vehicles — free full 3D',
+  },
+  'hf-stable-fast-3d': {
+    tr: 'Saniyeler içinde temiz dokulu model; diğerlerinin kotası dolduğunda yedek — ücretsiz tam 3D',
+    en: 'A clean textured model in seconds; the fallback when the others are out of quota — free full 3D',
+  },
   'ai-provider-3d': {
     tr: 'Kendi eklediğiniz yapay zekâ sağlayıcısıyla (fal, Replicate, Tripo…) tam 3D',
     en: 'Full 3D with an AI provider you added (fal, Replicate, Tripo…)',
@@ -89,7 +109,7 @@ export function outputKind(driver: Driver): I18nText {
 /** Mesh mode applied once when the user switches to this driver (null = keep the current one). */
 export function suggestedMeshMode(driver: Driver): MeshMode | null {
   if (driver.id === 'silhouette-inflate') return 'double';
-  if (driver.category === 'ml') return 'relief';
+  if (driver.category === 'ml') return driver.producesDepth ? 'relief' : null; // depth-volume builds its own closed geometry
   return null;
 }
 
