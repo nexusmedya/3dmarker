@@ -754,6 +754,11 @@ export function suggestTemplate(input: SuggestInput): TemplateSuggestion {
     const rel = (g.c - p.iLo) / span;
     if ((g.i1 - g.i0 + 1) < 0.2 * span && rel > 0.25 && rel < 0.75) return { template: 'bird', reason: 'bird' };
   }
+  // Roughly as tall as long and not standing on two far-apart leg groups (a
+  // front-facing mascot with feet side by side, a legless round character):
+  // a character, not a side-view animal.
+  const legsApart = p.groups.length >= 2 && p.groups[p.groups.length - 1].c - p.groups[0].c > 0.3 * span;
+  if (p.L < 1.3 * p.H && !legsApart) return { template: 'humanoid', reason: 'upright' };
   return { template: 'quadruped', reason: 'legs' };
 }
 
